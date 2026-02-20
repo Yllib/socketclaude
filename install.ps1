@@ -146,9 +146,11 @@ if ($claudeCmd) {
     Write-Ok "Claude Code CLI already installed ($claudeVer)"
 } else {
     Write-Host "  Installing Claude Code CLI..."
-    & npm install -g @anthropic-ai/claude-code 2>&1 | ForEach-Object { Write-Host "    $_" }
-    if ($LASTEXITCODE -ne 0) {
-        throw "npm install -g @anthropic-ai/claude-code failed"
+    $cliOutput = & npm install -g @anthropic-ai/claude-code 2>&1
+    $cliExit = $LASTEXITCODE
+    $cliOutput | ForEach-Object { Write-Host "    $_" }
+    if ($cliExit -ne 0) {
+        throw "npm install -g @anthropic-ai/claude-code failed (exit code $cliExit)"
     }
 
     Refresh-Path
@@ -215,13 +217,17 @@ Write-Phase "Phase 4: Install Dependencies & Build"
 Write-Host "  Running npm install..."
 Push-Location $SERVER_DIR
 try {
-    & npm install 2>&1 | ForEach-Object { Write-Host "    $_" }
-    if ($LASTEXITCODE -ne 0) { throw "npm install failed" }
+    $npmOutput = & npm install 2>&1
+    $npmExit = $LASTEXITCODE
+    $npmOutput | ForEach-Object { Write-Host "    $_" }
+    if ($npmExit -ne 0) { throw "npm install failed (exit code $npmExit)" }
     Write-Ok "Dependencies installed"
 
     Write-Host "  Compiling TypeScript..."
-    & npx tsc 2>&1 | ForEach-Object { Write-Host "    $_" }
-    if ($LASTEXITCODE -ne 0) { throw "TypeScript compilation failed" }
+    $tscOutput = & npx tsc 2>&1
+    $tscExit = $LASTEXITCODE
+    $tscOutput | ForEach-Object { Write-Host "    $_" }
+    if ($tscExit -ne 0) { throw "TypeScript compilation failed (exit code $tscExit)" }
     Write-Ok "Server built successfully"
 } finally {
     Pop-Location
