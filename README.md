@@ -9,7 +9,7 @@ Chat with [Claude Code](https://docs.anthropic.com/en/docs/claude-code) from you
 Open PowerShell and run:
 
 ```powershell
-irm https://github.com/Yllib/socketclaude/archive/master.zip -OutFile socketclaude.zip; Expand-Archive socketclaude.zip -Force; cd socketclaude-master; powershell -ExecutionPolicy Bypass -File install.ps1
+irm https://github.com/Yllib/socketclaude/archive/master.zip -OutFile socketclaude.zip; Expand-Archive socketclaude.zip -DestinationPath . -Force; cd socketclaude-master; powershell -ExecutionPolicy Bypass -File install.ps1
 ```
 
 Or if you have git:
