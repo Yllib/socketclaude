@@ -1,0 +1,33 @@
+# Server
+server/node_modules/
+server/dist/
+server/.env
+
+# Flutter app (private repo — lives in app/ as a nested git repo)
+app/
+
+# Claude Code project settings
+.claude/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+*.ipr
+*.iws
+
+# Plugins and tools (private, not committed to public repo)
+server/plugins/*
+!server/plugins/README.md
+!server/plugins/tsconfig.json
+server/tools/
+
+# Uploads (temp file storage)
+.uploads/
+
+# Auth/credential files
+*.tokens.json
+
+# OS
+.DS_Store
+*.swp
