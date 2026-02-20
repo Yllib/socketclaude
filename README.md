@@ -4,7 +4,15 @@ Chat with [Claude Code](https://docs.anthropic.com/en/docs/claude-code) from you
 
 ## Setup
 
-### 1. Install the server
+### 1. Install the server (Windows)
+
+Open PowerShell and run:
+
+```powershell
+irm https://github.com/Yllib/socketclaude/archive/master.zip -OutFile socketclaude.zip; Expand-Archive socketclaude.zip -Force; cd socketclaude-master; powershell -ExecutionPolicy Bypass -File install.ps1
+```
+
+Or if you have git:
 
 ```powershell
 git clone https://github.com/Yllib/socketclaude.git
@@ -28,7 +36,7 @@ Get-Content server\socketclaude.log -Tail 50       # Logs
 powershell -File uninstall.ps1                     # Uninstall
 ```
 
-To update, pull new code and re-run the installer. Existing pairings are preserved.
+To update, re-run the one-liner or `git pull` and re-run the installer. Existing pairings are preserved.
 
 ## How It Works
 
