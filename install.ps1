@@ -33,7 +33,7 @@ $ENV_FILE = Join-Path $SERVER_DIR ".env"
 $DATA_DIR = Join-Path $env:USERPROFILE ".claude-assistant"
 $KEYS_FILE = Join-Path $DATA_DIR "relay-keys.json"
 $LOG_FILE = Join-Path $SERVER_DIR "socketclaude.log"
-$SETUP_SCRIPT = Join-Path $SERVER_DIR "scripts" "setup.js"
+$SETUP_SCRIPT = Join-Path (Join-Path $SERVER_DIR "scripts") "setup.js"
 
 $currentPhase = ""
 
@@ -274,7 +274,7 @@ if ($isUpgrade) {
 Write-Phase "Phase 6: Register Windows Service"
 
 $nodeExe = (Get-Command node).Source
-$serverScript = Join-Path $SERVER_DIR "dist" "index.js"
+$serverScript = Join-Path (Join-Path $SERVER_DIR "dist") "index.js"
 
 # Stop and remove existing task
 $existing = Get-ScheduledTask -TaskName $TASK_NAME -ErrorAction SilentlyContinue
