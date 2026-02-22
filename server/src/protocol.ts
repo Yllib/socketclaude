@@ -40,6 +40,20 @@ export interface SetTtsMessage {
   enabled: boolean;
 }
 
+export interface SetTtsEngineMessage {
+  type: "set_tts_engine";
+  engine: "system" | "kokoro_server" | "kokoro_device";
+  voice?: string;
+  speed?: number;
+}
+
+export interface RequestTtsAudioMessage {
+  type: "request_tts_audio";
+  text: string;
+  voice?: string;
+  speed?: number;
+}
+
 export interface RequestFileMessage {
   type: "request_file";
   filePath: string;
@@ -115,6 +129,8 @@ export type ClientMessage =
   | ClearContextMessage
   | AbortMessage
   | SetTtsMessage
+  | SetTtsEngineMessage
+  | RequestTtsAudioMessage
   | SetEffortMessage
   | SetThinkingMessage
   | StopTaskMessage
@@ -220,7 +236,7 @@ export interface SessionCreatedServerMessage {
 }
 
 export interface HistoryEntry {
-  role: "user" | "assistant" | "tool_call" | "tool_result" | "question";
+  role: "user" | "assistant" | "tool_call" | "tool_result" | "question" | "todos_update";
   content: string;
   toolName?: string;
   toolInput?: Record<string, unknown>;
@@ -306,6 +322,13 @@ export interface SessionForkedServerMessage {
   cwd: string;
 }
 
+export interface TtsAudioServerMessage {
+  type: "tts_audio";
+  audioData: string;
+  text: string;
+  sessionId: string;
+}
+
 export type ServerMessage =
   | TextServerMessage
   | ToolCallServerMessage
@@ -324,4 +347,5 @@ export type ServerMessage =
   | ReminderServerMessage
   | CompactBoundaryServerMessage
   | TaskNotificationServerMessage
-  | SessionForkedServerMessage;
+  | SessionForkedServerMessage
+  | TtsAudioServerMessage;

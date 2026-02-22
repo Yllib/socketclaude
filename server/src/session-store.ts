@@ -296,6 +296,56 @@ export function getMissedMessages(
   return entries;
 }
 
+// ── SDK event history (separate JSONL files per session) ──
+
+const SDK_EVENTS_DIR = path.join(STORE_DIR, "sdk-events");
+
+function ensureSdkEventsDir(): void {
+  if (!fs.existsSync(SDK_EVENTS_DIR)) {
+    fs.mkdirSync(SDK_EVENTS_DIR, { recursive: true });
+  }
+}
+
+function sdkEventsFile(sessionId: string): string {
+  return path.join(SDK_EVENTS_DIR, `${sessionId}.jsonl`);
+}
+
+/** Append a single SDK event to the session's JSONL file */
+export function appendSdkEvent(sessionId: string, event: Record<string, any>): void {
+  ensureSdkEventsDir();
+  const line = JSON.stringify(event) + "\n";
+  fs.appendFileSync(sdkEventsFile(sessionId), line, "utf-8");
+}
+
+/** Read all SDK events for a session */
+export function getSdkEvents(sessionId: string): Record<string, any>[] {
+  ensureSdkEventsDir();
+  const file = sdkEventsFile(sessionId);
+  if (!fs.existsSync(file)) return [];
+  try {
+    const content = fs.readFileSync(file, "utf-8");
+    return content
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => { try { return JSON.parse(line); } catch { return null; } })
+      .filter(Boolean) as Record<string, any>[];
+  } catch {
+    return [];
+  }
+}
+
+/** Get SDK event count for a session (for deciding whether to send) */
+export function getSdkEventCount(sessionId: string): number {
+  const file = sdkEventsFile(sessionId);
+  if (!fs.existsSync(file)) return 0;
+  try {
+    const content = fs.readFileSync(file, "utf-8");
+    return content.split("\n").filter(Boolean).length;
+  } catch {
+    return 0;
+  }
+}
+
 const ARCHIVE_DIR = path.join(STORE_DIR, "archive");
 
 function ensureArchiveDir(): void {
@@ -339,7 +389,15 @@ export function clearSessionContext(sessionId: string, cwd: string): void {
     console.log(`[ClearContext] Archived todos: ${archiveName}`);
   }
 
-  // 4. Update session metadata to reflect the clear
+  // 4. Archive SDK events
+  const sdkFile = sdkEventsFile(sessionId);
+  if (fs.existsSync(sdkFile)) {
+    const archiveName = `${sessionId}_${ts}_sdk-events.jsonl`;
+    fs.renameSync(sdkFile, path.join(ARCHIVE_DIR, archiveName));
+    console.log(`[ClearContext] Archived SDK events: ${archiveName}`);
+  }
+
+  // 5. Update session metadata to reflect the clear
   const sessions = readStore();
   const session = sessions.find((s) => s.id === sessionId);
   if (session) {

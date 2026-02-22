@@ -7,7 +7,7 @@ import * as http from "http";
 import * as path from "path";
 import { WebSocketServer, WebSocket } from "ws";
 import { ClaudeSession } from "./claude-session";
-import { listSessions, getSession, getHistory, getHistoryPage, deleteSession, clearSessionContext, cleanupPendingToolCalls, getTodos, getMissedMessages, appendHistory } from "./session-store";
+import { listSessions, getSession, getHistory, getHistoryPage, deleteSession, clearSessionContext, cleanupPendingToolCalls, getTodos, getMissedMessages, appendHistory, getSdkEvents } from "./session-store";
 import { ClientMessage } from "./protocol";
 import { SocketClaudePlugin, PluginContext } from "./plugin-api";
 import { RelayClient, RelayStatus } from "./relay-client";
@@ -71,6 +71,7 @@ const activeSessions: Map<string, ClaudeSession> = new Map();
 // Sessions whose context has been cleared — next query should NOT pass resume
 const clearedSessions: Set<string> = new Set();
 
+
 // Track all connected WebSocket clients for broadcasting
 const connectedClients = new Set<WebSocket>();
 
@@ -128,6 +129,9 @@ interface ClientTransport {
 function createConnectionHandler(transport: ClientTransport) {
   let activeSession: ClaudeSession | null = null;
   let pendingTtsEnabled = false;
+  let pendingTtsEngine: "system" | "kokoro_server" | "kokoro_device" = "system";
+  let pendingKokoroVoice = "af_heart";
+  let pendingKokoroSpeed = 1.0;
   let pendingEffort: 'low' | 'medium' | 'high' | 'max' = 'high';
   let pendingThinking: { type: 'adaptive' } | { type: 'enabled'; budgetTokens: number } | { type: 'disabled' } = { type: 'adaptive' };
 
@@ -163,6 +167,9 @@ function createConnectionHandler(transport: ClientTransport) {
         }
         activeSession = new ClaudeSession(transport as any, cwd, plugins);
         activeSession.setTtsEnabled(pendingTtsEnabled);
+        activeSession.setTtsEngine(pendingTtsEngine);
+        activeSession.setKokoroVoice(pendingKokoroVoice);
+        activeSession.setKokoroSpeed(pendingKokoroSpeed);
         activeSession.setEffort(pendingEffort);
         activeSession.setThinking(pendingThinking);
         sendJson({
@@ -199,6 +206,9 @@ function createConnectionHandler(transport: ClientTransport) {
           (activeSession as any)._resumeSessionId = msg.sessionId;
         }
         activeSession.setTtsEnabled(pendingTtsEnabled);
+        activeSession.setTtsEngine(pendingTtsEngine);
+        activeSession.setKokoroVoice(pendingKokoroVoice);
+        activeSession.setKokoroSpeed(pendingKokoroSpeed);
         activeSession.setEffort(pendingEffort);
         activeSession.setThinking(pendingThinking);
 
@@ -251,6 +261,16 @@ function createConnectionHandler(transport: ClientTransport) {
           });
         }
 
+        // Send SDK event history for raw debug mode
+        const sdkEvents = getSdkEvents(msg.sessionId);
+        if (sdkEvents.length > 0) {
+          sendJson({
+            type: "sdk_event_history",
+            sessionId: msg.sessionId,
+            events: sdkEvents,
+          });
+        }
+
         // Restore last usage data if available
         if ((sessionInfo as any).lastUsage) {
           sendJson({
@@ -259,14 +279,12 @@ function createConnectionHandler(transport: ClientTransport) {
           });
         }
 
-        // Let the client know if the session is still working
-        if (existing && existing.isRunning) {
-          sendJson({
-            type: "status",
-            sessionId: msg.sessionId,
-            running: true,
-          });
-        }
+        // Always send status so the app resets its processing state on resume
+        sendJson({
+          type: "status",
+          sessionId: msg.sessionId,
+          running: !!(existing && existing.isRunning),
+        });
         break;
       }
 
@@ -420,6 +438,48 @@ function createConnectionHandler(transport: ClientTransport) {
         break;
       }
 
+      case "set_tts_engine": {
+        const engine = (msg as any).engine as string;
+        if (["system", "kokoro_server", "kokoro_device"].includes(engine)) {
+          pendingTtsEngine = engine as any;
+          if ((msg as any).voice) pendingKokoroVoice = (msg as any).voice;
+          if ((msg as any).speed) pendingKokoroSpeed = (msg as any).speed;
+          if (activeSession) {
+            activeSession.setTtsEngine(engine as any);
+            if ((msg as any).voice) activeSession.setKokoroVoice((msg as any).voice);
+            if ((msg as any).speed) activeSession.setKokoroSpeed((msg as any).speed);
+          }
+          console.log(`TTS engine set to ${engine} voice=${pendingKokoroVoice} (session ${activeSession ? 'active' : 'pending'})`);
+        }
+        break;
+      }
+
+      case "request_tts_audio": {
+        const text = (msg as any).text as string;
+        const voice = (msg as any).voice as string || pendingKokoroVoice;
+        const speed = (msg as any).speed as number || pendingKokoroSpeed;
+        if (text) {
+          try {
+            const { generateKokoroAudio } = require("./kokoro-tts");
+            const wavBuffer = generateKokoroAudio(text, voice, speed);
+            if (wavBuffer) {
+              sendJson({
+                type: "tts_audio",
+                audioData: wavBuffer.toString("base64"),
+                text,
+                sessionId: activeSession?.getSessionId() || "",
+              });
+            } else {
+              sendJson({ type: "error", message: "Kokoro TTS model not available" });
+            }
+          } catch (e: any) {
+            console.error("[KokoroTTS] request_tts_audio error:", e);
+            sendJson({ type: "error", message: `TTS generation failed: ${e.message || e}` });
+          }
+        }
+        break;
+      }
+
       case "set_effort": {
         const effort = (msg as any).effort as string;
         if (['low', 'medium', 'high', 'max'].includes(effort)) {
@@ -469,6 +529,9 @@ function createConnectionHandler(transport: ClientTransport) {
         }
         activeSession = new ClaudeSession(transport as any, sessionInfo.cwd, plugins);
         activeSession.setTtsEnabled(pendingTtsEnabled);
+        activeSession.setTtsEngine(pendingTtsEngine);
+        activeSession.setKokoroVoice(pendingKokoroVoice);
+        activeSession.setKokoroSpeed(pendingKokoroSpeed);
         activeSession.setEffort(pendingEffort);
         activeSession.setThinking(pendingThinking);
         activeSession.setForkSource(sourceId);
@@ -641,6 +704,126 @@ function createConnectionHandler(transport: ClientTransport) {
 }
 
 const httpServer = http.createServer((req, res) => {
+  // POST /continue — trigger a prompt on a session without a WebSocket (used by restart script)
+  if (req.method === "POST" && req.url?.startsWith("/continue")) {
+    const url = new URL(req.url, `http://localhost:${PORT}`);
+    const token = url.searchParams.get("token");
+    if (token !== AUTH_TOKEN) {
+      res.writeHead(401);
+      res.end("Unauthorized");
+      return;
+    }
+    let body = "";
+    req.on("data", (chunk: Buffer) => { body += chunk.toString(); });
+    req.on("end", () => {
+      try {
+        const { sessionId, prompt } = JSON.parse(body);
+        if (!sessionId || !prompt) {
+          res.writeHead(400);
+          res.end("Missing sessionId or prompt");
+          return;
+        }
+        const sessionInfo = getSession(sessionId);
+        if (!sessionInfo) {
+          res.writeHead(404);
+          res.end("Session not found");
+          return;
+        }
+        // Create a session with a dummy (detached) WebSocket — the app will attach when it reconnects
+        const dummyWs = { readyState: WebSocket.CLOSED, send: () => {} } as any;
+        const session = new ClaudeSession(dummyWs, sessionInfo.cwd, plugins);
+        (session as any)._resumeSessionId = sessionId;
+        session.onActivity = () => scheduleBroadcast();
+
+        // Register immediately so the app can find it when it reconnects
+        activeSessions.set(sessionId, session);
+        console.log(`[Continue] Starting query for session ${sessionId}`);
+
+        session.runQuery(prompt, sessionId).then(() => {
+          const sid = session.getSessionId() || sessionId;
+          if (activeSessions.get(sid) === session) {
+            activeSessions.delete(sid);
+          }
+          broadcastSessionList();
+        }).catch((err) => {
+          console.error(`[Continue] Query error: ${err.message}`);
+          activeSessions.delete(sessionId);
+        });
+
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      } catch (err: any) {
+        res.writeHead(500);
+        res.end(err.message || "Server error");
+      }
+    });
+    return;
+  }
+
+  // GET /tts-model — serve Kokoro model as tar.gz for on-device download
+  if (req.method === "GET" && req.url?.startsWith("/tts-model")) {
+    const url = new URL(req.url, `http://localhost:${PORT}`);
+    const token = url.searchParams.get("token");
+    if (token !== AUTH_TOKEN) {
+      res.writeHead(401);
+      res.end("Unauthorized");
+      return;
+    }
+    const modelDir = path.join(require("os").homedir(), ".claude-assistant", "tts-models", "kokoro-en-v0_19");
+    if (!fs.existsSync(path.join(modelDir, "model.onnx"))) {
+      res.writeHead(404);
+      res.end("Kokoro model not installed on server");
+      return;
+    }
+    console.log("[TTS Model] Serving kokoro-en-v0_19 model as tar.gz...");
+    res.writeHead(200, {
+      "Content-Type": "application/gzip",
+      "Content-Disposition": "attachment; filename=kokoro-en-v0_19.tar.gz",
+      "Transfer-Encoding": "chunked",
+    });
+    const { spawn } = require("child_process");
+    const tar = spawn("tar", ["czf", "-", "-C", path.dirname(modelDir), path.basename(modelDir)]);
+    tar.stdout.pipe(res);
+    tar.stderr.on("data", (d: Buffer) => console.error("[TTS Model tar]", d.toString()));
+    tar.on("close", (code: number) => {
+      if (code !== 0) console.error(`[TTS Model] tar exited with code ${code}`);
+      else console.log("[TTS Model] Transfer complete");
+    });
+    return;
+  }
+
+  // GET /download — stream a file for HTTP download (avoids WebSocket main-thread blocking)
+  if (req.method === "GET" && req.url?.startsWith("/download")) {
+    const url = new URL(req.url, `http://localhost:${PORT}`);
+    const token = url.searchParams.get("token");
+    if (token !== AUTH_TOKEN) {
+      res.writeHead(401);
+      res.end("Unauthorized");
+      return;
+    }
+    const filePath = url.searchParams.get("path");
+    if (!filePath || !fs.existsSync(filePath)) {
+      res.writeHead(404);
+      res.end("File not found");
+      return;
+    }
+    const stat = fs.statSync(filePath);
+    const fileName = path.basename(filePath);
+    console.log(`[HTTP Download] Serving ${fileName} (${(stat.size / 1024 / 1024).toFixed(1)} MB)`);
+    res.writeHead(200, {
+      "Content-Type": "application/octet-stream",
+      "Content-Disposition": `attachment; filename="${fileName}"`,
+      "Content-Length": stat.size.toString(),
+    });
+    const readStream = fs.createReadStream(filePath);
+    readStream.pipe(res);
+    readStream.on("error", (err) => {
+      console.error(`[HTTP Download] Error streaming ${fileName}:`, err);
+      res.end();
+    });
+    return;
+  }
+
   for (const plugin of plugins) {
     if (plugin.httpHandler && plugin.httpHandler(req, res)) return;
   }
@@ -699,6 +882,44 @@ httpServer.listen(PORT, async () => {
 // Clean up any tool calls left pending from a previous server crash
 cleanupPendingToolCalls();
 
+
+// ── Periodic status sync heartbeat ──
+// Broadcasts current state to all connected clients so the app stays in sync
+// after reconnects, server restarts, or dropped messages.
+const SERVER_STARTED_AT = new Date().toISOString();
+const STATUS_SYNC_INTERVAL = 10000; // 10 seconds
+
+setInterval(() => {
+  if (connectedClients.size === 0 && !relayConnectionHandler) return;
+
+  // Determine if any session is currently running
+  let anyRunning = false;
+  const backgroundTaskIds: string[] = [];
+  for (const [sid, session] of activeSessions) {
+    if (session.isRunning) anyRunning = true;
+    for (const [taskId] of session.activeBackgroundTasks) {
+      backgroundTaskIds.push(taskId);
+    }
+  }
+
+  const msg = JSON.stringify({
+    type: "status_sync",
+    running: anyRunning,
+    serverStartedAt: SERVER_STARTED_AT,
+    serverPid: process.pid,
+    backgroundTaskIds,
+  });
+
+  for (const client of connectedClients) {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(msg);
+    }
+  }
+  if (relayConnectionHandler) {
+    relayConnectionHandler.sendRaw(msg);
+  }
+}, STATUS_SYNC_INTERVAL);
+
 // ── Direct WebSocket connections ──
 wss.on("connection", (ws: WebSocket) => {
   console.log("Client connected (authenticated)");
@@ -751,12 +972,8 @@ function startRelayClient(): void {
   console.log(`[Relay] Connecting to ${RELAY_URL}`);
   console.log(`[Relay] Pairing token: ${PAIRING_TOKEN}`);
 
-  // Display QR code for pairing
-  const qrPayload = JSON.stringify({
-    relay: RELAY_URL,
-    token: PAIRING_TOKEN,
-    pubkey: pubkeyBase64,
-  });
+  // Display QR code for pairing (format: SC|<token>|<pubkey>)
+  const qrPayload = `SC|${PAIRING_TOKEN}|${pubkeyBase64}`;
 
   try {
     const qrcode = require("qrcode-terminal");

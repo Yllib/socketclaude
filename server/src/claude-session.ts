@@ -9,8 +9,9 @@ import {
   QuestionItem,
   SessionInfo,
 } from "./protocol";
-import { saveSession, updateSessionActivity, appendHistory, saveTodos, remapSession, markQuestionAnswered } from "./session-store";
+import { saveSession, updateSessionActivity, appendHistory, saveTodos, remapSession, markQuestionAnswered, appendSdkEvent } from "./session-store";
 import { SocketClaudePlugin, SessionContext } from "./plugin-api";
+import { generateKokoroAudio, isKokoroAvailable } from "./kokoro-tts";
 
 interface PendingQuestion {
   questionId: string;
@@ -26,10 +27,14 @@ export class ClaudeSession {
   private questionCounter = 0;
   private _isRunning = false;
   private _ttsEnabled = false;
+  private _ttsEngine: "system" | "kokoro_server" | "kokoro_device" = "system";
+  private _kokoroVoice: string = "af_heart";
+  private _kokoroSpeed: number = 1.0;
   private _effort: 'low' | 'medium' | 'high' | 'max' = 'high';
   private _thinking: { type: 'adaptive' } | { type: 'enabled'; budgetTokens: number } | { type: 'disabled' } = { type: 'adaptive' };
   private _forkFromSessionId?: string;
   private _backgroundTaskToolUseIds: Set<string> = new Set();  // toolUseIds of background Task calls
+  private _suppressedToolResultIds: Set<string> = new Set();  // toolUseIds whose results should be hidden from client
   private _taskIdToToolUseId: Map<string, string> = new Map();  // agentId → toolUseId mapping
   private _activeBashStream: { interval: NodeJS.Timeout; filePath: string; lastSize: number } | null = null;
   private _streamingText = "";  // accumulated text for the current streaming response
@@ -56,6 +61,23 @@ export class ClaudeSession {
 
   get ttsEnabled(): boolean {
     return this._ttsEnabled;
+  }
+
+  setTtsEngine(engine: "system" | "kokoro_server" | "kokoro_device"): void {
+    this._ttsEngine = engine;
+    console.log(`TTS engine set to ${engine} for session ${this.sessionId || '(pending)'}`);
+  }
+
+  get ttsEngine(): string {
+    return this._ttsEngine;
+  }
+
+  setKokoroVoice(voice: string): void {
+    this._kokoroVoice = voice;
+  }
+
+  setKokoroSpeed(speed: number): void {
+    this._kokoroSpeed = speed;
   }
 
   setEffort(effort: 'low' | 'medium' | 'high' | 'max'): void {
@@ -153,6 +175,11 @@ export class ClaudeSession {
     return this._isRunning;
   }
 
+  /** Active background task IDs (agentId → toolUseId) */
+  get activeBackgroundTasks(): Map<string, string> {
+    return this._taskIdToToolUseId;
+  }
+
   get lastPreview(): string {
     return this._lastPreview;
   }
@@ -193,10 +220,12 @@ export class ClaudeSession {
   }
 
   getSessionContext(): SessionContext {
+    const sid = this.sessionId || "";
     return {
-      sessionId: this.sessionId || "",
+      sessionId: sid,
       cwd: this.cwd,
       send: (msg) => this.send(msg as ServerMessage),
+      appendHistory: (entry) => { if (sid) appendHistory(sid, entry); },
       pendingQuestions: this.pendingQuestions,
       questionCounter: { next: () => `q${++this.questionCounter}` },
     };
@@ -288,9 +317,9 @@ export class ClaudeSession {
         }
       }
 
-      // Build the MCP server with Speak and SendFile tools
-      const assistantTools = createSdkMcpServer({
-        name: "tts-tools",
+      // Build the MCP server with app-facing tools (Speak, SendFile, ScheduleReminder)
+      const appTools = createSdkMcpServer({
+        name: "app",
         tools: [
           tool(
             "Speak",
@@ -302,6 +331,22 @@ export class ClaudeSession {
                 text: args.text,
                 sessionId: this.sessionId || "",
               } as any);
+              // If server-side Kokoro TTS is active, generate and send audio
+              if (this._ttsEngine === "kokoro_server") {
+                try {
+                  const wavBuffer = generateKokoroAudio(args.text, this._kokoroVoice, this._kokoroSpeed);
+                  if (wavBuffer) {
+                    this.send({
+                      type: "tts_audio",
+                      audioData: wavBuffer.toString("base64"),
+                      text: args.text,
+                      sessionId: this.sessionId || "",
+                    } as any);
+                  }
+                } catch (e) {
+                  console.error(`[KokoroTTS] Error generating audio:`, e);
+                }
+              }
               return { content: [{ type: "text" as const, text: "Speaking to user." }] };
             }
           ),
@@ -334,12 +379,6 @@ export class ClaudeSession {
               return { content: [{ type: "text" as const, text: `File ready for download: ${fileName} (${sizeStr})` }] };
             }
           ),
-        ],
-      });
-
-      const reminderTools = createSdkMcpServer({
-        name: "reminder-tools",
-        tools: [
           tool(
             "ScheduleReminder",
             "Schedule a reminder notification on the user's mobile device. The notification will fire at the specified time even if the app is backgrounded. Use this when the user asks to be reminded about something at a specific time.",
@@ -425,14 +464,14 @@ User request: `;
           tools: { type: "preset", preset: "claude_code" },
           settingSources: ["user", "project"],
           mcpServers: (() => {
-            const servers: Record<string, any> = { "tts-tools": assistantTools, "reminder-tools": reminderTools };
+            const servers: Record<string, any> = { "app": appTools };
             for (const plugin of this.plugins) {
               if (plugin.mcpServers) Object.assign(servers, plugin.mcpServers());
             }
             return servers;
           })(),
           allowedTools: (() => {
-            const tools = ["mcp__tts-tools__*", "mcp__reminder-tools__*"];
+            const tools = ["mcp__app__*"];
             for (const plugin of this.plugins) {
               if (plugin.allowedTools) tools.push(...plugin.allowedTools());
             }
@@ -594,6 +633,14 @@ User request: `;
       let lastResultContent = "";
       const now = () => new Date().toISOString();
 
+      // SDK event persistence: coalesce content block deltas
+      let sdkBlockText = "";
+      let sdkBlockIndex: number | null = null;
+      let sdkBlockType: string | null = null;
+      let sdkBlockToolName: string | null = null;
+      let sdkBlockToolUseId: string | null = null;
+      let sdkBlockDeltaCount = 0;
+
       // Track per-turn usage from stream events to get current context size
       let lastTurnInputTokens = 0;
       let lastTurnOutputTokens = 0;
@@ -627,6 +674,104 @@ User request: `;
         } else {
           console.log(`[SDK msg] type=${msgType} subtype=${subtype}`);
         }
+
+        // Forward raw SDK event to app for debug mode + persist to JSONL
+        try {
+          const sdkPayload: any = { type: "sdk_event", sdkType: msgType };
+          if (msgType === "stream_event") {
+            const evt = (message as any).event;
+            sdkPayload.event = evt;
+
+            // Coalesced persistence: accumulate deltas, write on block_stop
+            const sid = this.sessionId;
+            if (sid && evt) {
+              const evtType = evt.type;
+              if (evtType === "content_block_start") {
+                sdkBlockText = "";
+                sdkBlockDeltaCount = 0;
+                sdkBlockIndex = evt.index ?? null;
+                const cb = evt.content_block || {};
+                sdkBlockType = cb.type || null;
+                sdkBlockToolName = cb.name || null;
+                sdkBlockToolUseId = cb.id || null;
+              } else if (evtType === "content_block_delta") {
+                const delta = evt.delta || {};
+                if (delta.type === "text_delta") sdkBlockText += delta.text || "";
+                else if (delta.type === "input_json_delta") sdkBlockText += delta.partial_json || "";
+                else if (delta.type === "thinking_delta") sdkBlockText += delta.thinking || "";
+                sdkBlockDeltaCount++;
+              } else if (evtType === "content_block_stop") {
+                // Write coalesced content block entry
+                appendSdkEvent(sid, {
+                  ts: now(),
+                  sdkType: "content_block",
+                  blockIndex: sdkBlockIndex,
+                  blockType: sdkBlockType,
+                  toolName: sdkBlockToolName,
+                  toolUseId: sdkBlockToolUseId,
+                  text: sdkBlockText,
+                  deltaCount: sdkBlockDeltaCount,
+                });
+                sdkBlockText = "";
+                sdkBlockDeltaCount = 0;
+              } else if (evtType === "message_start") {
+                const msg2 = evt.message || {};
+                appendSdkEvent(sid, {
+                  ts: now(),
+                  sdkType: "message_start",
+                  model: msg2.model,
+                  usage: msg2.usage,
+                });
+              } else if (evtType === "message_delta") {
+                appendSdkEvent(sid, {
+                  ts: now(),
+                  sdkType: "message_delta",
+                  usage: evt.usage,
+                  stopReason: evt.delta?.stop_reason,
+                });
+              } else if (evtType === "message_stop") {
+                appendSdkEvent(sid, { ts: now(), sdkType: "message_stop" });
+              }
+            }
+          } else {
+            // Shallow copy, skip huge fields
+            const raw = message as any;
+            sdkPayload.subtype = raw.subtype;
+            if (raw.session_id) sdkPayload.sessionId = raw.session_id;
+            // assistant/user messages store content under .message.content
+            const contentSource = raw.content || raw.message?.content;
+            if (contentSource) {
+              const blocks = Array.isArray(contentSource) ? contentSource : [];
+              sdkPayload.blocks = blocks.map((b: any) => {
+                if (b.type === "text") return { type: "text", text: b.text?.slice(0, 200) };
+                if (b.type === "tool_use") return { type: "tool_use", name: b.name, id: b.id };
+                if (b.type === "tool_result") return { type: "tool_result", tool_use_id: b.tool_use_id, content: typeof b.content === 'string' ? b.content.slice(0, 200) : '(structured)' };
+                return { type: b.type };
+              });
+            }
+            if (raw.tool_name) sdkPayload.toolName = raw.tool_name;
+            if (raw.tool_use_id) sdkPayload.toolUseId = raw.tool_use_id;
+            if (raw.elapsed_time_seconds) sdkPayload.elapsed = raw.elapsed_time_seconds;
+            if (raw.duration_ms) sdkPayload.durationMs = raw.duration_ms;
+            if (raw.cost_usd) sdkPayload.cost = raw.cost_usd;
+            if (raw.num_turns) sdkPayload.numTurns = raw.num_turns;
+            if (raw.is_error) sdkPayload.isError = raw.is_error;
+            if (raw.model_usage) sdkPayload.modelUsage = raw.model_usage;
+            // System event fields
+            if (raw.status) sdkPayload.status = raw.status;
+            if (raw.compact_metadata) sdkPayload.compactMetadata = raw.compact_metadata;
+            if (raw.task_id) sdkPayload.taskId = raw.task_id;
+            if (raw.summary) sdkPayload.summary = raw.summary?.slice(0, 300);
+            if (raw.trigger) sdkPayload.trigger = raw.trigger;
+
+            // Persist non-stream events directly
+            const sid = this.sessionId;
+            if (sid) {
+              appendSdkEvent(sid, { ts: now(), ...sdkPayload, type: undefined });
+            }
+          }
+          this.send(sdkPayload as any);
+        } catch (_) {}
 
         if (message.type === "system" && (message as any).subtype === "init") {
           this.sessionId = message.session_id;
@@ -789,14 +934,23 @@ User request: `;
               if (block.type === "tool_use") {
                 // Don't send AskUserQuestion as a tool_call — it's handled
                 // via canUseTool and rendered as a proper question card
-                if (block.name === "AskUserQuestion") continue;
+                if (block.name === "AskUserQuestion") {
+                  this._suppressedToolResultIds.add(block.id);
+                  continue;
+                }
 
                 // Intercept TodoWrite — track todos server-side and push to client
                 if (block.name === "TodoWrite") {
+                  this._suppressedToolResultIds.add(block.id);
                   const todos = (block.input as any)?.todos;
                   if (Array.isArray(todos)) {
                     if (this.sessionId) {
                       saveTodos(this.sessionId, todos);
+                      appendHistory(this.sessionId, {
+                        role: "todos_update",
+                        content: JSON.stringify(todos),
+                        timestamp: new Date().toISOString(),
+                      });
                     }
                     this.send({
                       type: "todos",
@@ -808,7 +962,7 @@ User request: `;
                 }
 
                 // Send MCP tool calls (Speak, SendFile, ScheduleReminder) for UI display
-                const mcpName = block.name.replace("mcp__tts-tools__", "").replace("mcp__reminder-tools__", "");
+                const mcpName = block.name.replace("mcp__app__", "");
                 if (mcpName === "Speak" || mcpName === "SendFile" || mcpName === "ScheduleReminder") {
                   this.send({
                     type: "tool_call",
@@ -877,6 +1031,14 @@ User request: `;
           if (apiMessage?.content && Array.isArray(apiMessage.content)) {
             for (const block of apiMessage.content) {
               if (block.type === "tool_result") {
+                const toolUseId = block.tool_use_id || "";
+
+                // Skip results for suppressed tools (TodoWrite, AskUserQuestion)
+                if (this._suppressedToolResultIds.has(toolUseId)) {
+                  this._suppressedToolResultIds.delete(toolUseId);
+                  continue;
+                }
+
                 const output =
                   typeof block.content === "string"
                     ? block.content
@@ -886,8 +1048,6 @@ User request: `;
                           .map((c: any) => c.text)
                           .join("\n")
                       : JSON.stringify(block.content);
-
-                const toolUseId = block.tool_use_id || "";
 
                 // Detect bash command moved to background (timeout)
                 const bgMatch = output.match(/Command running in background with ID: (\S+)\. Output is being written to: (\S+)/);

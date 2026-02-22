@@ -1,5 +1,5 @@
 import { WebSocket } from "ws";
-import { ServerMessage } from "./protocol";
+import { ServerMessage, HistoryEntry } from "./protocol";
 import * as http from "http";
 
 /** Context provided to plugins at init time (server-level state) */
@@ -15,6 +15,8 @@ export interface SessionContext {
   sessionId: string;
   cwd: string;
   send: (msg: ServerMessage | Record<string, any>) => void;
+  /** Persist a message to session history (survives reconnects/restarts) */
+  appendHistory: (entry: HistoryEntry) => void;
   pendingQuestions: Map<string, { questionId: string; resolve: (answers: Record<string, string>) => void }>;
   questionCounter: { next: () => string };
 }
