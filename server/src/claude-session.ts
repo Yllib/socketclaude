@@ -323,7 +323,7 @@ export class ClaudeSession {
         tools: [
           tool(
             "Speak",
-            "Speak text aloud to the user via text-to-speech. Use this to provide a concise spoken summary of your response. Keep it natural and conversational — no markdown, no code, no formatting. Summarize rather than reading everything verbatim. Only call this once per response.",
+            "Speak text aloud to the user via text-to-speech. Use this to provide a concise spoken summary of your response. Keep it natural and conversational — no markdown, no code, no formatting. Summarize rather than reading everything verbatim. Only call this once per response. Avoid starting with a very short sentence — lead with a substantial opening sentence so audio playback begins with meaningful content.",
             { text: z.string().describe("The text to speak aloud to the user") },
             async (args) => {
               this.send({

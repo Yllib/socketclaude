@@ -56,6 +56,11 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# Fall back to CLAUDE_SESSION_ID env var if --session wasn't passed
+if [[ -z "$TARGET_SESSION" && -n "${CLAUDE_SESSION_ID:-}" ]]; then
+  TARGET_SESSION="$CLAUDE_SESSION_ID"
+fi
+
 # Ensure history directory exists
 mkdir -p "$HISTORY_DIR"
 

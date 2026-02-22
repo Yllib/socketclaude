@@ -6,6 +6,8 @@ import * as http from "http";
 export interface PluginContext {
   getActiveSessions: () => Map<string, any>;
   getConnectedClients: () => Set<WebSocket>;
+  /** Broadcast a message to all connected clients (direct + relay) */
+  broadcast: (msg: string) => void;
   getPort: () => number;
   getDefaultCwd: () => string;
 }

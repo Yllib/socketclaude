@@ -75,6 +75,15 @@ const clearedSessions: Set<string> = new Set();
 // Track all connected WebSocket clients for broadcasting
 const connectedClients = new Set<WebSocket>();
 
+// Track which WebSocket client is viewing which session, so the /continue
+// endpoint can use the real WebSocket instead of a dummy when the app has
+// already reconnected before the continue script runs.
+interface SessionClient {
+  ws: WebSocket;
+  setActiveSession: (s: ClaudeSession) => void;
+}
+const sessionClients = new Map<string, SessionClient>();
+
 /** Broadcast current session list to all connected clients */
 function broadcastSessionList(): void {
   const sessions = listSessions();
@@ -128,6 +137,7 @@ interface ClientTransport {
  */
 function createConnectionHandler(transport: ClientTransport) {
   let activeSession: ClaudeSession | null = null;
+  let activeSessionId: string | null = null;
   let pendingTtsEnabled = false;
   let pendingTtsEngine: "system" | "kokoro_server" | "kokoro_device" = "system";
   let pendingKokoroVoice = "af_heart";
@@ -205,12 +215,19 @@ function createConnectionHandler(transport: ClientTransport) {
           activeSession = new ClaudeSession(transport as any, sessionInfo.cwd, plugins);
           (activeSession as any)._resumeSessionId = msg.sessionId;
         }
+        activeSessionId = msg.sessionId;
         activeSession.setTtsEnabled(pendingTtsEnabled);
         activeSession.setTtsEngine(pendingTtsEngine);
         activeSession.setKokoroVoice(pendingKokoroVoice);
         activeSession.setKokoroSpeed(pendingKokoroSpeed);
         activeSession.setEffort(pendingEffort);
         activeSession.setThinking(pendingThinking);
+
+        // Register this client so /continue can find the real WebSocket
+        sessionClients.set(msg.sessionId, {
+          ws: transport as WebSocket,
+          setActiveSession: (s: ClaudeSession) => { activeSession = s; },
+        });
 
         sendJson({
           type: "session_created",
@@ -700,7 +717,12 @@ function createConnectionHandler(transport: ClientTransport) {
     }
   }
 
-  return { handleMessage, sendJson, sendRaw };
+  return {
+    handleMessage,
+    sendJson,
+    sendRaw,
+    get activeSessionId() { return activeSessionId; },
+  };
 }
 
 const httpServer = http.createServer((req, res) => {
@@ -729,14 +751,26 @@ const httpServer = http.createServer((req, res) => {
           res.end("Session not found");
           return;
         }
-        // Create a session with a dummy (detached) WebSocket — the app will attach when it reconnects
-        const dummyWs = { readyState: WebSocket.CLOSED, send: () => {} } as any;
-        const session = new ClaudeSession(dummyWs, sessionInfo.cwd, plugins);
+        // Use the real WebSocket if a client is already connected for this session
+        // (typical after restart: app reconnects before the continue script runs).
+        // Otherwise fall back to a dummy so the query still runs headless.
+        const existingClient = sessionClients.get(sessionId);
+        const ws = existingClient?.ws?.readyState === WebSocket.OPEN
+          ? existingClient.ws
+          : { readyState: WebSocket.CLOSED, send: () => {} } as any;
+        const session = new ClaudeSession(ws, sessionInfo.cwd, plugins);
         (session as any)._resumeSessionId = sessionId;
         session.onActivity = () => scheduleBroadcast();
 
         // Register immediately so the app can find it when it reconnects
         activeSessions.set(sessionId, session);
+
+        // Update the connection handler's active session so future messages
+        // (prompts, answers, abort) from the app go to this running session
+        if (existingClient) {
+          existingClient.setActiveSession(session);
+          console.log(`[Continue] Using existing WebSocket for session ${sessionId}`);
+        }
         console.log(`[Continue] Starting query for session ${sessionId}`);
 
         session.runQuery(prompt, sessionId).then(() => {
@@ -860,6 +894,16 @@ httpServer.listen(PORT, async () => {
   const pluginContext: PluginContext = {
     getActiveSessions: () => activeSessions,
     getConnectedClients: () => connectedClients,
+    broadcast: (msg: string) => {
+      for (const client of connectedClients) {
+        if (client.readyState === WebSocket.OPEN) {
+          client.send(msg);
+        }
+      }
+      if (relayConnectionHandler) {
+        relayConnectionHandler.sendRaw(msg);
+      }
+    },
     getPort: () => PORT,
     getDefaultCwd: () => DEFAULT_CWD,
   };
@@ -951,6 +995,13 @@ wss.on("connection", (ws: WebSocket) => {
   ws.on("close", () => {
     console.log("Client disconnected");
     connectedClients.delete(ws);
+    // Clean up session client mapping for this connection
+    if (handler.activeSessionId) {
+      const client = sessionClients.get(handler.activeSessionId);
+      if (client && client.ws === ws) {
+        sessionClients.delete(handler.activeSessionId);
+      }
+    }
     // DON'T abort — let the session keep running in the background
   });
 
