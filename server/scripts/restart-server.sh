@@ -2,21 +2,21 @@
 #
 # restart-server.sh — Restart SocketClaude server with app notifications
 #
-# Writes "restart initiated" and "server restarted" messages directly into
-# session history so both the user (in app) and Claude (in chat context)
-# see the restart happened and succeeded.
+# Queries the running server for active sessions before restarting, writes
+# restart notifications to ALL running sessions' history, and resumes them
+# all after the server comes back up.
 #
-# Usage: ./restart-server.sh [--compile] [--session SESSION_ID]
-#   --compile    Run npx tsc before restarting (default: yes)
-#   --session    Target a specific session ID (default: most recently active)
+# Usage: ./restart-server.sh [--no-compile] [--session SESSION_ID]
+#   --no-compile   Skip TypeScript compilation
+#   --session      Target a specific session ID (in addition to running ones)
 #
 # The script:
-# 1. Finds the active/recent session(s) from sessions.json
-# 2. Appends a "Server restart initiated" entry to session history
+# 1. Queries GET /running-sessions to find all actively running sessions
+# 2. Appends "Server restart initiated" to all their histories
 # 3. Optionally compiles TypeScript
 # 4. Restarts the systemd service
 # 5. Waits for the server to come back up
-# 6. Appends a "Server restarted successfully" entry to session history
+# 6. Appends "Server restart complete" and continues ALL sessions
 #
 # NOTE: This script escapes the socketclaude service's cgroup on first run
 # (via systemd-run) so it survives the service restart.
@@ -44,22 +44,31 @@ SERVER_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 SERVICE_NAME="socketclaude"
 
 COMPILE=true
-TARGET_SESSION=""
+EXTRA_SESSION=""
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --no-compile) COMPILE=false; shift ;;
     --compile) COMPILE=true; shift ;;
-    --session) TARGET_SESSION="$2"; shift 2 ;;
+    --session) EXTRA_SESSION="$2"; shift 2 ;;
     *) echo "Unknown option: $1"; exit 1 ;;
   esac
 done
 
 # Fall back to CLAUDE_SESSION_ID env var if --session wasn't passed
-if [[ -z "$TARGET_SESSION" && -n "${CLAUDE_SESSION_ID:-}" ]]; then
-  TARGET_SESSION="$CLAUDE_SESSION_ID"
+if [[ -z "$EXTRA_SESSION" && -n "${CLAUDE_SESSION_ID:-}" ]]; then
+  EXTRA_SESSION="$CLAUDE_SESSION_ID"
 fi
+
+# Load .env for PORT and AUTH_TOKEN
+if [[ -f "$SERVER_DIR/.env" ]]; then
+  set -a
+  source "$SERVER_DIR/.env"
+  set +a
+fi
+PORT="${PORT:-8085}"
+AUTH_TOKEN="${AUTH_TOKEN:-}"
 
 # Ensure history directory exists
 mkdir -p "$HISTORY_DIR"
@@ -91,58 +100,83 @@ inject_history() {
   "
 }
 
-# Find target session ID(s) — either specified or most recently active
-get_target_sessions() {
-  if [[ -n "$TARGET_SESSION" ]]; then
-    echo "$TARGET_SESSION"
-    return
-  fi
-
-  if [[ ! -f "$SESSIONS_FILE" ]]; then
+# Query the running server for actively running session IDs
+get_running_sessions() {
+  if [[ -z "$AUTH_TOKEN" ]]; then
     echo ""
     return
   fi
-
-  # Get the most recently active session(s)
-  node -e "
-    const sessions = JSON.parse(require('fs').readFileSync('${SESSIONS_FILE}', 'utf-8'));
-    const sorted = sessions.sort((a, b) => new Date(b.lastActive) - new Date(a.lastActive));
-    // Output the most recent session (or all sessions active in the last hour)
-    const cutoff = Date.now() - 3600000;
-    const recent = sorted.filter(s => new Date(s.lastActive).getTime() > cutoff);
-    const targets = recent.length > 0 ? recent : sorted.slice(0, 1);
-    targets.forEach(s => console.log(s.id));
-  "
+  # curl the running-sessions endpoint; fail silently if server is unreachable
+  local response
+  response=$(curl -s --max-time 3 "http://localhost:${PORT}/running-sessions?token=${AUTH_TOKEN}" 2>/dev/null) || true
+  if [[ -n "$response" ]]; then
+    echo "$response" | node -e "
+      let d=''; process.stdin.on('data',c=>d+=c); process.stdin.on('end',()=>{
+        try {
+          const obj = JSON.parse(d);
+          (obj.sessions || []).forEach(s => console.log(s));
+        } catch {}
+      });
+    " 2>/dev/null || true
+  fi
 }
 
 # Check if server is responding
 check_server() {
   local port
   port=$(grep -oP 'PORT=\K\d+' "$SERVER_DIR/.env" 2>/dev/null || echo "8085")
-  # Try to connect to the WebSocket port
   (echo > /dev/tcp/localhost/"$port") 2>/dev/null
 }
 
 echo "=== SocketClaude Server Restart ==="
 echo ""
 
-# Get target sessions
-SESSIONS=$(get_target_sessions)
+# Get running sessions from the live server
+echo "Querying server for running sessions..."
+RUNNING_SESSIONS=$(get_running_sessions)
 
-if [[ -z "$SESSIONS" ]]; then
-  echo "Warning: No sessions found in $SESSIONS_FILE"
+# Merge with extra session (dedup)
+ALL_SESSIONS="$RUNNING_SESSIONS"
+if [[ -n "$EXTRA_SESSION" ]]; then
+  if ! echo "$ALL_SESSIONS" | grep -qx "$EXTRA_SESSION" 2>/dev/null; then
+    if [[ -n "$ALL_SESSIONS" ]]; then
+      ALL_SESSIONS="$ALL_SESSIONS"$'\n'"$EXTRA_SESSION"
+    else
+      ALL_SESSIONS="$EXTRA_SESSION"
+    fi
+  fi
+fi
+
+# Fall back to most recently active session if we found nothing
+if [[ -z "$ALL_SESSIONS" ]] && [[ -f "$SESSIONS_FILE" ]]; then
+  echo "  No running sessions found, falling back to most recently active..."
+  ALL_SESSIONS=$(node -e "
+    const sessions = JSON.parse(require('fs').readFileSync('${SESSIONS_FILE}', 'utf-8'));
+    const sorted = sessions.sort((a, b) => new Date(b.lastActive) - new Date(a.lastActive));
+    if (sorted.length > 0) console.log(sorted[0].id);
+  " 2>/dev/null || true)
+fi
+
+if [[ -z "$ALL_SESSIONS" ]]; then
+  echo "Warning: No sessions found"
   echo "Proceeding with restart anyway..."
 else
   echo "Target sessions:"
-  echo "$SESSIONS" | while read -r sid; do
-    echo "  - $sid"
+  echo "$ALL_SESSIONS" | while read -r sid; do
+    [[ -z "$sid" ]] && continue
+    # Mark if it was actively running
+    if echo "$RUNNING_SESSIONS" | grep -qx "$sid" 2>/dev/null; then
+      echo "  - $sid (running)"
+    else
+      echo "  - $sid"
+    fi
   done
 fi
 
 # Step 1: Write "restart initiated" to session history
 echo ""
 echo "[1/4] Writing restart notification to history..."
-echo "$SESSIONS" | while read -r sid; do
+echo "$ALL_SESSIONS" | while read -r sid; do
   [[ -z "$sid" ]] && continue
   inject_history "$sid" "assistant" "[Server restart initiated — compiling and restarting service...]"
   echo "  Wrote to session $sid"
@@ -157,8 +191,7 @@ if $COMPILE; then
     echo "  Compilation successful"
   else
     echo "  Compilation failed!"
-    # Write failure to history
-    echo "$SESSIONS" | while read -r sid; do
+    echo "$ALL_SESSIONS" | while read -r sid; do
       [[ -z "$sid" ]] && continue
       inject_history "$sid" "assistant" "[Server restart FAILED — TypeScript compilation error. Server was NOT restarted.]"
     done
@@ -190,7 +223,7 @@ echo "  Restart command sent"
 # Write success to history immediately after systemctl returns.
 # systemd has forked the new process but Node.js hasn't opened the port yet,
 # so this lands in history before the app reconnects and requests it.
-echo "$SESSIONS" | while read -r sid; do
+echo "$ALL_SESSIONS" | while read -r sid; do
   [[ -z "$sid" ]] && continue
   inject_history "$sid" "assistant" "[Server restart complete.]"
   echo "  Wrote success to session $sid"
@@ -206,8 +239,7 @@ while ! check_server 2>/dev/null; do
   WAITED=$((WAITED + 1))
   if [[ $WAITED -ge $MAX_WAIT ]]; then
     echo "  Server did not start within ${MAX_WAIT}s"
-    # Overwrite the optimistic success with failure
-    echo "$SESSIONS" | while read -r sid; do
+    echo "$ALL_SESSIONS" | while read -r sid; do
       [[ -z "$sid" ]] && continue
       inject_history "$sid" "assistant" "[Server restart FAILED — service did not come back up within ${MAX_WAIT} seconds.]"
     done
@@ -220,16 +252,17 @@ done
 
 echo "  Server is up! (took ${WAITED}s)"
 
-# Step 5: Continue the session with a restart-success prompt
+# Step 5: Continue ALL sessions that were running
 echo ""
-echo "[5/5] Continuing session..."
+echo "[5/5] Continuing sessions..."
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-FIRST_SESSION=$(echo "$SESSIONS" | head -1)
-if [[ -n "$FIRST_SESSION" ]]; then
-  node "$SCRIPT_DIR/continue-session.js" "$FIRST_SESSION" \
+echo "$ALL_SESSIONS" | while read -r sid; do
+  [[ -z "$sid" ]] && continue
+  echo "  Continuing session $sid..."
+  node "$SCRIPT_DIR/continue-session.js" "$sid" \
     "[System: The server restart completed successfully (${WAITED}s). Continue where you left off.]" \
-    2>&1 || echo "  Warning: continue-session failed (non-fatal)"
-fi
+    2>&1 || echo "  Warning: continue-session failed for $sid (non-fatal)"
+done
 
 echo ""
 echo "=== Restart complete ==="

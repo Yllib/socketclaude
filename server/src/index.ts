@@ -7,7 +7,7 @@ import * as http from "http";
 import * as path from "path";
 import { WebSocketServer, WebSocket } from "ws";
 import { ClaudeSession } from "./claude-session";
-import { listSessions, getSession, getHistory, getHistoryPage, deleteSession, clearSessionContext, cleanupPendingToolCalls, getTodos, getMissedMessages, appendHistory, getSdkEvents } from "./session-store";
+import { listSessions, getSession, getHistory, getHistoryPage, deleteSession, clearSessionContext, cleanupPendingToolCalls, getTodos, getMissedMessages, appendHistory, getSdkEvents, markQuestionAnswered } from "./session-store";
 import { ClientMessage } from "./protocol";
 import { SocketClaudePlugin, PluginContext } from "./plugin-api";
 import { RelayClient, RelayStatus } from "./relay-client";
@@ -237,12 +237,14 @@ function createConnectionHandler(transport: ClientTransport) {
 
         // Send most recent page of message history (always send, even if empty)
         const page = getHistoryPage(msg.sessionId, 50);
+        const todos = getTodos(msg.sessionId);
         sendJson({
           type: "session_history",
           sessionId: msg.sessionId,
           messages: page.entries,
           total: page.total,
           offset: page.offset,
+          ...(todos.length > 0 ? { todos } : {}),
         });
 
         // Check for missed messages from Claude Code's session file
@@ -266,16 +268,6 @@ function createConnectionHandler(transport: ClientTransport) {
               append: true,
             });
           }
-        }
-
-        // Send stored todos
-        const todos = getTodos(msg.sessionId);
-        if (todos.length > 0) {
-          sendJson({
-            type: "todos",
-            sessionId: msg.sessionId,
-            todos,
-          });
         }
 
         // Send SDK event history for raw debug mode
@@ -387,12 +379,60 @@ function createConnectionHandler(transport: ClientTransport) {
           for (const plugin of plugins) {
             if (plugin.answerMiddleware) {
               const result = await plugin.answerMiddleware(qId, msg.answers, sessionCtx);
-              if (result.handled) { answerHandled = true; break; }
+              if (result.handled) {
+                answerHandled = true;
+                // Notify app so card marks as answered
+                sendJson({ type: "question_answered", questionId: qId });
+                // Persist answered state in history
+                const sid = activeSession.getSessionId()
+                  || (activeSession as any)._resumeSessionId
+                  || activeSessionId
+                  || undefined;
+                if (sid) markQuestionAnswered(sid, qId);
+                break;
+              }
             }
           }
         }
         if (!answerHandled && activeSession) {
-          activeSession.resolveQuestion(qId, msg.answers);
+          const resolved = activeSession.resolveQuestion(qId, msg.answers);
+          if (!resolved) {
+            // Question promise is gone (e.g. after server restart) — inject as prompt
+            const answers = msg.answers as Record<string, string>;
+            const parts: string[] = [];
+            for (const [question, answer] of Object.entries(answers)) {
+              parts.push(`Q: ${question}\nA: ${answer}`);
+            }
+            const injectedText = `[You previously asked me a question. Here is my answer:]\n\n${parts.join("\n\n")}`;
+            console.log(`[Answer] No pending promise for ${qId}, injecting as prompt`);
+            // Confirm to app that the question was handled (so card marks as answered)
+            sendJson({ type: "question_answered", questionId: qId });
+            // Resolve the session ID — check all sources (same as prompt handler)
+            const sid = activeSession.getSessionId()
+              || (activeSession as any)._resumeSessionId
+              || activeSessionId
+              || undefined;
+            // Mark as answered in history even though promise is gone
+            if (sid) {
+              markQuestionAnswered(sid, qId);
+            }
+            // If a query is running, inject mid-conversation; otherwise resume with answer
+            if (activeSession.isRunning) {
+              activeSession.injectMessage(injectedText);
+            } else {
+              // Resume the existing session with the answer context
+              activeSession.onActivity = () => scheduleBroadcast();
+              activeSession.runQuery(injectedText, sid).then(() => {
+                const s = activeSession?.getSessionId();
+                if (s && activeSessions.get(s) === activeSession) {
+                  activeSessions.delete(s);
+                }
+                broadcastSessionList();
+              }).catch((err) => {
+                sendJson({ type: "error", message: err.message || "Query failed" });
+              });
+            }
+          }
         }
         break;
       }
@@ -438,9 +478,32 @@ function createConnectionHandler(transport: ClientTransport) {
       }
 
       case "abort": {
-        if (activeSession) {
-          console.log(`Aborting active session`);
+        // Always use the explicit session ID from the client
+        const targetSid = msg.sessionId || activeSessionId;
+        if (!targetSid) {
+          console.log(`[Abort] No session ID provided and no active session`);
+          break;
+        }
+        const targetSession = activeSessions.get(targetSid);
+        if (targetSession) {
+          console.log(`[Abort] Aborting session ${targetSid} (isRunning=${targetSession.isRunning})`);
+          targetSession.abort();
+          activeSessions.delete(targetSid);
+          broadcastStatusSync();
+        } else if (activeSession && activeSessionId === targetSid) {
+          console.log(`[Abort] Aborting connection-local session ${targetSid}`);
           activeSession.abort();
+          broadcastStatusSync();
+        } else {
+          console.log(`[Abort] Session ${targetSid} not found in activeSessions`);
+        }
+        break;
+      }
+
+      case "interrupt": {
+        if (activeSession) {
+          console.log(`Interrupting active session (graceful pause)`);
+          activeSession.interrupt();
         }
         break;
       }
@@ -526,6 +589,76 @@ function createConnectionHandler(transport: ClientTransport) {
         console.log(`[stop_task] received: taskId=${taskId} activeSession=${!!activeSession}`);
         if (activeSession && taskId) {
           activeSession.stopTask(taskId).catch(e => console.error(`[stop_task] error: ${e}`));
+        }
+        break;
+      }
+
+      case "set_model": {
+        const model = (msg as any).model as string | undefined;
+        if (activeSession) {
+          activeSession.setModel(model).catch(e => {
+            console.error(`[set_model] error: ${e}`);
+            sendJson({ type: "error", message: `Failed to set model: ${e.message || e}` });
+          });
+        }
+        break;
+      }
+
+      case "mcp_status": {
+        if (activeSession) {
+          activeSession.mcpServerStatus().then(status => {
+            sendJson({ type: "mcp_status", servers: status || [] });
+          }).catch(e => {
+            sendJson({ type: "error", message: `Failed to get MCP status: ${e.message || e}` });
+          });
+        }
+        break;
+      }
+
+      case "mcp_reconnect": {
+        const serverName = (msg as any).serverName as string;
+        if (activeSession && serverName) {
+          activeSession.reconnectMcpServer(serverName).then(result => {
+            sendJson({ type: "mcp_reconnect_result", serverName, success: true });
+          }).catch(e => {
+            sendJson({ type: "error", message: `Failed to reconnect ${serverName}: ${e.message || e}` });
+          });
+        }
+        break;
+      }
+
+      case "mcp_toggle": {
+        const serverName = (msg as any).serverName as string;
+        const enabled = (msg as any).enabled as boolean;
+        if (activeSession && serverName) {
+          activeSession.toggleMcpServer(serverName, enabled).then(() => {
+            sendJson({ type: "mcp_toggle_result", serverName, enabled });
+          }).catch(e => {
+            sendJson({ type: "error", message: `Failed to toggle ${serverName}: ${e.message || e}` });
+          });
+        }
+        break;
+      }
+
+      case "rewind": {
+        const uuid = (msg as any).userMessageUuid as string;
+        const dryRun = (msg as any).dryRun === true;
+        if (!activeSession) {
+          sendJson({ type: "rewind_result", uuid, dryRun, success: false, error: "No active session" });
+        } else if (!uuid) {
+          sendJson({ type: "rewind_result", uuid, dryRun, success: false, error: "No message UUID" });
+        } else if (!activeSession.isRunning) {
+          sendJson({ type: "rewind_result", uuid, dryRun, success: false, error: "No active query — rewind requires a running conversation. Send a message first, then rewind." });
+        } else {
+          activeSession.rewindFiles(uuid, dryRun).then(result => {
+            if (!result) {
+              sendJson({ type: "rewind_result", uuid, dryRun, success: false, error: "No file checkpoint found at this message" });
+            } else {
+              sendJson({ type: "rewind_result", uuid, dryRun, success: true, ...result });
+            }
+          }).catch(e => {
+            sendJson({ type: "rewind_result", uuid, dryRun, success: false, error: e.message || String(e) });
+          });
         }
         break;
       }
@@ -794,6 +927,24 @@ const httpServer = http.createServer((req, res) => {
     return;
   }
 
+  // GET /running-sessions — return list of currently running session IDs (used by restart script)
+  if (req.method === "GET" && req.url?.startsWith("/running-sessions")) {
+    const url = new URL(req.url, `http://localhost:${PORT}`);
+    const token = url.searchParams.get("token");
+    if (token !== AUTH_TOKEN) {
+      res.writeHead(401);
+      res.end("Unauthorized");
+      return;
+    }
+    const running: string[] = [];
+    for (const [sid, session] of activeSessions) {
+      if (session.isRunning) running.push(sid);
+    }
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ sessions: running }));
+    return;
+  }
+
   // GET /tts-model — serve Kokoro model as tar.gz for on-device download
   if (req.method === "GET" && req.url?.startsWith("/tts-model")) {
     const url = new URL(req.url, `http://localhost:${PORT}`);
@@ -931,29 +1082,14 @@ cleanupPendingToolCalls();
 // Broadcasts current state to all connected clients so the app stays in sync
 // after reconnects, server restarts, or dropped messages.
 const SERVER_STARTED_AT = new Date().toISOString();
-const STATUS_SYNC_INTERVAL = 10000; // 10 seconds
+const STATUS_SYNC_IDLE_INTERVAL = 10000; // 10s when idle
+const STATUS_SYNC_RUNNING_INTERVAL = 3000; // 3s when running
 
-setInterval(() => {
+/** Build and broadcast status_sync to all connected clients (and relay). */
+function broadcastStatusSync(): void {
   if (connectedClients.size === 0 && !relayConnectionHandler) return;
 
-  // Determine if any session is currently running
-  let anyRunning = false;
-  const backgroundTaskIds: string[] = [];
-  for (const [sid, session] of activeSessions) {
-    if (session.isRunning) anyRunning = true;
-    for (const [taskId] of session.activeBackgroundTasks) {
-      backgroundTaskIds.push(taskId);
-    }
-  }
-
-  const msg = JSON.stringify({
-    type: "status_sync",
-    running: anyRunning,
-    serverStartedAt: SERVER_STARTED_AT,
-    serverPid: process.pid,
-    backgroundTaskIds,
-  });
-
+  const msg = buildStatusSyncMessage();
   for (const client of connectedClients) {
     if (client.readyState === WebSocket.OPEN) {
       client.send(msg);
@@ -962,12 +1098,63 @@ setInterval(() => {
   if (relayConnectionHandler) {
     relayConnectionHandler.sendRaw(msg);
   }
-}, STATUS_SYNC_INTERVAL);
+}
+
+/** Send status_sync to a single client. */
+function sendStatusSyncTo(ws: WebSocket): void {
+  if (ws.readyState === WebSocket.OPEN) {
+    ws.send(buildStatusSyncMessage());
+  }
+}
+
+function buildStatusSyncMessage(): string {
+  let anyRunning = false;
+  const runningSessions: string[] = [];
+  const backgroundTaskIds: string[] = [];
+  for (const [sid, session] of activeSessions) {
+    if (session.isRunning) {
+      anyRunning = true;
+      runningSessions.push(sid);
+    }
+    for (const [taskId] of session.activeBackgroundTasks) {
+      backgroundTaskIds.push(taskId);
+    }
+  }
+  return JSON.stringify({
+    type: "status_sync",
+    running: anyRunning,
+    runningSessions,
+    serverStartedAt: SERVER_STARTED_AT,
+    serverPid: process.pid,
+    backgroundTaskIds,
+  });
+}
+
+// Adaptive heartbeat: 3s when any session is running, 10s when idle
+let statusSyncTimer: ReturnType<typeof setTimeout> | null = null;
+function scheduleStatusSync(): void {
+  if (statusSyncTimer) clearTimeout(statusSyncTimer);
+
+  let anyRunning = false;
+  for (const [, session] of activeSessions) {
+    if (session.isRunning) { anyRunning = true; break; }
+  }
+
+  const interval = anyRunning ? STATUS_SYNC_RUNNING_INTERVAL : STATUS_SYNC_IDLE_INTERVAL;
+  statusSyncTimer = setTimeout(() => {
+    broadcastStatusSync();
+    scheduleStatusSync(); // reschedule
+  }, interval);
+}
+scheduleStatusSync();
 
 // ── Direct WebSocket connections ──
 wss.on("connection", (ws: WebSocket) => {
   console.log("Client connected (authenticated)");
   connectedClients.add(ws);
+
+  // Send immediate status so the app knows server state right away
+  sendStatusSyncTo(ws);
 
   const handler = createConnectionHandler(ws);
 

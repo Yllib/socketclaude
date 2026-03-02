@@ -33,6 +33,11 @@ export interface DeleteSessionMessage {
 
 export interface AbortMessage {
   type: "abort";
+  sessionId?: string;
+}
+
+export interface InterruptMessage {
+  type: "interrupt";
 }
 
 export interface SetTtsMessage {
@@ -119,6 +124,32 @@ export interface ForkSessionMessage {
   sessionId: string;
 }
 
+export interface SetModelMessage {
+  type: "set_model";
+  model?: string;
+}
+
+export interface McpStatusRequestMessage {
+  type: "mcp_status";
+}
+
+export interface McpReconnectMessage {
+  type: "mcp_reconnect";
+  serverName: string;
+}
+
+export interface McpToggleMessage {
+  type: "mcp_toggle";
+  serverName: string;
+  enabled: boolean;
+}
+
+export interface RewindMessage {
+  type: "rewind";
+  userMessageUuid: string;
+  dryRun?: boolean;
+}
+
 export type ClientMessage =
   | PromptMessage
   | AnswerMessage
@@ -128,6 +159,7 @@ export type ClientMessage =
   | DeleteSessionMessage
   | ClearContextMessage
   | AbortMessage
+  | InterruptMessage
   | SetTtsMessage
   | SetTtsEngineMessage
   | RequestTtsAudioMessage
@@ -135,6 +167,11 @@ export type ClientMessage =
   | SetThinkingMessage
   | StopTaskMessage
   | ForkSessionMessage
+  | SetModelMessage
+  | McpStatusRequestMessage
+  | McpReconnectMessage
+  | McpToggleMessage
+  | RewindMessage
   | RequestFileMessage
   | LoadMoreHistoryMessage
   | CheckCwdMessage
@@ -148,6 +185,8 @@ export interface TextServerMessage {
   type: "text";
   content: string;
   sessionId: string;
+  parentToolUseId?: string | null;
+  uuid?: string;
 }
 
 export interface ToolCallServerMessage {
@@ -156,6 +195,8 @@ export interface ToolCallServerMessage {
   input: Record<string, unknown>;
   toolUseId: string;
   sessionId: string;
+  parentToolUseId?: string | null;
+  uuid?: string;
 }
 
 export interface ToolResultServerMessage {
@@ -163,6 +204,8 @@ export interface ToolResultServerMessage {
   toolUseId: string;
   output: string;
   sessionId: string;
+  parentToolUseId?: string | null;
+  uuid?: string;
 }
 
 export interface EmailPreview {
@@ -170,6 +213,8 @@ export interface EmailPreview {
   subject: string;
   body: string;
   cc?: string;
+  attachment?: string;
+  scheduledTime?: string;
 }
 
 export interface QuestionServerMessage {
@@ -187,6 +232,14 @@ export interface QuestionItem {
   multiSelect?: boolean;
 }
 
+export interface ThinkingServerMessage {
+  type: "thinking";
+  content: string;
+  sessionId: string;
+  parentToolUseId?: string | null;
+  uuid?: string;
+}
+
 export interface UsageInfo {
   inputTokens: number;
   outputTokens: number;
@@ -201,11 +254,13 @@ export interface ResultServerMessage {
   sessionId: string;
   costUsd?: number;
   durationMs?: number;
+  durationApiMs?: number;
   usage?: UsageInfo;
   numTurns?: number;
   stopReason?: string;
   resultSubtype?: string;
   errors?: string[];
+  permissionDenials?: { tool_name: string; tool_use_id: string; tool_input: Record<string, unknown> }[];
 }
 
 export interface SessionListServerMessage {
@@ -236,7 +291,7 @@ export interface SessionCreatedServerMessage {
 }
 
 export interface HistoryEntry {
-  role: "user" | "assistant" | "tool_call" | "tool_result" | "question" | "todos_update";
+  role: "user" | "assistant" | "tool_call" | "tool_result" | "question" | "todos_update" | "user_uuid";
   content: string;
   toolName?: string;
   toolInput?: Record<string, unknown>;
@@ -248,6 +303,14 @@ export interface HistoryEntry {
   questions?: QuestionItem[];
   emailPreview?: EmailPreview;
   answered?: boolean;
+  // Subagent hierarchy and message tracking
+  parentToolUseId?: string | null;
+  uuid?: string;
+  // Tool summary fields
+  toolSummary?: boolean;
+  precedingToolUseIds?: string[];
+  // Thinking block
+  thinking?: boolean;
 }
 
 export interface SessionHistoryServerMessage {
@@ -313,6 +376,17 @@ export interface TaskNotificationServerMessage {
   outputFile?: string;
   summary: string;
   sessionId: string;
+  parentToolUseId?: string | null;
+  uuid?: string;
+}
+
+export interface ToolSummaryServerMessage {
+  type: "tool_summary";
+  summary: string;
+  precedingToolUseIds: string[];
+  sessionId: string;
+  parentToolUseId?: string | null;
+  uuid?: string;
 }
 
 export interface SessionForkedServerMessage {
@@ -347,5 +421,7 @@ export type ServerMessage =
   | ReminderServerMessage
   | CompactBoundaryServerMessage
   | TaskNotificationServerMessage
+  | ToolSummaryServerMessage
   | SessionForkedServerMessage
-  | TtsAudioServerMessage;
+  | TtsAudioServerMessage
+  | ThinkingServerMessage;

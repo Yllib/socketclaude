@@ -9,7 +9,7 @@ import {
   QuestionItem,
   SessionInfo,
 } from "./protocol";
-import { saveSession, updateSessionActivity, appendHistory, saveTodos, remapSession, markQuestionAnswered, appendSdkEvent } from "./session-store";
+import { saveSession, updateSessionActivity, appendHistory, saveTodos, getTodos, remapSession, markQuestionAnswered, appendSdkEvent } from "./session-store";
 import { SocketClaudePlugin, SessionContext } from "./plugin-api";
 import { generateKokoroAudio, isKokoroAvailable } from "./kokoro-tts";
 
@@ -39,6 +39,8 @@ export class ClaudeSession {
   private _activeBashStream: { interval: NodeJS.Timeout; filePath: string; lastSize: number } | null = null;
   private _streamingText = "";  // accumulated text for the current streaming response
   private _lastPreview: string = "";
+  private _lastSessionInit: ServerMessage | null = null;
+  private _lastSupportedModels: ServerMessage | null = null;
   public onActivity?: () => void;
   // When set, this fresh session replaces an old cleared session — remap the ID in the store
   public replacesSessionId?: string;
@@ -191,6 +193,9 @@ export class ClaudeSession {
   /** Swap the WebSocket so a reconnecting client receives future messages */
   setWebSocket(ws: WebSocket): void {
     this.ws = ws;
+    // Re-send cached session init and models so app UI populates immediately
+    if (this._lastSessionInit) this.send(this._lastSessionInit);
+    if (this._lastSupportedModels) this.send(this._lastSupportedModels);
     // Send any text accumulated during the current streaming response
     if (this._streamingText.length > 0) {
       this.send({
@@ -231,7 +236,7 @@ export class ClaudeSession {
     };
   }
 
-  resolveQuestion(questionId: string, answers: Record<string, string>): void {
+  resolveQuestion(questionId: string, answers: Record<string, string>): boolean {
     const pending = this.pendingQuestions.get(questionId);
     if (pending) {
       pending.resolve(answers);
@@ -240,7 +245,9 @@ export class ClaudeSession {
       if (this.sessionId) {
         markQuestionAnswered(this.sessionId, questionId);
       }
+      return true;
     }
+    return false;
   }
 
   abort(): void {
@@ -250,6 +257,53 @@ export class ClaudeSession {
       try { this.activeQuery.close(); } catch {}
       this.activeQuery = null;
     }
+  }
+
+  /** Gracefully stop the current query between turns — session stays alive and can continue */
+  interrupt(): void {
+    if (this.activeQuery) {
+      this.activeQuery.interrupt();
+    }
+  }
+
+  /** Switch model mid-session. Pass undefined to reset to default. */
+  async setModel(model?: string): Promise<void> {
+    if (this.activeQuery) {
+      await this.activeQuery.setModel(model);
+      console.log(`[Model] Set to ${model || 'default'} for session ${this.sessionId || '(pending)'}`);
+    }
+  }
+
+  /** Get MCP server health status */
+  async mcpServerStatus(): Promise<any> {
+    if (this.activeQuery) {
+      return this.activeQuery.mcpServerStatus();
+    }
+    return null;
+  }
+
+  /** Reconnect a failed MCP server */
+  async reconnectMcpServer(name: string): Promise<any> {
+    if (this.activeQuery) {
+      return (this.activeQuery as any).reconnectMcpServer(name);
+    }
+    return null;
+  }
+
+  /** Toggle an MCP server on/off */
+  async toggleMcpServer(name: string, enabled: boolean): Promise<any> {
+    if (this.activeQuery) {
+      return (this.activeQuery as any).toggleMcpServer(name, enabled);
+    }
+    return null;
+  }
+
+  /** Rewind files to a specific message UUID (requires file checkpointing) */
+  async rewindFiles(uuid: string, dryRun = false): Promise<any> {
+    if (this.activeQuery) {
+      return this.activeQuery.rewindFiles(uuid, { dryRun });
+    }
+    return null;
   }
 
   /** Inject a user message into the running conversation between turns */
@@ -309,6 +363,8 @@ export class ClaudeSession {
       // Inject session ID for tools that need to reach the app
       const sid = resumeSessionId || this.sessionId || "";
       if (sid) cleanEnv["CLAUDE_SESSION_ID"] = sid;
+      // Enable file checkpointing for rewind support
+      cleanEnv["CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING"] = "1";
 
       // Merge plugin environment variables
       for (const plugin of this.plugins) {
@@ -429,13 +485,7 @@ export class ClaudeSession {
         }
       }
 
-      const toolContext = `You are a general-purpose personal assistant. You can schedule reminders for the user using the ScheduleReminder tool — use ISO 8601 datetime for the scheduledTime parameter.${ttsInstruction}${pluginContext}
-
-User request: `;
-
-      const enrichedPrompt = (!resumeSessionId && !this.sessionId)
-        ? toolContext + prompt
-        : prompt;
+      const toolContext = `You are a general-purpose personal assistant. You can schedule reminders for the user using the ScheduleReminder tool — use ISO 8601 datetime for the scheduledTime parameter.${ttsInstruction}${pluginContext}`;
 
       // Handle fork: use fork source as resume target + set forkSession flag
       const shouldFork = !!this._forkFromSessionId;
@@ -446,10 +496,10 @@ User request: `;
         ? forkSourceId
         : (resumeSessionId || this.sessionId || undefined);
 
-      console.log(`Starting query: resume=${resumeTarget || 'none'}${shouldFork ? ' (FORK)' : ''}, effort=${this._effort}, thinking=${JSON.stringify(this._thinking)}, prompt=${enrichedPrompt.slice(0, 80)}..., cwd=${this.cwd}`);
+      console.log(`Starting query: resume=${resumeTarget || 'none'}${shouldFork ? ' (FORK)' : ''}, effort=${this._effort}, thinking=${JSON.stringify(this._thinking)}, prompt=${prompt.slice(0, 80)}..., cwd=${this.cwd}`);
 
       const q = this.activeQuery = query({
-        prompt: enrichedPrompt,
+        prompt: prompt,
         options: {
           cwd: this.cwd,
           permissionMode: "bypassPermissions",
@@ -460,8 +510,9 @@ User request: `;
           abortController: this.abortController,
           effort: this._effort as any,
           thinking: this._thinking as any,
-          systemPrompt: { type: "preset", preset: "claude_code" },
+          systemPrompt: { type: "preset", preset: "claude_code", append: toolContext } as any,
           tools: { type: "preset", preset: "claude_code" },
+          enableFileCheckpointing: true,
           settingSources: ["user", "project"],
           mcpServers: (() => {
             const servers: Record<string, any> = { "app": appTools };
@@ -478,6 +529,61 @@ User request: `;
             return tools;
           })(),
           env: cleanEnv,
+          hooks: {
+            PreToolUse: [{
+              hooks: [async (input: any) => {
+                const toolName = input.tool_name || "";
+                const toolInput = input.tool_input || {};
+
+                // Run plugin interceptors
+                const sessionCtx = this.getSessionContext();
+                for (const plugin of this.plugins) {
+                  if (plugin.canUseToolInterceptor) {
+                    const result = await plugin.canUseToolInterceptor(toolName, toolInput, sessionCtx);
+                    if (result !== null && result !== undefined) {
+                      if (result.behavior === "deny") {
+                        console.log(`[Hook] PreToolUse DENIED by plugin: ${toolName}`);
+                        return {
+                          hookSpecificOutput: {
+                            hookEventName: "PreToolUse",
+                            permissionDecision: "deny",
+                            permissionDecisionReason: result.message || "Blocked by plugin",
+                          },
+                        };
+                      }
+                      // Plugin explicitly allowed
+                      console.log(`[Hook] PreToolUse ALLOWED by plugin: ${toolName}`);
+                      return {
+                        hookSpecificOutput: {
+                          hookEventName: "PreToolUse",
+                          permissionDecision: "allow",
+                        },
+                      };
+                    }
+                  }
+                }
+
+                // No plugin intercepted — allow
+                return { continue: true };
+              }],
+            }],
+            SubagentStart: [{
+              hooks: [async (input: any) => {
+                const agentId = input.agent_id || "";
+                const agentType = input.agent_type || "";
+                console.log(`[Hook] SubagentStart: agentId=${agentId} type=${agentType}`);
+                return { continue: true };
+              }],
+            }],
+            SubagentStop: [{
+              hooks: [async (input: any) => {
+                const agentId = input.agent_id || "";
+                const agentType = input.agent_type || "";
+                console.log(`[Hook] SubagentStop: agentId=${agentId} type=${agentType}`);
+                return { continue: true };
+              }],
+            }],
+          },
           stderr: (data: string) => {
             const trimmed = data.trimEnd();
             if (trimmed) {
@@ -490,8 +596,8 @@ User request: `;
               } as any);
             }
           },
-          canUseTool: async (toolName, input) => {
-            console.log(`canUseTool called: ${toolName}`);
+          canUseTool: async (toolName, input, { signal, suggestions, blockedPath, decisionReason, toolUseID, agentID } = {} as any) => {
+            console.log(`canUseTool called: ${toolName}${agentID ? ` (agent: ${agentID})` : ''}${decisionReason ? ` reason: ${decisionReason}` : ''}`);
 
             // Run plugin interceptors first
             const sessionCtx = this.getSessionContext();
@@ -528,7 +634,9 @@ User request: `;
                 questionId: qId,
                 questions,
                 sessionId: this.sessionId || "",
-              };
+                agentId: agentID || undefined,
+                decisionReason: decisionReason || undefined,
+              } as any;
               this.send(questionMsg);
 
               // Persist to history so questions survive reconnects
@@ -712,6 +820,16 @@ User request: `;
                   text: sdkBlockText,
                   deltaCount: sdkBlockDeltaCount,
                 });
+                // Persist thinking blocks to chat history
+                if (sdkBlockType === "thinking" && sdkBlockText.length > 0) {
+                  appendHistory(sid, {
+                    role: "assistant",
+                    content: sdkBlockText,
+                    thinking: true,
+                    uuid: (message as any).uuid || undefined,
+                    timestamp: now(),
+                  });
+                }
                 sdkBlockText = "";
                 sdkBlockDeltaCount = 0;
               } else if (evtType === "message_start") {
@@ -798,6 +916,36 @@ User request: `;
             saveSession(sessionInfo);
           }
 
+          // Forward init data to app (available agents, tools, MCP servers, model, etc.)
+          const initMsg = message as any;
+          this._lastSessionInit = {
+            type: "session_init",
+            agents: initMsg.agents || undefined,
+            tools: initMsg.tools || undefined,
+            mcpServers: initMsg.mcp_servers || undefined,
+            model: initMsg.model || undefined,
+            claudeCodeVersion: initMsg.claude_code_version || undefined,
+            permissionMode: initMsg.permissionMode || undefined,
+            sessionId: this.sessionId || "",
+          } as any;
+          this.send(this._lastSessionInit!);
+
+          // Query available models and forward to app for model picker
+          if (this.activeQuery) {
+            this.activeQuery.supportedModels().then((models: any) => {
+              if (models) {
+                this._lastSupportedModels = {
+                  type: "supported_models",
+                  models,
+                  sessionId: this.sessionId || "",
+                } as any;
+                this.send(this._lastSupportedModels!);
+              }
+            }).catch((e: any) => {
+              console.error(`[Init] Failed to get supported models: ${e}`);
+            });
+          }
+
           // Log user prompt now that we have the session ID (for new sessions)
           if (!promptLogged) {
             appendHistory(message.session_id, {
@@ -817,6 +965,33 @@ User request: `;
             toolUseId: tp.tool_use_id || "",
             toolName: tp.tool_name || "",
             elapsedSeconds: tp.elapsed_time_seconds || 0,
+            sessionId: this.sessionId || "",
+            parentToolUseId: tp.parent_tool_use_id || null,
+            uuid: tp.uuid || undefined,
+          } as any);
+        }
+
+        // Forward files_persisted events — tells the app which files were written
+        if (message.type === "system" && (message as any).subtype === "files_persisted") {
+          const fp = message as any;
+          console.log(`[SDK] Files persisted: ${fp.files?.length || 0} files, ${fp.failed?.length || 0} failed`);
+          this.send({
+            type: "files_persisted",
+            files: fp.files || [],
+            failed: fp.failed || [],
+            sessionId: this.sessionId || "",
+          } as any);
+        }
+
+        // Forward auth status changes (authenticating state)
+        if (message.type === "auth_status") {
+          const auth = message as any;
+          console.log(`[SDK] Auth status: isAuthenticating=${auth.isAuthenticating}`);
+          this.send({
+            type: "auth_status",
+            isAuthenticating: auth.isAuthenticating || false,
+            output: auth.output || [],
+            error: auth.error || undefined,
             sessionId: this.sessionId || "",
           } as any);
         }
@@ -876,6 +1051,29 @@ User request: `;
           }
         }
 
+        // Handle tool use summaries — clean human-readable summaries of tool groups
+        if (message.type === "tool_use_summary") {
+          const summary = message as any;
+          console.log(`[SDK] Tool use summary: ${summary.summary?.slice(0, 100)}`);
+          this.send({
+            type: "tool_summary",
+            summary: summary.summary || "",
+            precedingToolUseIds: summary.preceding_tool_use_ids || [],
+            sessionId: this.sessionId || "",
+            uuid: summary.uuid || undefined,
+          } as any);
+          if (this.sessionId) {
+            appendHistory(this.sessionId, {
+              role: "assistant",
+              content: summary.summary || "",
+              toolSummary: true,
+              precedingToolUseIds: summary.preceding_tool_use_ids || [],
+              uuid: summary.uuid || undefined,
+              timestamp: now(),
+            });
+          }
+        }
+
         if (message.type === "stream_event") {
           const event = (message as any).event;
           if (
@@ -888,6 +1086,22 @@ User request: `;
               type: "text",
               content: event.delta.text,
               sessionId: this.sessionId || "",
+              parentToolUseId: (message as any).parent_tool_use_id || null,
+              uuid: (message as any).uuid || undefined,
+            });
+          }
+
+          // Stream thinking deltas to client
+          if (
+            event?.type === "content_block_delta" &&
+            event.delta?.type === "thinking_delta"
+          ) {
+            this.send({
+              type: "thinking",
+              content: event.delta.thinking || "",
+              sessionId: this.sessionId || "",
+              parentToolUseId: (message as any).parent_tool_use_id || null,
+              uuid: (message as any).uuid || undefined,
             });
           }
 
@@ -909,6 +1123,18 @@ User request: `;
         }
 
         if (message.type === "assistant") {
+          // Surface per-message error types (rate_limit, auth_failed, billing_error, etc.)
+          const assistantError = (message as any).error;
+          if (assistantError) {
+            console.error(`[SDK] Assistant error: ${assistantError}`);
+            this.send({
+              type: "error",
+              message: `Assistant error: ${assistantError}`,
+              errorType: assistantError,
+              sessionId: this.sessionId || "",
+            } as any);
+          }
+
           // Reset streaming text — this assistant turn is complete
           this._streamingText = "";
           // Log the full assistant text once the message is complete
@@ -925,6 +1151,8 @@ User request: `;
                 appendHistory(this.sessionId, {
                   role: "assistant",
                   content: textParts.join(""),
+                  parentToolUseId: (message as any).parent_tool_use_id || null,
+                  uuid: (message as any).uuid || undefined,
                   timestamp: now(),
                 });
               }
@@ -939,24 +1167,25 @@ User request: `;
                   continue;
                 }
 
-                // Intercept TodoWrite — track todos server-side and push to client
+                // Intercept TodoWrite — diff against stored state, only send if changed
                 if (block.name === "TodoWrite") {
                   this._suppressedToolResultIds.add(block.id);
                   const todos = (block.input as any)?.todos;
                   if (Array.isArray(todos)) {
+                    const prev = this.sessionId ? getTodos(this.sessionId) : [];
+                    const changed = todos.length !== prev.length ||
+                      todos.some((t: any, i: number) =>
+                        t.content !== prev[i]?.content || t.status !== prev[i]?.status);
                     if (this.sessionId) {
                       saveTodos(this.sessionId, todos);
-                      appendHistory(this.sessionId, {
-                        role: "todos_update",
-                        content: JSON.stringify(todos),
-                        timestamp: new Date().toISOString(),
-                      });
                     }
-                    this.send({
-                      type: "todos",
-                      todos,
-                      sessionId: this.sessionId || "",
-                    } as any);
+                    if (changed) {
+                      this.send({
+                        type: "todos",
+                        todos,
+                        sessionId: this.sessionId || "",
+                      } as any);
+                    }
                   }
                   continue;
                 }
@@ -970,6 +1199,8 @@ User request: `;
                     input: block.input as Record<string, unknown>,
                     toolUseId: block.id,
                     sessionId: this.sessionId || "",
+                    parentToolUseId: (message as any).parent_tool_use_id || null,
+                    uuid: (message as any).uuid || undefined,
                   });
                   if (this.sessionId) {
                     appendHistory(this.sessionId, {
@@ -978,6 +1209,8 @@ User request: `;
                       toolName: mcpName,
                       toolInput: block.input as Record<string, unknown>,
                       toolUseId: block.id,
+                      parentToolUseId: (message as any).parent_tool_use_id || null,
+                      uuid: (message as any).uuid || undefined,
                       timestamp: now(),
                     });
                   }
@@ -990,6 +1223,8 @@ User request: `;
                   input: block.input as Record<string, unknown>,
                   toolUseId: block.id,
                   sessionId: this.sessionId || "",
+                  parentToolUseId: (message as any).parent_tool_use_id || null,
+                  uuid: (message as any).uuid || undefined,
                 });
 
                 // Start watching for bash streaming output (tee'd by PreToolUse hook)
@@ -1018,6 +1253,8 @@ User request: `;
                     toolName: block.name,
                     toolInput: block.input as Record<string, unknown>,
                     toolUseId: block.id,
+                    parentToolUseId: (message as any).parent_tool_use_id || null,
+                    uuid: (message as any).uuid || undefined,
                     timestamp: now(),
                   });
                 }
@@ -1027,6 +1264,23 @@ User request: `;
         }
 
         if (message.type === "user") {
+          // Forward user message UUID to app for rewind support
+          const userMsgUuid = (message as any).uuid || undefined;
+          if (userMsgUuid) {
+            this.send({
+              type: "user_message_uuid",
+              uuid: userMsgUuid,
+              sessionId: this.sessionId || "",
+            } as any);
+            // Persist UUID linkage so history loader can restore it
+            if (this.sessionId) {
+              appendHistory(this.sessionId, {
+                role: "user_uuid",
+                content: userMsgUuid,
+                timestamp: now(),
+              });
+            }
+          }
           const apiMessage = (message as any).message;
           if (apiMessage?.content && Array.isArray(apiMessage.content)) {
             for (const block of apiMessage.content) {
@@ -1093,6 +1347,8 @@ User request: `;
                 // Stream large tool output in chunks for progressive rendering
                 const CHUNK_THRESHOLD = 500; // Only chunk if output > 500 chars
                 const CHUNK_SIZE = 200; // ~200 chars per chunk (roughly 3-4 lines)
+                const parentId = (message as any).parent_tool_use_id || null;
+                const msgUuid = (message as any).uuid || undefined;
                 if (output.length > CHUNK_THRESHOLD) {
                   let chunkIdx = 0;
                   for (let i = 0; i < output.length; i += CHUNK_SIZE) {
@@ -1103,6 +1359,7 @@ User request: `;
                       content: output.slice(i, i + CHUNK_SIZE),
                       done: i + CHUNK_SIZE >= output.length,
                       sessionId: this.sessionId || "",
+                      parentToolUseId: parentId,
                     } as any);
                   }
                 } else {
@@ -1111,6 +1368,8 @@ User request: `;
                     toolUseId,
                     output,
                     sessionId: this.sessionId || "",
+                    parentToolUseId: parentId,
+                    uuid: msgUuid,
                   });
                 }
                 if (this.sessionId) {
@@ -1119,6 +1378,8 @@ User request: `;
                     content: "",
                     toolUseId: block.tool_use_id || "",
                     toolOutput: output,
+                    parentToolUseId: parentId,
+                    uuid: msgUuid,
                     timestamp: now(),
                   });
                 }
@@ -1158,11 +1419,13 @@ User request: `;
             sessionId: this.sessionId || "",
             costUsd: result.total_cost_usd,
             durationMs: result.duration_ms,
+            durationApiMs: result.duration_api_ms || undefined,
             usage: usageInfo,
             numTurns: result.num_turns,
             stopReason: result.stop_reason || undefined,
             resultSubtype: result.subtype || undefined,
             errors: result.errors?.length ? result.errors : undefined,
+            permissionDenials: result.permission_denials?.length ? result.permission_denials : undefined,
           });
 
           this._lastPreview = lastResultContent.slice(0, 200);
