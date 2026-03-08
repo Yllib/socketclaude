@@ -208,6 +208,15 @@ export interface ToolResultServerMessage {
   uuid?: string;
 }
 
+export interface ToolImageServerMessage {
+  type: "tool_image";
+  toolUseId: string;
+  imageData: string;
+  mimeType: string;
+  filePath: string;
+  sessionId: string;
+}
+
 export interface EmailPreview {
   to: string;
   subject: string;
@@ -291,7 +300,7 @@ export interface SessionCreatedServerMessage {
 }
 
 export interface HistoryEntry {
-  role: "user" | "assistant" | "tool_call" | "tool_result" | "question" | "todos_update" | "user_uuid";
+  role: "user" | "assistant" | "tool_call" | "tool_result" | "tool_image" | "question" | "todos_update" | "user_uuid";
   content: string;
   toolName?: string;
   toolInput?: Record<string, unknown>;
@@ -311,6 +320,9 @@ export interface HistoryEntry {
   precedingToolUseIds?: string[];
   // Thinking block
   thinking?: boolean;
+  // Tool image fields (role === "tool_image")
+  filePath?: string;
+  mimeType?: string;
 }
 
 export interface SessionHistoryServerMessage {
@@ -424,4 +436,5 @@ export type ServerMessage =
   | ToolSummaryServerMessage
   | SessionForkedServerMessage
   | TtsAudioServerMessage
-  | ThinkingServerMessage;
+  | ThinkingServerMessage
+  | ToolImageServerMessage;

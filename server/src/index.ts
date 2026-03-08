@@ -751,6 +751,34 @@ function createConnectionHandler(transport: ClientTransport) {
         break;
       }
 
+      case "list_directory" as any: {
+        const listPath = (msg as any).path as string || DEFAULT_CWD;
+        try {
+          const resolvedPath = path.resolve(listPath);
+          const entries = fs.readdirSync(resolvedPath, { withFileTypes: true });
+          const dirs: string[] = [];
+          for (const entry of entries) {
+            if (entry.isDirectory() && !entry.name.startsWith('.')) {
+              dirs.push(entry.name);
+            }
+          }
+          dirs.sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
+          sendJson({
+            type: "directory_listing",
+            path: resolvedPath,
+            directories: dirs,
+          });
+        } catch (e: any) {
+          sendJson({
+            type: "directory_listing",
+            path: listPath,
+            directories: [],
+            error: e.message,
+          });
+        }
+        break;
+      }
+
       case "request_file": {
         const filePath = (msg as any).filePath as string;
         const fileId = (msg as any).fileId as string;
@@ -1255,6 +1283,78 @@ function startRelayClient(): void {
   });
 
   relayClient.connect();
+}
+
+// ── Auto-update from git ──
+const AUTO_UPDATE_INTERVAL = 60000; // Check every 60s
+const SERVER_DIR = path.resolve(__dirname, ".."); // server/ directory
+
+function findGitRoot(startDir: string): string | null {
+  let dir = startDir;
+  while (dir !== path.dirname(dir)) {
+    if (fs.existsSync(path.join(dir, ".git"))) return dir;
+    dir = path.dirname(dir);
+  }
+  return null;
+}
+
+const GIT_ROOT = findGitRoot(SERVER_DIR);
+
+async function checkForUpdates(): Promise<void> {
+  if (!GIT_ROOT) return;
+  try {
+    const { execSync } = require("child_process");
+
+    // Fetch latest from origin
+    execSync("git fetch origin", { cwd: GIT_ROOT, stdio: "pipe", timeout: 30000 });
+
+    // Get current branch name
+    const branch = execSync("git rev-parse --abbrev-ref HEAD", { cwd: GIT_ROOT, stdio: "pipe" }).toString().trim();
+
+    // Compare local vs remote
+    const local = execSync("git rev-parse HEAD", { cwd: GIT_ROOT, stdio: "pipe" }).toString().trim();
+    let remote: string;
+    try {
+      remote = execSync(`git rev-parse origin/${branch}`, { cwd: GIT_ROOT, stdio: "pipe" }).toString().trim();
+    } catch {
+      return; // No remote tracking branch
+    }
+
+    if (local === remote) return; // Already up to date
+
+    // Check if any sessions are actively running
+    for (const [, session] of activeSessions) {
+      if (session.isRunning) {
+        console.log(`[Auto-update] Update available (${local.substring(0, 7)} → ${remote.substring(0, 7)}) but sessions are running, deferring...`);
+        return;
+      }
+    }
+
+    console.log(`[Auto-update] Updating ${local.substring(0, 7)} → ${remote.substring(0, 7)}...`);
+
+    // Pull
+    execSync(`git pull origin ${branch}`, { cwd: GIT_ROOT, stdio: "pipe", timeout: 60000 });
+
+    // Compile TypeScript — find the server dir (could be repo root or server/ subdir)
+    const tscDir = fs.existsSync(path.join(GIT_ROOT, "server", "tsconfig.json"))
+      ? path.join(GIT_ROOT, "server")
+      : GIT_ROOT;
+    execSync("npx tsc", { cwd: tscDir, stdio: "pipe", timeout: 120000 });
+
+    console.log(`[Auto-update] Compiled successfully, restarting...`);
+
+    // Exit cleanly — systemd (Linux) or batch loop (Windows) will restart us
+    process.exit(0);
+  } catch (e: any) {
+    console.error(`[Auto-update] Error: ${e.message}`);
+  }
+}
+
+if (GIT_ROOT) {
+  console.log(`[Auto-update] Watching git repo at ${GIT_ROOT} (every ${AUTO_UPDATE_INTERVAL / 1000}s)`);
+  setInterval(checkForUpdates, AUTO_UPDATE_INTERVAL);
+} else {
+  console.log(`[Auto-update] No git repo found, auto-update disabled`);
 }
 
 // Graceful shutdown — clean up plugins and relay

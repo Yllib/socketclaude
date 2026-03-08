@@ -37,6 +37,7 @@ export class ClaudeSession {
   private _suppressedToolResultIds: Set<string> = new Set();  // toolUseIds whose results should be hidden from client
   private _taskIdToToolUseId: Map<string, string> = new Map();  // agentId → toolUseId mapping
   private _activeBashStream: { interval: NodeJS.Timeout; filePath: string; lastSize: number } | null = null;
+  private _readToolPaths: Map<string, string> = new Map();  // toolUseId → file_path for Read tool calls
   private _streamingText = "";  // accumulated text for the current streaming response
   private _lastPreview: string = "";
   private _lastSessionInit: ServerMessage | null = null;
@@ -1227,6 +1228,20 @@ export class ClaudeSession {
                   uuid: (message as any).uuid || undefined,
                 });
 
+                // Update preview with tool call description
+                const inp = block.input as Record<string, unknown>;
+                const previewDesc = (inp.file_path as string) || (inp.command as string) || (inp.pattern as string) || (inp.query as string) || (inp.prompt as string) || "";
+                this._lastPreview = `[${block.name}] ${previewDesc}`.slice(0, 200);
+                this.onActivity?.();
+
+                // Track Read tool file paths for image extraction
+                if (block.name === "Read") {
+                  const filePath = (block.input as any)?.file_path || "";
+                  if (filePath) {
+                    this._readToolPaths.set(block.id, filePath);
+                  }
+                }
+
                 // Start watching for bash streaming output (tee'd by PreToolUse hook)
                 if (block.name === "Bash") {
                   this._startBashWatcher("/tmp/claude-bash-live.log");
@@ -1302,6 +1317,37 @@ export class ClaudeSession {
                           .map((c: any) => c.text)
                           .join("\n")
                       : JSON.stringify(block.content);
+
+                // Extract image blocks from tool results (e.g., Read on image files)
+                if (Array.isArray(block.content)) {
+                  for (const c of block.content as any[]) {
+                    if (c.type === "image" && c.source?.type === "base64") {
+                      const filePath = this._readToolPaths.get(toolUseId) || "";
+                      console.log(`[SDK] Image block found in tool result: ${filePath || toolUseId}`);
+                      this.send({
+                        type: "tool_image",
+                        toolUseId,
+                        imageData: c.source.data,
+                        mimeType: c.source.media_type || "image/png",
+                        filePath,
+                        sessionId: this.sessionId || "",
+                      });
+                      // Persist file path reference to history (NOT the base64 data)
+                      if (this.sessionId) {
+                        appendHistory(this.sessionId, {
+                          role: "tool_image",
+                          content: "",
+                          toolUseId,
+                          filePath,
+                          mimeType: c.source.media_type || "image/png",
+                          timestamp: now(),
+                        });
+                      }
+                    }
+                  }
+                  // Clean up tracked path
+                  this._readToolPaths.delete(toolUseId);
+                }
 
                 // Detect bash command moved to background (timeout)
                 const bgMatch = output.match(/Command running in background with ID: (\S+)\. Output is being written to: (\S+)/);
