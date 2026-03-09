@@ -4,39 +4,38 @@ Chat with [Claude Code](https://docs.anthropic.com/en/docs/claude-code) from you
 
 ## Setup
 
-### 1. Install the server (Windows)
+### Linux
 
-Open PowerShell and run:
-
-```powershell
-irm https://github.com/Yllib/socketclaude/archive/master.zip -OutFile socketclaude.zip; Expand-Archive socketclaude.zip -DestinationPath . -Force; cd socketclaude-master; powershell -ExecutionPolicy Bypass -File install.ps1
+```bash
+git clone https://github.com/Yllib/socketclaude.git && cd socketclaude && bash install.sh
 ```
 
-Or if you have git:
+### Windows
 
 ```powershell
-git clone https://github.com/Yllib/socketclaude.git
-cd socketclaude
-powershell -ExecutionPolicy Bypass -File install.ps1
+irm https://github.com/Yllib/socketclaude/archive/master.zip -OutFile sc.zip; Expand-Archive sc.zip . -Force; cd socketclaude-master; powershell -ExecutionPolicy Bypass -File install.ps1
 ```
 
-The installer handles Node.js, Claude Code CLI, authentication, server build, encryption keys, and Windows service registration.
+The installer handles Node.js, Claude Code CLI, authentication, server build, encryption keys, and service registration. A QR code appears at the end — scan it with the app to pair.
 
-### 2. Scan the QR code
+### Management
 
-A QR code appears at the end of installation. Open the SocketClaude app and scan it. Done.
+**Linux:**
+```bash
+systemctl --user status socketclaude          # Status
+systemctl --user restart socketclaude         # Restart
+journalctl --user -u socketclaude -f          # Logs
+```
 
-### 3. Management
-
+**Windows:**
 ```powershell
-Get-ScheduledTask -TaskName SocketClaude          # Status
-Stop-ScheduledTask -TaskName SocketClaude          # Stop
-Start-ScheduledTask -TaskName SocketClaude         # Start
-Get-Content server\socketclaude.log -Tail 50       # Logs
-powershell -File uninstall.ps1                     # Uninstall
+Get-ScheduledTask -TaskName SocketClaude      # Status
+Start-ScheduledTask -TaskName SocketClaude    # Start
+Stop-ScheduledTask -TaskName SocketClaude     # Stop
+Get-Content server\socketclaude.log -Tail 50  # Logs
 ```
 
-To update, re-run the one-liner or `git pull` and re-run the installer. Existing pairings are preserved.
+To update: `git pull && bash install.sh` (Linux) or `git pull; powershell -File install.ps1` (Windows). Existing pairings are preserved.
 
 ## How It Works
 
@@ -59,6 +58,7 @@ All communication between your phone and server is end-to-end encrypted (NaCl bo
 - Todo list and reminder integration
 - Token usage and cost tracking
 - Auto-reconnect with missed message recovery
+- Auto-update from git (pulls, compiles, restarts when idle)
 - Samsung AI button integration
 
 ## Plugins
