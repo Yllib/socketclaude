@@ -235,6 +235,7 @@ NODE_PATH=$(command -v node)
 
 mkdir -p "$SERVICE_DIR"
 
+NODE_DIR=$(dirname "$NODE_PATH")
 cat > "$SERVICE_FILE" << EOF
 [Unit]
 Description=SocketClaude WebSocket Server
@@ -248,7 +249,8 @@ ExecStart=$NODE_PATH $SERVER_DIR/dist/index.js
 Restart=on-failure
 RestartSec=5
 Environment=HOME=$HOME
-Environment=PATH=$HOME/.local/bin:$HOME/.nvm/versions/node/$(node --version)/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PATH=$NODE_DIR:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin
+UnsetEnvironment=CLAUDECODE
 
 [Install]
 WantedBy=default.target
