@@ -178,7 +178,11 @@ fi
 IS_UPGRADE=false
 [[ -f "$ENV_FILE" ]] && IS_UPGRADE=true
 
-SETUP_OUTPUT=$(node "$SETUP_SCRIPT" \
+# Ensure data directory exists for keys file
+mkdir -p "$DATA_DIR"
+
+# Run from server dir so require('tweetnacl') resolves
+SETUP_OUTPUT=$(cd "$SERVER_DIR" && node "$SETUP_SCRIPT" \
   --env-file "$ENV_FILE" \
   --keys-file "$KEYS_FILE" \
   --relay-url "$RELAY_URL" \
