@@ -97,11 +97,33 @@ else
     exit 1
   fi
 
+  # Refresh PATH — package managers may install to dirs not yet on PATH
+  hash -r 2>/dev/null
+  export PATH="/usr/local/bin:/usr/bin:$PATH"
+
   if ! command -v node &>/dev/null; then
     fail "Node.js installation failed. Install manually: https://nodejs.org/"
     exit 1
   fi
   ok "Node.js $(node --version) installed"
+fi
+
+# Verify npm is available (some distros package it separately)
+if ! command -v npm &>/dev/null; then
+  warn "npm not found, attempting to install..."
+  if command -v apt-get &>/dev/null; then
+    sudo apt-get install -y npm
+  elif command -v dnf &>/dev/null; then
+    sudo dnf install -y npm
+  elif command -v pacman &>/dev/null; then
+    sudo pacman -S --noconfirm npm
+  fi
+  hash -r 2>/dev/null
+  if ! command -v npm &>/dev/null; then
+    fail "npm not found. Install it manually or reinstall Node.js from https://nodejs.org/"
+    exit 1
+  fi
+  ok "npm installed"
 fi
 
 # ══════════════════════════════════════════════
