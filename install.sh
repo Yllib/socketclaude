@@ -16,7 +16,7 @@ set -euo pipefail
 
 RELAY_URL="ws://jarofdirt.info:9988"
 SERVICE_NAME="socketclaude"
-NODE_MIN_VERSION=18
+NODE_MIN_VERSION=22
 PORT=8085
 RESET_PAIRING=false
 
@@ -66,18 +66,21 @@ fi
 
 phase "Phase 1: Node.js"
 
+NEED_NODE_INSTALL=false
 if command -v node &>/dev/null; then
   NODE_VERSION=$(node --version | sed 's/^v//' | cut -d. -f1)
   if [[ "$NODE_VERSION" -ge "$NODE_MIN_VERSION" ]]; then
     ok "Node.js $(node --version) already installed"
   else
-    warn "Node.js v$NODE_VERSION found but v$NODE_MIN_VERSION+ required"
-    fail "Please upgrade Node.js: https://nodejs.org/"
-    exit 1
+    warn "Node.js v$(node --version) found but v$NODE_MIN_VERSION+ required. Upgrading..."
+    NEED_NODE_INSTALL=true
   fi
 else
-  echo "  Node.js not found. Attempting to install..."
+  echo "  Node.js not found. Installing..."
+  NEED_NODE_INSTALL=true
+fi
 
+if [[ "$NEED_NODE_INSTALL" == "true" ]]; then
   if command -v apt-get &>/dev/null; then
     # Debian/Ubuntu — use NodeSource
     echo "  Installing via NodeSource (may need sudo)..."
@@ -106,7 +109,7 @@ else
     exit 1
   fi
   ok "Node.js $(node --version) installed"
-fi
+fi # NEED_NODE_INSTALL
 
 # Verify npm is available (some distros package it separately)
 if ! command -v npm &>/dev/null; then
