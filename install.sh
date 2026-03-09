@@ -183,8 +183,8 @@ mkdir -p "$DATA_DIR"
 
 # Run from server dir so require('tweetnacl') resolves
 SETUP_OUTPUT=$(cd "$SERVER_DIR" && node "$SETUP_SCRIPT" \
-  --env-file "$ENV_FILE" \
-  --keys-file "$KEYS_FILE" \
+  --envfile "$ENV_FILE" \
+  --keysfile "$KEYS_FILE" \
   --relay-url "$RELAY_URL" \
   --default-cwd "$HOME" \
   --port "$PORT")

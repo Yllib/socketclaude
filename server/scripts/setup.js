@@ -22,15 +22,15 @@ for (let i = 2; i < process.argv.length; i += 2) {
   args[key] = process.argv[i + 1];
 }
 
-const envFile = args["env-file"];
-const keysFile = args["keys-file"];
+const envFile = args["envfile"] || args["env-file"];
+const keysFile = args["keysfile"] || args["keys-file"];
 const relayUrl = args["relay-url"] || "";
 const defaultCwd = args["default-cwd"] || process.cwd();
 const port = args["port"] || "8085";
 
 if (!envFile || !keysFile) {
   console.error(
-    "Usage: node setup.js --env-file <path> --keys-file <path> [--relay-url <url>] [--default-cwd <path>] [--port <port>]"
+    "Usage: node setup.js --envfile <path> --keysfile <path> [--relay-url <url>] [--default-cwd <path>] [--port <port>]"
   );
   process.exit(1);
 }

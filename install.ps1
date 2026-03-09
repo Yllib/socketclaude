@@ -253,8 +253,8 @@ if ($ResetPairing) {
 $isUpgrade = Test-Path $ENV_FILE
 
 $setupOutput = & node $SETUP_SCRIPT `
-    --env-file $ENV_FILE `
-    --keys-file $KEYS_FILE `
+    --envfile $ENV_FILE `
+    --keysfile $KEYS_FILE `
     --relay-url $RELAY_URL `
     --default-cwd $env:USERPROFILE `
     --port $Port
