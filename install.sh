@@ -84,6 +84,8 @@ if [[ "$NEED_NODE_INSTALL" == "true" ]]; then
   if command -v apt-get &>/dev/null; then
     # Debian/Ubuntu — use NodeSource
     echo "  Installing via NodeSource (may need sudo)..."
+    # Remove old nodejs first — apt won't upgrade across repo sources
+    sudo apt-get remove -y nodejs 2>/dev/null || true
     curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
     sudo apt-get install -y nodejs
   elif command -v dnf &>/dev/null; then
@@ -106,6 +108,15 @@ if [[ "$NEED_NODE_INSTALL" == "true" ]]; then
 
   if ! command -v node &>/dev/null; then
     fail "Node.js installation failed. Install manually: https://nodejs.org/"
+    exit 1
+  fi
+
+  # Verify we actually got v22+
+  NODE_VERSION=$(node --version | sed 's/^v//' | cut -d. -f1)
+  if [[ "$NODE_VERSION" -lt "$NODE_MIN_VERSION" ]]; then
+    fail "Node.js $(node --version) installed but v$NODE_MIN_VERSION+ required."
+    fail "The package manager may have pinned an older version."
+    fail "Try: sudo apt-get remove -y nodejs && curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash - && sudo apt-get install -y nodejs"
     exit 1
   fi
   ok "Node.js $(node --version) installed"
