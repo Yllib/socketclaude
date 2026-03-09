@@ -8,7 +8,7 @@ import * as path from "path";
 import { WebSocketServer, WebSocket } from "ws";
 import { ClaudeSession } from "./claude-session";
 import { listSessions, getSession, getHistory, getHistoryPage, deleteSession, clearSessionContext, cleanupPendingToolCalls, getTodos, getMissedMessages, appendHistory, getSdkEvents, markQuestionAnswered } from "./session-store";
-import { ClientMessage } from "./protocol";
+import { ClientMessage, SessionInfo } from "./protocol";
 import { SocketClaudePlugin, PluginContext } from "./plugin-api";
 import { RelayClient, RelayStatus } from "./relay-client";
 import { loadOrCreateKeyPair, toBase64 } from "./relay-crypto";
@@ -84,10 +84,10 @@ interface SessionClient {
 }
 const sessionClients = new Map<string, SessionClient>();
 
-/** Broadcast current session list to all connected clients */
-function broadcastSessionList(): void {
+/** Enrich stored sessions with live data from active sessions */
+function getEnrichedSessions(): SessionInfo[] {
   const sessions = listSessions();
-  const enriched = sessions.map(s => {
+  return sessions.map(s => {
     const active = activeSessions.get(s.id);
     if (active && active.isRunning) {
       return {
@@ -99,6 +99,11 @@ function broadcastSessionList(): void {
     }
     return { ...s, running: false };
   });
+}
+
+/** Broadcast current session list to all connected clients */
+function broadcastSessionList(): void {
+  const enriched = getEnrichedSessions();
   const msg = JSON.stringify({ type: "session_list", sessions: enriched });
   for (const client of connectedClients) {
     if (client.readyState === WebSocket.OPEN) {
@@ -438,10 +443,9 @@ function createConnectionHandler(transport: ClientTransport) {
       }
 
       case "list_sessions": {
-        const sessionList = listSessions();
         sendJson({
           type: "session_list",
-          sessions: sessionList,
+          sessions: getEnrichedSessions(),
         });
         break;
       }

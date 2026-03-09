@@ -24,6 +24,10 @@ export class RelayClient {
   private reconnectDelay = 1000;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private closed = false;
+  private pingInterval: ReturnType<typeof setInterval> | null = null;
+  private pongReceived = true;
+  private static PING_INTERVAL = 30_000;  // send ping every 30s
+  private static PING_TIMEOUT = 10_000;   // if no pong within 10s, connection is dead
 
   // Virtual WebSocket interface for ClaudeSession compatibility
   private virtualWs: VirtualRelaySocket;
@@ -57,6 +61,19 @@ export class RelayClient {
       console.log(`[Relay] Connected, waiting for phone...`);
       this.reconnectDelay = 1000; // reset backoff
       this.setStatus("waiting_for_peer");
+
+      // Enable TCP keepalive on the underlying socket to detect dead connections
+      const socket = (this.ws as any)?._socket;
+      if (socket?.setKeepAlive) {
+        socket.setKeepAlive(true, 60_000);
+      }
+
+      // Start WebSocket-level ping/pong keepalive
+      this.startPingPong();
+    });
+
+    this.ws.on("pong", () => {
+      this.pongReceived = true;
     });
 
     this.ws.on("message", (data) => {
@@ -71,6 +88,7 @@ export class RelayClient {
 
     this.ws.on("close", () => {
       console.log(`[Relay] Disconnected`);
+      this.stopPingPong();
       this.ws = null;
       this.phonePublicKey = null;
       this.virtualWs._setOpen(false);
@@ -112,6 +130,7 @@ export class RelayClient {
   /** Disconnect and stop reconnecting */
   close(): void {
     this.closed = true;
+    this.stopPingPong();
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     if (this.ws) this.ws.close();
     this.ws = null;
@@ -176,6 +195,30 @@ export class RelayClient {
   private setStatus(status: RelayStatus): void {
     this.status = status;
     this.opts.onStatusChange(status);
+  }
+
+  /** Start periodic WebSocket ping/pong to detect dead connections */
+  private startPingPong(): void {
+    this.stopPingPong();
+    this.pongReceived = true;
+    this.pingInterval = setInterval(() => {
+      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+      if (!this.pongReceived) {
+        // No pong received since last ping — connection is dead
+        console.warn(`[Relay] No pong received in ${RelayClient.PING_INTERVAL / 1000}s — forcing reconnect`);
+        this.ws.terminate(); // force-close, triggers 'close' event → scheduleReconnect
+        return;
+      }
+      this.pongReceived = false;
+      this.ws.ping();
+    }, RelayClient.PING_INTERVAL);
+  }
+
+  private stopPingPong(): void {
+    if (this.pingInterval) {
+      clearInterval(this.pingInterval);
+      this.pingInterval = null;
+    }
   }
 
   private scheduleReconnect(): void {
