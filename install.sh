@@ -81,63 +81,50 @@ else
 fi
 
 if [[ "$NEED_NODE_INSTALL" == "true" ]]; then
-  if command -v apt-get &>/dev/null; then
-    # Debian/Ubuntu — use NodeSource
-    echo "  Installing via NodeSource (may need sudo)..."
-    # Remove old nodejs first — apt won't upgrade across repo sources
-    sudo apt-get remove -y nodejs 2>/dev/null || true
-    curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
-    sudo apt-get install -y nodejs
-  elif command -v dnf &>/dev/null; then
-    # Fedora/RHEL
-    curl -fsSL https://rpm.nodesource.com/setup_22.x | sudo bash -
-    sudo dnf install -y nodejs
-  elif command -v pacman &>/dev/null; then
-    # Arch
-    sudo pacman -S --noconfirm nodejs npm
-  elif command -v brew &>/dev/null; then
-    brew install node
-  else
-    fail "Could not detect package manager. Install Node.js 18+ manually: https://nodejs.org/"
-    exit 1
-  fi
+  # Install Node.js from official binary tarball — works on any Linux distro
+  # regardless of broken apt repos, pinning, or package manager quirks
+  ARCH=$(uname -m)
+  case "$ARCH" in
+    x86_64)  NODE_ARCH="x64" ;;
+    aarch64) NODE_ARCH="arm64" ;;
+    armv7l)  NODE_ARCH="armv7l" ;;
+    *) fail "Unsupported architecture: $ARCH"; exit 1 ;;
+  esac
 
-  # Refresh PATH — package managers may install to dirs not yet on PATH
+  NODE_INSTALL_DIR="/usr/local"
+  NODE_TARBALL="node-v22.22.1-linux-${NODE_ARCH}.tar.xz"
+  NODE_URL="https://nodejs.org/dist/v22.22.1/${NODE_TARBALL}"
+
+  echo "  Downloading Node.js v22.22.1 for ${NODE_ARCH}..."
+  curl -fSL --progress-bar -o "/tmp/${NODE_TARBALL}" "$NODE_URL"
+
+  echo "  Installing to ${NODE_INSTALL_DIR}..."
+  sudo tar -xJf "/tmp/${NODE_TARBALL}" -C "$NODE_INSTALL_DIR" --strip-components=1
+  rm -f "/tmp/${NODE_TARBALL}"
+
+  # Refresh PATH
   hash -r 2>/dev/null
-  export PATH="/usr/local/bin:/usr/bin:$PATH"
+  export PATH="/usr/local/bin:$PATH"
 
   if ! command -v node &>/dev/null; then
     fail "Node.js installation failed. Install manually: https://nodejs.org/"
     exit 1
   fi
 
-  # Verify we actually got v22+
+  # Verify version
   NODE_VERSION=$(node --version | sed 's/^v//' | cut -d. -f1)
   if [[ "$NODE_VERSION" -lt "$NODE_MIN_VERSION" ]]; then
     fail "Node.js $(node --version) installed but v$NODE_MIN_VERSION+ required."
-    fail "The package manager may have pinned an older version."
-    fail "Try: sudo apt-get remove -y nodejs && curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash - && sudo apt-get install -y nodejs"
     exit 1
   fi
   ok "Node.js $(node --version) installed"
 fi # NEED_NODE_INSTALL
 
-# Verify npm is available (some distros package it separately)
+# npm is always included in the official Node.js tarball,
+# but verify it's on PATH
 if ! command -v npm &>/dev/null; then
-  warn "npm not found, attempting to install..."
-  if command -v apt-get &>/dev/null; then
-    sudo apt-get install -y npm
-  elif command -v dnf &>/dev/null; then
-    sudo dnf install -y npm
-  elif command -v pacman &>/dev/null; then
-    sudo pacman -S --noconfirm npm
-  fi
-  hash -r 2>/dev/null
-  if ! command -v npm &>/dev/null; then
-    fail "npm not found. Install it manually or reinstall Node.js from https://nodejs.org/"
-    exit 1
-  fi
-  ok "npm installed"
+  fail "npm not found despite Node.js being installed. Check your PATH."
+  exit 1
 fi
 
 # ══════════════════════════════════════════════
