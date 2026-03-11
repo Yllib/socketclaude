@@ -1349,8 +1349,9 @@ async function checkForUpdates(): Promise<void> {
 
     console.log(`[Auto-update] Compiled successfully, restarting...`);
 
-    // Exit cleanly — systemd (Linux) or batch loop (Windows) will restart us
-    process.exit(0);
+    // Exit with non-zero so systemd Restart=on-failure triggers a restart.
+    // exit(0) is clean and won't restart. Windows batch loops check for any exit.
+    process.exit(1);
   } catch (e: any) {
     console.error(`[Auto-update] Error: ${e.message}`);
   }
