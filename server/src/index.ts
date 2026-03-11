@@ -7,7 +7,8 @@ import * as http from "http";
 import * as path from "path";
 import { WebSocketServer, WebSocket } from "ws";
 import { ClaudeSession } from "./claude-session";
-import { listSessions, getSession, getHistory, getHistoryPage, deleteSession, clearSessionContext, cleanupPendingToolCalls, getTodos, getMissedMessages, appendHistory, getSdkEvents, markQuestionAnswered } from "./session-store";
+import { listSessions, getSession, getHistory, getHistoryPage, deleteSession, clearSessionContext, cleanupPendingToolCalls, getTodos, getMissedMessages, appendHistory, getSdkEvents, markQuestionAnswered, getLastHistoryTimestamp } from "./session-store";
+import { DesktopCliWatcher } from "./desktop-cli-watcher";
 import { ClientMessage, SessionInfo } from "./protocol";
 import { SocketClaudePlugin, PluginContext } from "./plugin-api";
 import { RelayClient, RelayStatus } from "./relay-client";
@@ -67,6 +68,9 @@ if (fs.existsSync(pluginsDir)) {
 
 // Global session registry — sessions survive client disconnects
 const activeSessions: Map<string, ClaudeSession> = new Map();
+
+// Desktop CLI watchers — detect when desktop CLI is using a session
+const desktopWatchers: Map<string, DesktopCliWatcher> = new Map();
 
 // Sessions whose context has been cleared — next query should NOT pass resume
 const clearedSessions: Set<string> = new Set();
@@ -301,10 +305,60 @@ function createConnectionHandler(transport: ClientTransport) {
           sessionId: msg.sessionId,
           running: resumeRunning,
         });
+
+        // Start desktop CLI watcher for this session
+        if (!desktopWatchers.has(msg.sessionId)) {
+          const watcherSessionId = msg.sessionId;
+          const watcher = new DesktopCliWatcher({
+            sessionId: watcherSessionId,
+            cwd: sessionInfo.cwd,
+            serverPid: process.pid,
+            onStateChange: (active, pid) => {
+              console.log(`[DesktopCLI] State change: session=${watcherSessionId} active=${active} pid=${pid}`);
+              sendJson({
+                type: "desktop_cli_status",
+                sessionId: watcherSessionId,
+                active,
+                pid,
+              });
+              if (!active) broadcastSessionList();
+            },
+            onNewMessages: (messages) => {
+              console.log(`[DesktopCLI] Syncing ${messages.length} messages to app for session ${watcherSessionId}`);
+              sendJson({
+                type: "session_history",
+                sessionId: watcherSessionId,
+                messages,
+                total: -1,
+                offset: -1,
+                append: true,
+              });
+            },
+            isOurQueryRunning: () => {
+              const session = activeSessions.get(watcherSessionId);
+              return session?.isRunning || false;
+            },
+          });
+          watcher.start();
+          desktopWatchers.set(watcherSessionId, watcher);
+        }
         break;
       }
 
       case "prompt": {
+        // Block if desktop CLI is using this session
+        const promptSessionId = msg.sessionId || activeSessionId;
+        if (promptSessionId) {
+          const cliWatcher = desktopWatchers.get(promptSessionId);
+          if (cliWatcher?.isBlocked) {
+            sendJson({
+              type: "error",
+              message: "This session is currently being used by the desktop Claude CLI. Wait for it to finish, or close it on desktop.",
+            });
+            break;
+          }
+        }
+
         if (!activeSession) {
           let cwd = DEFAULT_CWD;
           const savedResumeId = msg.sessionId;
@@ -452,12 +506,29 @@ function createConnectionHandler(transport: ClientTransport) {
         break;
       }
 
+      case "sync_desktop": {
+        const syncSid = (msg as any).sessionId as string;
+        if (syncSid) {
+          const watcher = desktopWatchers.get(syncSid);
+          if (watcher) {
+            watcher.syncNow();
+          }
+        }
+        break;
+      }
+
       case "delete_session": {
         const sid = msg.sessionId;
         const running = activeSessions.get(sid);
         if (running) {
           running.abort();
           activeSessions.delete(sid);
+        }
+        // Stop desktop CLI watcher
+        const delWatcher = desktopWatchers.get(sid);
+        if (delWatcher) {
+          delWatcher.stop();
+          desktopWatchers.delete(sid);
         }
         deleteSession(sid);
         console.log(`Deleted session ${sid}`);
@@ -473,6 +544,12 @@ function createConnectionHandler(transport: ClientTransport) {
           if (running) {
             running.abort();
             activeSessions.delete(sid);
+          }
+          // Stop desktop CLI watcher (JSONL gets archived)
+          const clearWatcher = desktopWatchers.get(sid);
+          if (clearWatcher) {
+            clearWatcher.stop();
+            desktopWatchers.delete(sid);
           }
           clearSessionContext(sid, sessionInfo.cwd);
           clearedSessions.add(sid);
@@ -1154,6 +1231,13 @@ function buildStatusSyncMessage(): string {
       backgroundTaskIds.push(taskId);
     }
   }
+  // Collect sessions with active desktop CLI
+  const desktopCliSessions: string[] = [];
+  for (const [sid, watcher] of desktopWatchers) {
+    if (watcher.isBlocked) {
+      desktopCliSessions.push(sid);
+    }
+  }
   return JSON.stringify({
     type: "status_sync",
     running: anyRunning,
@@ -1161,6 +1245,7 @@ function buildStatusSyncMessage(): string {
     serverStartedAt: SERVER_STARTED_AT,
     serverPid: process.pid,
     backgroundTaskIds,
+    ...(desktopCliSessions.length > 0 ? { desktopCliSessions } : {}),
   });
 }
 
@@ -1364,11 +1449,15 @@ if (GIT_ROOT) {
   console.log(`[Auto-update] No git repo found, auto-update disabled`);
 }
 
-// Graceful shutdown — clean up plugins and relay
+// Graceful shutdown — clean up plugins, relay, and watchers
 for (const sig of ["SIGTERM", "SIGINT"] as const) {
   process.on(sig, async () => {
     console.log(`Received ${sig}, cleaning up...`);
     if (relayClient) relayClient.close();
+    for (const [, watcher] of desktopWatchers) {
+      watcher.stop();
+    }
+    desktopWatchers.clear();
     for (const plugin of plugins) {
       if (plugin.cleanup) {
         try { await plugin.cleanup(); } catch {}

@@ -194,6 +194,19 @@ export function getTodos(sessionId: string): any[] {
   }
 }
 
+/** Build the path to Claude Code's JSONL session file */
+export function getJsonlPath(sessionId: string, cwd: string): string {
+  const homeDir = process.env.HOME || require("os").homedir();
+  const projectDir = cwd.replace(/^\//, "").replace(/\//g, "-");
+  return path.join(homeDir, ".claude", "projects", `-${projectDir}`, `${sessionId}.jsonl`);
+}
+
+/** Get the timestamp of the last entry in a session's history */
+export function getLastHistoryTimestamp(sessionId: string): string {
+  const history = getHistory(sessionId);
+  return history.length > 0 ? history[history.length - 1].timestamp : "";
+}
+
 /**
  * Read missed messages from Claude Code's own session JSONL file.
  * Returns HistoryEntry[] for messages that occurred after `afterTimestamp`.
@@ -204,10 +217,7 @@ export function getMissedMessages(
   cwd: string,
   afterTimestamp: string
 ): HistoryEntry[] {
-  const homeDir = process.env.HOME || require("os").homedir();
-  // Claude Code stores sessions in ~/.claude/projects/<cwd-with-dashes>/
-  const projectDir = cwd.replace(/^\//, "").replace(/\//g, "-");
-  const jsonlPath = path.join(homeDir, ".claude", "projects", `-${projectDir}`, `${sessionId}.jsonl`);
+  const jsonlPath = getJsonlPath(sessionId, cwd);
 
   if (!fs.existsSync(jsonlPath)) return [];
 
@@ -272,7 +282,7 @@ export function getMissedMessages(
                 toolOutput: output.slice(0, 2000), // Truncate large outputs
                 timestamp: msg.timestamp,
               });
-            } else if (block.type === "text" && msg.userType === "external") {
+            } else if (block.type === "text") {
               entries.push({
                 role: "user",
                 content: block.text,
@@ -364,9 +374,7 @@ export function clearSessionContext(sessionId: string, cwd: string): void {
   const ts = new Date().toISOString().replace(/[:.]/g, "-");
 
   // 1. Archive Claude Code's JSONL session file
-  const homeDir = process.env.HOME || require("os").homedir();
-  const projectDir = cwd.replace(/^\//, "").replace(/\//g, "-");
-  const jsonlPath = path.join(homeDir, ".claude", "projects", `-${projectDir}`, `${sessionId}.jsonl`);
+  const jsonlPath = getJsonlPath(sessionId, cwd);
   if (fs.existsSync(jsonlPath)) {
     const archiveName = `${sessionId}_${ts}.jsonl`;
     fs.renameSync(jsonlPath, path.join(ARCHIVE_DIR, archiveName));

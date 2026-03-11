@@ -150,6 +150,11 @@ export interface RewindMessage {
   dryRun?: boolean;
 }
 
+export interface SyncDesktopMessage {
+  type: "sync_desktop";
+  sessionId: string;
+}
+
 export type ClientMessage =
   | PromptMessage
   | AnswerMessage
@@ -172,6 +177,7 @@ export type ClientMessage =
   | McpReconnectMessage
   | McpToggleMessage
   | RewindMessage
+  | SyncDesktopMessage
   | RequestFileMessage
   | LoadMoreHistoryMessage
   | CheckCwdMessage
@@ -415,6 +421,13 @@ export interface TtsAudioServerMessage {
   sessionId: string;
 }
 
+export interface DesktopCliStatusServerMessage {
+  type: "desktop_cli_status";
+  sessionId: string;
+  active: boolean;
+  pid?: number;
+}
+
 export type ServerMessage =
   | TextServerMessage
   | ToolCallServerMessage
@@ -437,4 +450,5 @@ export type ServerMessage =
   | SessionForkedServerMessage
   | TtsAudioServerMessage
   | ThinkingServerMessage
-  | ToolImageServerMessage;
+  | ToolImageServerMessage
+  | DesktopCliStatusServerMessage;
