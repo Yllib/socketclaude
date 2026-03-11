@@ -1218,6 +1218,7 @@ export class ClaudeSession {
                   continue;
                 }
 
+                console.log(`[SDK] >>> tool_call: ${block.name} toolUseId=${block.id}`);
                 this.send({
                   type: "tool_call",
                   tool: block.name,
@@ -1396,6 +1397,8 @@ export class ClaudeSession {
                 const parentId = (message as any).parent_tool_use_id || null;
                 const msgUuid = (message as any).uuid || undefined;
                 if (output.length > CHUNK_THRESHOLD) {
+                  const numChunks = Math.ceil(output.length / CHUNK_SIZE);
+                  console.log(`[SDK] <<< tool_result_chunk: toolUseId=${toolUseId} len=${output.length} chunks=${numChunks}`);
                   let chunkIdx = 0;
                   for (let i = 0; i < output.length; i += CHUNK_SIZE) {
                     this.send({
@@ -1409,6 +1412,7 @@ export class ClaudeSession {
                     } as any);
                   }
                 } else {
+                  console.log(`[SDK] <<< tool_result: toolUseId=${toolUseId} len=${output.length}`);
                   this.send({
                     type: "tool_result",
                     toolUseId,
@@ -1436,6 +1440,23 @@ export class ClaudeSession {
 
         if (message.type === "result") {
           const result = message as any;
+          const resultParentId = result.parent_tool_use_id || null;
+          if (resultParentId) {
+            console.log(`[SDK] Subagent result (parent_tool_use_id=${resultParentId}), subtype=${result.subtype}, cost=${result.total_cost_usd}, turns=${result.num_turns}`);
+            // Send as subagent_result so the app can track it without mistaking it for the main query result
+            this.send({
+              type: "subagent_result",
+              parentToolUseId: resultParentId,
+              content: result.result || "",
+              costUsd: result.total_cost_usd,
+              durationMs: result.duration_ms,
+              numTurns: result.num_turns,
+              stopReason: result.stop_reason || undefined,
+              subtype: result.subtype || undefined,
+              sessionId: this.sessionId || "",
+            } as any);
+            continue;
+          }
           lastResultContent =
             result.result || currentText || "Task completed.";
 

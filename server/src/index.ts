@@ -294,10 +294,12 @@ function createConnectionHandler(transport: ClientTransport) {
         }
 
         // Always send status so the app resets its processing state on resume
+        const resumeRunning = !!(existing && existing.isRunning);
+        console.log(`[Resume] sessionId=${msg.sessionId} existing=${!!existing} isRunning=${existing?.isRunning} → sending running=${resumeRunning}`);
         sendJson({
           type: "status",
           sessionId: msg.sessionId,
-          running: !!(existing && existing.isRunning),
+          running: resumeRunning,
         });
         break;
       }
