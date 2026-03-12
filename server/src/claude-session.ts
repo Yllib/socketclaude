@@ -34,6 +34,8 @@ export class ClaudeSession {
   private _kokoroSpeed: number = 1.0;
   private _effort: 'low' | 'medium' | 'high' | 'max' = 'high';
   private _thinking: { type: 'adaptive' } | { type: 'enabled'; budgetTokens: number } | { type: 'disabled' } = { type: 'adaptive' };
+  private _disallowedTools: string[] = [];
+  private _appendSystemPrompt: string = '';
   private _forkFromSessionId?: string;
   private _backgroundTaskToolUseIds: Set<string> = new Set();  // toolUseIds of background Task calls
   private _suppressedToolResultIds: Set<string> = new Set();  // toolUseIds whose results should be hidden from client
@@ -105,6 +107,16 @@ export class ClaudeSession {
 
   get thinking() {
     return this._thinking;
+  }
+
+  setDisallowedTools(tools: string[]): void {
+    this._disallowedTools = tools;
+    console.log(`Disallowed tools set to [${tools.join(', ')}] for session ${this.sessionId || '(pending)'}`);
+  }
+
+  setAppendSystemPrompt(text: string): void {
+    this._appendSystemPrompt = text;
+    console.log(`Append system prompt set (${text.length} chars) for session ${this.sessionId || '(pending)'}`);
   }
 
   setForkSource(sessionId: string): void {
@@ -619,8 +631,9 @@ export class ClaudeSession {
           abortController: this.abortController,
           effort: this._effort as any,
           thinking: this._thinking as any,
-          systemPrompt: { type: "preset", preset: "claude_code", append: toolContext } as any,
+          systemPrompt: { type: "preset", preset: "claude_code", append: this._appendSystemPrompt ? toolContext + '\n\n' + this._appendSystemPrompt : toolContext } as any,
           tools: { type: "preset", preset: "claude_code" },
+          ...(this._disallowedTools.length ? { disallowedTools: this._disallowedTools } : {}),
           enableFileCheckpointing: true,
           settingSources: ["user", "project"],
           mcpServers: (() => {

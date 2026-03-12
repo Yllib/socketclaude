@@ -31,6 +31,12 @@ export interface DeleteSessionMessage {
   sessionId: string;
 }
 
+export interface RenameSessionMessage {
+  type: "rename_session";
+  sessionId: string;
+  title: string;
+}
+
 export interface AbortMessage {
   type: "abort";
   sessionId?: string;
@@ -112,6 +118,16 @@ export interface SetThinkingMessage {
     | { type: "adaptive" }
     | { type: "enabled"; budgetTokens: number }
     | { type: "disabled" };
+}
+
+export interface SetDisallowedToolsMessage {
+  type: "set_disallowed_tools";
+  tools: string[];
+}
+
+export interface SetSystemPromptMessage {
+  type: "set_system_prompt";
+  prompt: string;
 }
 
 export interface StopTaskMessage {
@@ -203,6 +219,7 @@ export type ClientMessage =
   | ResumeSessionMessage
   | ListSessionsMessage
   | DeleteSessionMessage
+  | RenameSessionMessage
   | ClearContextMessage
   | AbortMessage
   | InterruptMessage
@@ -211,6 +228,8 @@ export type ClientMessage =
   | RequestTtsAudioMessage
   | SetEffortMessage
   | SetThinkingMessage
+  | SetDisallowedToolsMessage
+  | SetSystemPromptMessage
   | StopTaskMessage
   | ForkSessionMessage
   | SetModelMessage

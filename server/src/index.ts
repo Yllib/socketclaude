@@ -175,6 +175,8 @@ function createConnectionHandler(transport: ClientTransport) {
   let pendingKokoroSpeed = 1.0;
   let pendingEffort: 'low' | 'medium' | 'high' | 'max' = 'high';
   let pendingThinking: { type: 'adaptive' } | { type: 'enabled'; budgetTokens: number } | { type: 'disabled' } = { type: 'adaptive' };
+  let pendingDisallowedTools: string[] = [];
+  let pendingSystemPrompt: string = '';
 
   // Track active file uploads from the app
   const activeUploads = new Map<string, {
@@ -213,10 +215,13 @@ function createConnectionHandler(transport: ClientTransport) {
         activeSession.setKokoroSpeed(pendingKokoroSpeed);
         activeSession.setEffort(pendingEffort);
         activeSession.setThinking(pendingThinking);
+        activeSession.setDisallowedTools(pendingDisallowedTools);
+        activeSession.setAppendSystemPrompt(pendingSystemPrompt);
         sendJson({
           type: "session_created",
           sessionId: "",
           cwd,
+          title: "Untitled",
         });
         break;
       }
@@ -266,6 +271,8 @@ function createConnectionHandler(transport: ClientTransport) {
         activeSession.setKokoroSpeed(pendingKokoroSpeed);
         activeSession.setEffort(pendingEffort);
         activeSession.setThinking(pendingThinking);
+        activeSession.setDisallowedTools(pendingDisallowedTools);
+        activeSession.setAppendSystemPrompt(pendingSystemPrompt);
 
         // Register this client so /continue can find the real WebSocket
         sessionClients.set(msg.sessionId, {
@@ -277,6 +284,7 @@ function createConnectionHandler(transport: ClientTransport) {
           type: "session_created",
           sessionId: msg.sessionId,
           cwd: sessionInfo.cwd,
+          title: sessionInfo.title,
         });
 
         // Send message history — if session is running, load back to last user prompt
@@ -580,6 +588,17 @@ function createConnectionHandler(transport: ClientTransport) {
         break;
       }
 
+      case "rename_session": {
+        const session = getSession(msg.sessionId);
+        if (session) {
+          session.title = msg.title;
+          saveSession(session);
+          console.log(`Renamed session ${msg.sessionId} to "${msg.title}"`);
+          broadcastSessionList();
+        }
+        break;
+      }
+
       // ── Scheduled tasks ──
 
       case "schedule_task": {
@@ -777,6 +796,30 @@ function createConnectionHandler(transport: ClientTransport) {
         break;
       }
 
+      case "set_disallowed_tools": {
+        const tools = (msg as any).tools as string[];
+        if (Array.isArray(tools)) {
+          pendingDisallowedTools = tools;
+          if (activeSession) {
+            activeSession.setDisallowedTools(tools);
+          }
+          console.log(`Disallowed tools set to [${tools.join(', ')}] (session ${activeSession ? 'active' : 'pending'})`);
+        }
+        break;
+      }
+
+      case "set_system_prompt": {
+        const prompt = (msg as any).prompt as string;
+        if (typeof prompt === 'string') {
+          pendingSystemPrompt = prompt;
+          if (activeSession) {
+            activeSession.setAppendSystemPrompt(prompt);
+          }
+          console.log(`System prompt set (${prompt.length} chars) (session ${activeSession ? 'active' : 'pending'})`);
+        }
+        break;
+      }
+
       case "stop_task": {
         const taskId = (msg as any).taskId as string;
         console.log(`[stop_task] received: taskId=${taskId} activeSession=${!!activeSession}`);
@@ -877,11 +920,14 @@ function createConnectionHandler(transport: ClientTransport) {
         activeSession.setKokoroSpeed(pendingKokoroSpeed);
         activeSession.setEffort(pendingEffort);
         activeSession.setThinking(pendingThinking);
+        activeSession.setDisallowedTools(pendingDisallowedTools);
+        activeSession.setAppendSystemPrompt(pendingSystemPrompt);
         activeSession.setForkSource(sourceId);
         sendJson({
           type: "session_created",
           sessionId: "",
           cwd: sessionInfo.cwd,
+          title: "Untitled",
         });
         const forkPage = getHistoryPage(sourceId, 50);
         sendJson({
