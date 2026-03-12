@@ -25,7 +25,7 @@ export interface SessionContext {
 
 /** canUseTool interceptor result — return null to pass to next handler */
 export type CanUseToolResult =
-  | { behavior: "allow"; updatedInput?: any }
+  | { behavior: "allow"; updatedInput?: any; message?: string }
   | { behavior: "deny"; message: string }
   | null;
 

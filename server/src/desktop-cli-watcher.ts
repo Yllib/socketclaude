@@ -10,8 +10,6 @@ import { HistoryEntry } from "./protocol";
 export interface DesktopCliWatcherOptions {
   sessionId: string;
   cwd: string;
-  serverPid: number;
-  onStateChange: (active: boolean, pid?: number) => void;
   onNewMessages: (messages: HistoryEntry[]) => void;
   isOurQueryRunning: () => boolean;
 }
@@ -21,8 +19,6 @@ export class DesktopCliWatcher {
   private pollTimer: NodeJS.Timeout | null = null;
   private debounceTimer: NodeJS.Timeout | null = null;
   private quietTimer: NodeJS.Timeout | null = null;
-  private _active = false;
-  private _pid: number | undefined;
   private lastSyncTimestamp: string;
   private jsonlPath: string;
   private lastMtime = 0;
@@ -31,10 +27,6 @@ export class DesktopCliWatcher {
   constructor(private opts: DesktopCliWatcherOptions) {
     this.jsonlPath = getJsonlPath(opts.sessionId, opts.cwd);
     this.lastSyncTimestamp = getLastHistoryTimestamp(opts.sessionId);
-  }
-
-  get isBlocked(): boolean {
-    return this._active;
   }
 
   start(): void {
@@ -69,15 +61,6 @@ export class DesktopCliWatcher {
         // File doesn't exist yet — that's fine
       }
     }, 2000);
-
-    // Do an initial check in case a CLI is already running
-    const cli = this.detectDesktopCli();
-    if (cli) {
-      this._active = true;
-      this._pid = cli;
-      console.log(`[DesktopCLI] Session ${this.opts.sessionId}: desktop CLI already active (PID ${cli})`);
-      this.opts.onStateChange(true, cli);
-    }
   }
 
   stop(): void {
@@ -119,39 +102,14 @@ export class DesktopCliWatcher {
       // Reset quiet timer — CLI is still writing
       if (this.quietTimer) clearTimeout(this.quietTimer);
       this.quietTimer = setTimeout(() => this.onQuiet(), 2000);
-
-      // Detect desktop CLI process
-      const cli = this.detectDesktopCli();
-
-      if (!this._active) {
-        if (cli) {
-          this._active = true;
-          this._pid = cli;
-          console.log(`[DesktopCLI] Session ${this.opts.sessionId}: desktop CLI detected (PID ${cli})`);
-          this.opts.onStateChange(true, cli);
-        } else {
-          // No local process found — could be cross-machine or already exited
-          // Only mark active via file change if we haven't already synced
-          this._active = true;
-          this._pid = undefined;
-          console.log(`[DesktopCLI] Session ${this.opts.sessionId}: external JSONL change detected (no local process)`);
-          this.opts.onStateChange(true);
-        }
-      }
     }, 500);
   }
 
   private onQuiet(): void {
     if (this.stopped) return;
 
-    // JSONL stopped being written to — sync and unblock regardless of
-    // whether the CLI process is still alive.  An idle CLI sitting open
-    // on the desktop is not a conflict; only active writes are.
     console.log(`[DesktopCLI] Session ${this.opts.sessionId}: JSONL quiet, syncing messages`);
     this.syncMessages();
-    this._active = false;
-    this._pid = undefined;
-    this.opts.onStateChange(false);
   }
 
   private syncMessages(): void {
@@ -174,61 +132,5 @@ export class DesktopCliWatcher {
       this.lastSyncTimestamp = missed[missed.length - 1].timestamp;
       this.opts.onNewMessages(missed);
     }
-  }
-
-  /**
-   * Scan /proc for a `claude` process whose CWD matches the session CWD
-   * and is NOT a descendant of our server process.
-   * Returns the PID if found, null otherwise.
-   */
-  private detectDesktopCli(): number | null {
-    try {
-      const entries = fs.readdirSync("/proc");
-      for (const entry of entries) {
-        if (!/^\d+$/.test(entry)) continue;
-        const pid = parseInt(entry);
-
-        try {
-          // Check process name
-          const comm = fs.readFileSync(`/proc/${pid}/comm`, "utf-8").trim();
-          if (comm !== "claude") continue;
-
-          // Check CWD matches session CWD
-          const cwd = fs.readlinkSync(`/proc/${pid}/cwd`);
-          if (cwd !== this.opts.cwd) continue;
-
-          // Exclude descendants of our server process
-          if (this.isDescendantOf(pid, this.opts.serverPid)) continue;
-
-          return pid;
-        } catch {
-          // Process may have exited between readdir and read, skip
-          continue;
-        }
-      }
-    } catch {
-      // /proc not available (non-Linux or permission issue)
-    }
-    return null;
-  }
-
-  /** Walk the PPid chain to check if `pid` is a descendant of `ancestorPid` */
-  private isDescendantOf(pid: number, ancestorPid: number): boolean {
-    let current = pid;
-    const visited = new Set<number>();
-    while (current > 1 && !visited.has(current)) {
-      visited.add(current);
-      if (current === ancestorPid) return true;
-      try {
-        const stat = fs.readFileSync(`/proc/${current}/stat`, "utf-8");
-        // PPid is the 4th field in /proc/{pid}/stat
-        const ppid = parseInt(stat.split(" ")[3]);
-        if (ppid === ancestorPid) return true;
-        current = ppid;
-      } catch {
-        return false;
-      }
-    }
-    return false;
   }
 }

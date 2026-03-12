@@ -7,7 +7,8 @@ import * as http from "http";
 import * as path from "path";
 import { WebSocketServer, WebSocket } from "ws";
 import { ClaudeSession } from "./claude-session";
-import { listSessions, getSession, getHistory, getHistoryPage, deleteSession, clearSessionContext, cleanupPendingToolCalls, getTodos, getMissedMessages, appendHistory, getSdkEvents, markQuestionAnswered, getLastHistoryTimestamp } from "./session-store";
+import { listSessions, getSession, saveSession, getHistory, getHistoryPage, getHistoryPageToLastPrompt, deleteSession, clearSessionContext, cleanupPendingToolCalls, getTodos, getMissedMessages, appendHistory, getSdkEvents, markQuestionAnswered, getLastHistoryTimestamp, listSdkSessions } from "./session-store";
+import { listScheduledTasks, getScheduledTask, saveScheduledTask, deleteScheduledTask, getDueTasks, getNextRunTime, getScheduledTaskSessionIds, ScheduledTask } from "./scheduled-task-store";
 import { DesktopCliWatcher } from "./desktop-cli-watcher";
 import { ClientMessage, SessionInfo } from "./protocol";
 import { SocketClaudePlugin, PluginContext } from "./plugin-api";
@@ -91,18 +92,21 @@ const sessionClients = new Map<string, SessionClient>();
 /** Enrich stored sessions with live data from active sessions */
 function getEnrichedSessions(): SessionInfo[] {
   const sessions = listSessions();
-  return sessions.map(s => {
-    const active = activeSessions.get(s.id);
-    if (active && active.isRunning) {
-      return {
-        ...s,
-        running: true,
-        messagePreview: active.lastPreview || s.messagePreview,
-        lastActive: new Date().toISOString(),
-      };
-    }
-    return { ...s, running: false };
-  });
+  const taskSessionIds = getScheduledTaskSessionIds();
+  return sessions
+    .filter(s => !taskSessionIds.has(s.id))
+    .map(s => {
+      const active = activeSessions.get(s.id);
+      if (active && active.isRunning) {
+        return {
+          ...s,
+          running: true,
+          messagePreview: active.lastPreview || s.messagePreview,
+          lastActive: new Date().toISOString(),
+        };
+      }
+      return { ...s, running: false };
+    });
 }
 
 /** Broadcast current session list to all connected clients */
@@ -118,6 +122,24 @@ function broadcastSessionList(): void {
   if (relayConnectionHandler) {
     relayConnectionHandler.sendRaw(msg);
   }
+}
+
+/** Broadcast scheduled task list to all connected clients */
+function broadcastScheduledTaskList(): void {
+  const msg = JSON.stringify({ type: "scheduled_task_list", tasks: listScheduledTasks() });
+  for (const client of connectedClients) {
+    if (client.readyState === WebSocket.OPEN) client.send(msg);
+  }
+  if (relayConnectionHandler) relayConnectionHandler.sendRaw(msg);
+}
+
+/** Broadcast a scheduled task notification to all connected clients */
+function broadcastScheduledTaskNotification(title: string, body: string, sessionId: string): void {
+  const msg = JSON.stringify({ type: "scheduled_task_notification", title, body, sessionId });
+  for (const client of connectedClients) {
+    if (client.readyState === WebSocket.OPEN) client.send(msg);
+  }
+  if (relayConnectionHandler) relayConnectionHandler.sendRaw(msg);
 }
 
 /** Debounced broadcast for intermediate updates during queries */
@@ -204,7 +226,20 @@ function createConnectionHandler(transport: ClientTransport) {
         if (activeSession && activeSession.isRunning) {
           activeSession.detachWebSocket();
         }
-        const sessionInfo = getSession(msg.sessionId);
+        let sessionInfo = getSession(msg.sessionId);
+        // If not in SocketClaude store but cwd is provided, this is an SDK-only session
+        if (!sessionInfo && (msg as any).cwd) {
+          sessionInfo = {
+            id: msg.sessionId,
+            title: "Untitled",
+            cwd: (msg as any).cwd,
+            createdAt: new Date().toISOString(),
+            lastActive: new Date().toISOString(),
+            messagePreview: "",
+          };
+          saveSession(sessionInfo);
+          console.log(`[Resume] Created SocketClaude entry for SDK session ${msg.sessionId} in ${(msg as any).cwd}`);
+        }
         if (!sessionInfo) {
           sendJson({
             type: "error",
@@ -244,8 +279,11 @@ function createConnectionHandler(transport: ClientTransport) {
           cwd: sessionInfo.cwd,
         });
 
-        // Send most recent page of message history (always send, even if empty)
-        const page = getHistoryPage(msg.sessionId, 50);
+        // Send message history — if session is running, load back to last user prompt
+        const isRunning = activeSessions.has(msg.sessionId) && activeSessions.get(msg.sessionId)!.isRunning;
+        const page = isRunning
+          ? getHistoryPageToLastPrompt(msg.sessionId, 50)
+          : getHistoryPage(msg.sessionId, 50);
         const todos = getTodos(msg.sessionId);
         sendJson({
           type: "session_history",
@@ -261,8 +299,9 @@ function createConnectionHandler(transport: ClientTransport) {
         const lastTimestamp = allHistory.length > 0
           ? allHistory[allHistory.length - 1].timestamp
           : "";
-        if (lastTimestamp) {
-          const missed = getMissedMessages(msg.sessionId, sessionInfo.cwd, lastTimestamp);
+        {
+          // When history is empty, use epoch so we sync ALL messages from the JSONL
+          const missed = getMissedMessages(msg.sessionId, sessionInfo.cwd, lastTimestamp || "1970-01-01T00:00:00Z");
           if (missed.length > 0) {
             console.log(`[Resume] Found ${missed.length} missed messages from JSONL`);
             for (const entry of missed) {
@@ -299,30 +338,34 @@ function createConnectionHandler(transport: ClientTransport) {
 
         // Always send status so the app resets its processing state on resume
         const resumeRunning = !!(existing && existing.isRunning);
-        console.log(`[Resume] sessionId=${msg.sessionId} existing=${!!existing} isRunning=${existing?.isRunning} → sending running=${resumeRunning}`);
+        const activeToolInfo = existing?.getActiveToolCall?.() || null;
+        console.log(`[Resume] sessionId=${msg.sessionId} existing=${!!existing} isRunning=${existing?.isRunning} → sending running=${resumeRunning} activeToolUseId=${activeToolInfo?.toolUseId || 'none'}`);
         sendJson({
           type: "status",
           sessionId: msg.sessionId,
           running: resumeRunning,
+          ...(activeToolInfo ? { activeToolUseId: activeToolInfo.toolUseId } : {}),
         });
 
-        // Start desktop CLI watcher for this session
+        // Re-send accumulated bash output so the reconnecting client sees live output
+        if (resumeRunning && existing) {
+          const bashOutput = existing.getAccumulatedBashOutput();
+          if (bashOutput) {
+            console.log(`[Resume] Re-sending ${bashOutput.length} chars of accumulated bash output`);
+            sendJson({
+              type: "tool_stderr",
+              content: bashOutput,
+              sessionId: msg.sessionId,
+            });
+          }
+        }
+
+        // Start desktop CLI watcher for this session (syncs JSONL changes)
         if (!desktopWatchers.has(msg.sessionId)) {
           const watcherSessionId = msg.sessionId;
           const watcher = new DesktopCliWatcher({
             sessionId: watcherSessionId,
             cwd: sessionInfo.cwd,
-            serverPid: process.pid,
-            onStateChange: (active, pid) => {
-              console.log(`[DesktopCLI] State change: session=${watcherSessionId} active=${active} pid=${pid}`);
-              sendJson({
-                type: "desktop_cli_status",
-                sessionId: watcherSessionId,
-                active,
-                pid,
-              });
-              if (!active) broadcastSessionList();
-            },
             onNewMessages: (messages) => {
               console.log(`[DesktopCLI] Syncing ${messages.length} messages to app for session ${watcherSessionId}`);
               sendJson({
@@ -333,6 +376,7 @@ function createConnectionHandler(transport: ClientTransport) {
                 offset: -1,
                 append: true,
               });
+              broadcastSessionList();
             },
             isOurQueryRunning: () => {
               const session = activeSessions.get(watcherSessionId);
@@ -346,19 +390,6 @@ function createConnectionHandler(transport: ClientTransport) {
       }
 
       case "prompt": {
-        // Block if desktop CLI is using this session
-        const promptSessionId = msg.sessionId || activeSessionId;
-        if (promptSessionId) {
-          const cliWatcher = desktopWatchers.get(promptSessionId);
-          if (cliWatcher?.isBlocked) {
-            sendJson({
-              type: "error",
-              message: "This session is currently being used by the desktop Claude CLI. Wait for it to finish, or close it on desktop.",
-            });
-            break;
-          }
-        }
-
         if (!activeSession) {
           let cwd = DEFAULT_CWD;
           const savedResumeId = msg.sessionId;
@@ -506,6 +537,19 @@ function createConnectionHandler(transport: ClientTransport) {
         break;
       }
 
+      case "list_sdk_sessions": {
+        const cwd = (msg as any).cwd as string;
+        console.log(`[SdkSessions] Request for cwd=${cwd}`);
+        if (!cwd) {
+          sendJson({ type: "error", message: "No cwd provided for list_sdk_sessions" });
+          break;
+        }
+        const sdkSessions = listSdkSessions(cwd);
+        console.log(`[SdkSessions] Found ${sdkSessions.length} sessions for ${cwd}`);
+        sendJson({ type: "sdk_session_list", cwd, sessions: sdkSessions });
+        break;
+      }
+
       case "sync_desktop": {
         const syncSid = (msg as any).sessionId as string;
         if (syncSid) {
@@ -533,6 +577,72 @@ function createConnectionHandler(transport: ClientTransport) {
         deleteSession(sid);
         console.log(`Deleted session ${sid}`);
         broadcastSessionList();
+        break;
+      }
+
+      // ── Scheduled tasks ──
+
+      case "schedule_task": {
+        const recurrence = (msg as any).recurrence;
+        const task: ScheduledTask = {
+          id: crypto.randomUUID(),
+          prompt: (msg as any).prompt,
+          cwd: (msg as any).cwd,
+          scheduledTime: (msg as any).scheduledTime,
+          createdAt: new Date().toISOString(),
+          status: "pending",
+          createdBySessionId: activeSessionId || undefined,
+          recurrence: recurrence && recurrence.type !== "once" ? recurrence : undefined,
+          reuseSession: (msg as any).reuseSession || false,
+          runCount: 0,
+          runs: [],
+        };
+        saveScheduledTask(task);
+        console.log(`[Scheduler] Task created: ${task.id} for ${task.scheduledTime}${task.recurrence ? ` (recurring: ${task.recurrence.type})` : ""}`);
+        broadcastScheduledTaskList();
+        break;
+      }
+
+      case "list_scheduled_tasks": {
+        sendJson({ type: "scheduled_task_list", tasks: listScheduledTasks() });
+        break;
+      }
+
+      case "cancel_scheduled_task": {
+        const task = getScheduledTask((msg as any).taskId);
+        if (task && task.status === "pending") {
+          task.status = "cancelled";
+          saveScheduledTask(task);
+          console.log(`[Scheduler] Task cancelled: ${task.id}`);
+          broadcastScheduledTaskList();
+        }
+        break;
+      }
+
+      case "update_scheduled_task": {
+        const task = getScheduledTask((msg as any).taskId);
+        if (task && (task.status === "pending" || task.status === "cancelled")) {
+          if ((msg as any).prompt !== undefined) task.prompt = (msg as any).prompt;
+          if ((msg as any).cwd !== undefined) task.cwd = (msg as any).cwd;
+          if ((msg as any).scheduledTime !== undefined) task.scheduledTime = (msg as any).scheduledTime;
+          if ((msg as any).recurrence !== undefined) {
+            const rec = (msg as any).recurrence;
+            task.recurrence = rec && rec.type !== "once" ? rec : undefined;
+          }
+          if ((msg as any).reuseSession !== undefined) task.reuseSession = (msg as any).reuseSession;
+          // Allow re-activating a cancelled task
+          if (task.status === "cancelled") task.status = "pending";
+          saveScheduledTask(task);
+          console.log(`[Scheduler] Task updated: ${task.id}`);
+          broadcastScheduledTaskList();
+        }
+        break;
+      }
+
+      case "delete_scheduled_task": {
+        deleteScheduledTask((msg as any).taskId);
+        console.log(`[Scheduler] Task deleted: ${(msg as any).taskId}`);
+        broadcastScheduledTaskList();
         break;
       }
 
@@ -1056,7 +1166,9 @@ const httpServer = http.createServer((req, res) => {
     return;
   }
 
-  // GET /tts-model — serve Kokoro model as tar.gz for on-device download
+  // GET /tts-model — serve Kokoro model components individually
+  // ?model=kokoro-en-v0_19|kokoro-multi-lang-v1_0 — which model dir (default: kokoro-en-v0_19)
+  // ?file=model.onnx|voices.bin|tokens.txt|espeak-ng-data — which file to serve
   if (req.method === "GET" && req.url?.startsWith("/tts-model")) {
     const url = new URL(req.url, `http://localhost:${PORT}`);
     const token = url.searchParams.get("token");
@@ -1065,25 +1177,77 @@ const httpServer = http.createServer((req, res) => {
       res.end("Unauthorized");
       return;
     }
-    const modelDir = path.join(require("os").homedir(), ".claude-assistant", "tts-models", "kokoro-en-v0_19");
-    if (!fs.existsSync(path.join(modelDir, "model.onnx"))) {
-      res.writeHead(404);
-      res.end("Kokoro model not installed on server");
+    // Whitelist of allowed model directories
+    const allowedModels = ["kokoro-en-v0_19", "kokoro-multi-lang-v1_0"];
+    const modelName = url.searchParams.get("model") || "kokoro-en-v0_19";
+    if (!allowedModels.includes(modelName)) {
+      res.writeHead(400);
+      res.end(`Invalid model: ${modelName}. Allowed: ${allowedModels.join(", ")}`);
       return;
     }
-    console.log("[TTS Model] Serving kokoro-en-v0_19 model as tar.gz...");
+    const modelDir = path.join(require("os").homedir(), ".claude-assistant", "tts-models", modelName);
+
+    const fileName = url.searchParams.get("file") || "";
+    if (!fileName) {
+      res.writeHead(400);
+      res.end("Missing ?file= parameter.");
+      return;
+    }
+
+    // Directories served as tar.gz (espeak-ng-data, dict)
+    const tarDirs = ["espeak-ng-data", "dict"];
+    if (tarDirs.includes(fileName)) {
+      const dirPath = path.join(modelDir, fileName);
+      if (!fs.existsSync(dirPath)) {
+        res.writeHead(404);
+        res.end(`${fileName} not found`);
+        return;
+      }
+      console.log(`[TTS Model] Serving ${modelName}/${fileName} as tar.gz...`);
+      res.writeHead(200, {
+        "Content-Type": "application/gzip",
+        "Content-Disposition": `attachment; filename=${fileName}.tar.gz`,
+        "Transfer-Encoding": "chunked",
+      });
+      const { spawn } = require("child_process");
+      const tar = spawn("tar", ["czf", "-", "-C", modelDir, fileName]);
+      tar.stdout.pipe(res);
+      tar.stderr.on("data", (d: Buffer) => console.error("[TTS Model tar]", d.toString()));
+      tar.on("close", (code: number) => {
+        if (code !== 0) console.error(`[TTS Model] tar exited with code ${code}`);
+        else console.log(`[TTS Model] ${fileName} transfer complete`);
+      });
+      return;
+    }
+
+    // Validate file name (only allow known files to prevent path traversal)
+    const allowedFiles = ["model.onnx", "voices.bin", "tokens.txt",
+      "lexicon-us-en.txt", "lexicon-gb-en.txt", "lexicon-zh.txt"];
+    if (!allowedFiles.includes(fileName)) {
+      res.writeHead(400);
+      res.end(`Invalid file: ${fileName}. Allowed: ${allowedFiles.join(", ")}, ${tarDirs.join(", ")}`);
+      return;
+    }
+
+    const filePath = path.join(modelDir, fileName);
+    if (!fs.existsSync(filePath)) {
+      res.writeHead(404);
+      res.end(`File not found: ${fileName}`);
+      return;
+    }
+
+    const stat = fs.statSync(filePath);
+    console.log(`[TTS Model] Serving ${fileName} (${(stat.size / 1024 / 1024).toFixed(0)} MB)...`);
     res.writeHead(200, {
-      "Content-Type": "application/gzip",
-      "Content-Disposition": "attachment; filename=kokoro-en-v0_19.tar.gz",
-      "Transfer-Encoding": "chunked",
+      "Content-Type": "application/octet-stream",
+      "Content-Length": stat.size.toString(),
+      "Content-Disposition": `attachment; filename=${fileName}`,
     });
-    const { spawn } = require("child_process");
-    const tar = spawn("tar", ["czf", "-", "-C", path.dirname(modelDir), path.basename(modelDir)]);
-    tar.stdout.pipe(res);
-    tar.stderr.on("data", (d: Buffer) => console.error("[TTS Model tar]", d.toString()));
-    tar.on("close", (code: number) => {
-      if (code !== 0) console.error(`[TTS Model] tar exited with code ${code}`);
-      else console.log("[TTS Model] Transfer complete");
+    const stream = fs.createReadStream(filePath);
+    stream.pipe(res);
+    stream.on("error", (err) => {
+      console.error("[TTS Model] Stream error:", err);
+      res.end();
     });
     return;
   }
@@ -1231,13 +1395,6 @@ function buildStatusSyncMessage(): string {
       backgroundTaskIds.push(taskId);
     }
   }
-  // Collect sessions with active desktop CLI
-  const desktopCliSessions: string[] = [];
-  for (const [sid, watcher] of desktopWatchers) {
-    if (watcher.isBlocked) {
-      desktopCliSessions.push(sid);
-    }
-  }
   return JSON.stringify({
     type: "status_sync",
     running: anyRunning,
@@ -1245,7 +1402,6 @@ function buildStatusSyncMessage(): string {
     serverStartedAt: SERVER_STARTED_AT,
     serverPid: process.pid,
     backgroundTaskIds,
-    ...(desktopCliSessions.length > 0 ? { desktopCliSessions } : {}),
   });
 }
 
@@ -1266,6 +1422,179 @@ function scheduleStatusSync(): void {
   }, interval);
 }
 scheduleStatusSync();
+
+// ── Scheduled task executor ──
+const SCHEDULER_INTERVAL = 30000; // 30s
+
+async function checkScheduledTasks(): Promise<void> {
+  const dueTasks = getDueTasks();
+  for (const task of dueTasks) {
+    // Mark as running immediately to prevent double-execution
+    task.status = "running";
+    saveScheduledTask(task);
+    broadcastScheduledTaskList();
+
+    const isRecurring = task.recurrence && task.recurrence.type !== "once";
+    const runNumber = (task.runCount || 0) + 1;
+    console.log(`[Scheduler] Executing task ${task.id} (run #${runNumber}): ${task.prompt.slice(0, 80)}`);
+
+    // Notify clients that task is starting
+    broadcastScheduledTaskNotification(
+      isRecurring ? `Recurring task started (run #${runNumber})` : "Scheduled task started",
+      task.prompt.slice(0, 200),
+      "" // no session ID yet
+    );
+
+    try {
+      // Verify CWD exists
+      if (!fs.existsSync(task.cwd)) {
+        task.status = "failed";
+        task.error = `Directory not found: ${task.cwd}`;
+        saveScheduledTask(task);
+        broadcastScheduledTaskList();
+        broadcastScheduledTaskNotification("Scheduled task failed", task.error, "");
+        continue;
+      }
+
+      // Determine if we should resume an existing session
+      const shouldResume = task.reuseSession && task.sessionId;
+
+      // Create headless session (same pattern as /continue endpoint)
+      const ws = { readyState: WebSocket.CLOSED, send: () => {} } as any;
+      const session = new ClaudeSession(ws, task.cwd, plugins);
+      session.onActivity = () => scheduleBroadcast();
+
+      // If reusing session, set the resume ID so SDK continues that session
+      if (shouldResume) {
+        (session as any)._resumeSessionId = task.sessionId;
+        console.log(`[Scheduler] Reusing session ${task.sessionId}`);
+      }
+
+      const tempId = `scheduled-${task.id}`;
+      activeSessions.set(tempId, session);
+
+      // Track this run
+      const currentRun: import("./scheduled-task-store").TaskRun = {
+        sessionId: "", // will be filled in
+        startedAt: new Date().toISOString(),
+        status: "running",
+      };
+
+      // Poll for real session ID
+      const registerInterval = setInterval(() => {
+        const sid = session.getSessionId();
+        if (sid && sid !== tempId) {
+          clearInterval(registerInterval);
+          activeSessions.delete(tempId);
+          activeSessions.set(sid, session);
+          task.sessionId = sid;
+          currentRun.sessionId = sid;
+          saveScheduledTask(task);
+          broadcastSessionList();
+        }
+      }, 500);
+      setTimeout(() => clearInterval(registerInterval), 30000);
+
+      // Use resumeSessionId for session reuse, otherwise undefined for new session
+      const resumeId = shouldResume ? task.sessionId : undefined;
+
+      session.runQuery(task.prompt, resumeId).then(() => {
+        clearInterval(registerInterval);
+        const sid = session.getSessionId() || tempId;
+        task.sessionId = sid;
+        currentRun.sessionId = sid;
+        currentRun.completedAt = new Date().toISOString();
+        currentRun.status = "completed";
+        currentRun.resultSummary = (session as any)._lastPreview || "Task completed";
+
+        task.resultSummary = currentRun.resultSummary;
+        task.runCount = runNumber;
+        task.lastRunAt = new Date().toISOString();
+        if (!task.runs) task.runs = [];
+        task.runs.push(currentRun);
+
+        if (activeSessions.get(sid) === session) activeSessions.delete(sid);
+        if (activeSessions.get(tempId) === session) activeSessions.delete(tempId);
+
+        // For recurring tasks, schedule the next run
+        if (isRecurring) {
+          const nextTime = getNextRunTime(task);
+          if (nextTime) {
+            task.status = "pending";
+            task.scheduledTime = nextTime;
+            task.error = undefined;
+            console.log(`[Scheduler] Task ${task.id} next run at ${nextTime}`);
+          } else {
+            task.status = "completed";
+          }
+        } else {
+          task.status = "completed";
+        }
+        saveScheduledTask(task);
+
+        broadcastScheduledTaskList();
+        broadcastSessionList();
+        broadcastScheduledTaskNotification(
+          isRecurring ? `Recurring task complete (run #${runNumber})` : "Scheduled task complete",
+          task.resultSummary || task.prompt.slice(0, 200),
+          task.sessionId || ""
+        );
+        console.log(`[Scheduler] Task ${task.id} run #${runNumber} completed, session ${sid}`);
+      }).catch((err) => {
+        clearInterval(registerInterval);
+        const sid = session.getSessionId() || tempId;
+        task.sessionId = sid !== tempId ? sid : undefined;
+        currentRun.sessionId = sid !== tempId ? sid : "";
+        currentRun.completedAt = new Date().toISOString();
+        currentRun.status = "failed";
+        currentRun.error = err.message || "Unknown error";
+
+        task.error = currentRun.error;
+        task.runCount = runNumber;
+        task.lastRunAt = new Date().toISOString();
+        if (!task.runs) task.runs = [];
+        task.runs.push(currentRun);
+
+        activeSessions.delete(tempId);
+        if (sid !== tempId) activeSessions.delete(sid);
+
+        // For recurring tasks, still schedule next run even if this one failed
+        if (isRecurring) {
+          const nextTime = getNextRunTime(task);
+          if (nextTime) {
+            task.status = "pending";
+            task.scheduledTime = nextTime;
+            console.log(`[Scheduler] Task ${task.id} failed but rescheduled for ${nextTime}`);
+          } else {
+            task.status = "failed";
+          }
+        } else {
+          task.status = "failed";
+        }
+        saveScheduledTask(task);
+
+        broadcastScheduledTaskList();
+        broadcastScheduledTaskNotification(
+          isRecurring ? `Recurring task failed (run #${runNumber})` : "Scheduled task failed",
+          currentRun.error || task.prompt.slice(0, 200),
+          task.sessionId || ""
+        );
+        console.error(`[Scheduler] Task ${task.id} run #${runNumber} failed: ${err.message}`);
+      });
+
+    } catch (err: any) {
+      task.status = "failed";
+      task.error = err.message;
+      saveScheduledTask(task);
+      broadcastScheduledTaskList();
+      broadcastScheduledTaskNotification("Scheduled task failed", task.error!, "");
+    }
+  }
+}
+
+setInterval(checkScheduledTasks, SCHEDULER_INTERVAL);
+// Also run once on startup to catch overdue tasks
+setTimeout(checkScheduledTasks, 5000);
 
 // ── Direct WebSocket connections ──
 wss.on("connection", (ws: WebSocket) => {

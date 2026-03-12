@@ -6,10 +6,12 @@ import * as path from "path";
 import { WebSocket } from "ws";
 import {
   ServerMessage,
+  ActiveSubagentsServerMessage,
   QuestionItem,
   SessionInfo,
 } from "./protocol";
 import { saveSession, updateSessionActivity, appendHistory, saveTodos, getTodos, remapSession, markQuestionAnswered, appendSdkEvent } from "./session-store";
+import { saveScheduledTask, ScheduledTask, RecurrenceConfig } from "./scheduled-task-store";
 import { SocketClaudePlugin, SessionContext } from "./plugin-api";
 import { generateKokoroAudio, isKokoroAvailable } from "./kokoro-tts";
 
@@ -36,9 +38,13 @@ export class ClaudeSession {
   private _backgroundTaskToolUseIds: Set<string> = new Set();  // toolUseIds of background Task calls
   private _suppressedToolResultIds: Set<string> = new Set();  // toolUseIds whose results should be hidden from client
   private _taskIdToToolUseId: Map<string, string> = new Map();  // agentId → toolUseId mapping
+  private _activeSubagents: Map<string, { toolUseId: string; description: string; subagentType: string; startedAt: string }> = new Map();
   private _activeBashStream: { interval: NodeJS.Timeout; filePath: string; lastSize: number } | null = null;
+  private _activeToolUseId: string | null = null;  // currently-executing tool call
+  private _activeToolName: string | null = null;
   private _readToolPaths: Map<string, string> = new Map();  // toolUseId → file_path for Read tool calls
   private _streamingText = "";  // accumulated text for the current streaming response
+  private _streamingThinking = "";  // accumulated thinking for the current thinking block
   private _lastPreview: string = "";
   private _lastSessionInit: ServerMessage | null = null;
   private _lastSupportedModels: ServerMessage | null = null;
@@ -183,6 +189,37 @@ export class ClaudeSession {
     return this._taskIdToToolUseId;
   }
 
+  /** Active subagent tasks with metadata */
+  getActiveSubagents(): Array<{ agentId: string; toolUseId: string; description: string; subagentType: string; startedAt: string }> {
+    return Array.from(this._activeSubagents.entries()).map(([toolUseId, info]) => ({
+      agentId: toolUseId,  // toolUseId is the key the app knows
+      toolUseId: info.toolUseId,
+      description: info.description,
+      subagentType: info.subagentType,
+      startedAt: info.startedAt,
+    }));
+  }
+
+  /** Currently-executing tool call info (null if no tool is running) */
+  getActiveToolCall(): { toolUseId: string; name: string } | null {
+    if (this._activeToolUseId && this._activeToolName) {
+      return { toolUseId: this._activeToolUseId, name: this._activeToolName };
+    }
+    return null;
+  }
+
+  /** Read accumulated bash output from the live log file (for replay on reconnect) */
+  getAccumulatedBashOutput(): string | null {
+    if (!this._activeBashStream) return null;
+    try {
+      if (!fs.existsSync(this._activeBashStream.filePath)) return null;
+      const content = fs.readFileSync(this._activeBashStream.filePath, "utf8");
+      return content.length > 0 ? content : null;
+    } catch {
+      return null;
+    }
+  }
+
   get lastPreview(): string {
     return this._lastPreview;
   }
@@ -197,6 +234,14 @@ export class ClaudeSession {
     // Re-send cached session init and models so app UI populates immediately
     if (this._lastSessionInit) this.send(this._lastSessionInit);
     if (this._lastSupportedModels) this.send(this._lastSupportedModels);
+    // Send any thinking accumulated during the current thinking block
+    if (this._streamingThinking.length > 0) {
+      this.send({
+        type: "thinking",
+        content: this._streamingThinking,
+        sessionId: this.sessionId || "",
+      });
+    }
     // Send any text accumulated during the current streaming response
     if (this._streamingText.length > 0) {
       this.send({
@@ -210,6 +255,16 @@ export class ClaudeSession {
       if (pending.questionData) {
         this.send(pending.questionData);
       }
+    }
+    // Send active subagent tasks so the app can render SubAgentCards
+    const activeSubagents = this.getActiveSubagents();
+    if (activeSubagents.length > 0) {
+      console.log(`[Resume] Sending ${activeSubagents.length} active subagents`);
+      this.send({
+        type: "active_subagents",
+        tasks: activeSubagents,
+        sessionId: this.sessionId || "",
+      } as ActiveSubagentsServerMessage);
     }
   }
 
@@ -350,6 +405,7 @@ export class ClaudeSession {
     this.abortController = new AbortController();
     this._isRunning = true;
     this._streamingText = "";
+    this._streamingThinking = "";
     this._lastPreview = "";
     this.onActivity?.();
 
@@ -469,6 +525,58 @@ export class ClaudeSession {
               return { content: [{ type: "text" as const, text: `Reminder scheduled: "${args.title}" at ${when}` }] };
             }
           ),
+          tool(
+            "ScheduleTask",
+            "Schedule a Claude prompt to run automatically at a future time. Creates a new session in the specified directory and executes the prompt when the scheduled time arrives. The server runs 24/7 so the task will execute even if the app is closed. Use this when the user wants to defer a task to run later. Supports recurring schedules (daily, weekly, monthly, or custom interval) and optionally reusing the same session across recurrences.",
+            {
+              prompt: z.string().describe("The prompt/instructions for Claude to execute at the scheduled time"),
+              cwd: z.string().describe("Working directory for the scheduled task (absolute path)"),
+              scheduledTime: z.string().describe("When to run the task, in ISO 8601 format (e.g. 2026-03-13T09:00:00)"),
+              recurrenceType: z.enum(["once", "daily", "weekly", "monthly", "custom"]).optional().describe("How often to repeat. Default: once (no recurrence)"),
+              customIntervalMs: z.number().optional().describe("Custom interval in milliseconds (only used when recurrenceType is 'custom')"),
+              reuseSession: z.boolean().optional().describe("If true and recurring, reuse the same session for all occurrences instead of creating new ones"),
+            },
+            async (args) => {
+              const scheduledDate = new Date(args.scheduledTime);
+              if (isNaN(scheduledDate.getTime())) {
+                return { content: [{ type: "text" as const, text: `Invalid date format: ${args.scheduledTime}. Use ISO 8601 format.` }] };
+              }
+              if (scheduledDate.getTime() <= Date.now()) {
+                return { content: [{ type: "text" as const, text: `Scheduled time is in the past. Please provide a future time.` }] };
+              }
+
+              const recurrenceType = args.recurrenceType || "once";
+              const recurrence: RecurrenceConfig | undefined = recurrenceType !== "once" ? {
+                type: recurrenceType,
+                intervalMs: recurrenceType === "custom" ? args.customIntervalMs : undefined,
+              } : undefined;
+
+              const task: ScheduledTask = {
+                id: crypto.randomUUID(),
+                prompt: args.prompt,
+                cwd: args.cwd,
+                scheduledTime: args.scheduledTime,
+                createdAt: new Date().toISOString(),
+                status: "pending",
+                createdBySessionId: this.sessionId || undefined,
+                recurrence,
+                reuseSession: args.reuseSession || false,
+                runCount: 0,
+                runs: [],
+              };
+              saveScheduledTask(task);
+
+              // Notify the app about the new task
+              this.send({
+                type: "scheduled_task_update",
+                task,
+              } as any);
+
+              const when = scheduledDate.toLocaleString();
+              const recurrenceLabel = recurrence ? ` (recurring: ${recurrence.type})` : "";
+              return { content: [{ type: "text" as const, text: `Task scheduled for ${when}${recurrenceLabel} in ${args.cwd}:\n"${args.prompt.slice(0, 300)}"` }] };
+            }
+          ),
         ],
       });
 
@@ -486,7 +594,7 @@ export class ClaudeSession {
         }
       }
 
-      const toolContext = `You are a general-purpose personal assistant. You can schedule reminders for the user using the ScheduleReminder tool — use ISO 8601 datetime for the scheduledTime parameter.${ttsInstruction}${pluginContext}`;
+      const toolContext = `You are a general-purpose personal assistant. You can schedule reminders for the user using the ScheduleReminder tool — use ISO 8601 datetime for the scheduledTime parameter. You can also schedule deferred tasks using the ScheduleTask tool — these create a new Claude session that runs automatically at the specified time. Supports recurring schedules (daily, weekly, monthly, or custom interval) and optionally reusing the same session across recurrences.${ttsInstruction}${pluginContext}`;
 
       // Handle fork: use fork source as resume target + set forkSession flag
       const shouldFork = !!this._forkFromSessionId;
@@ -538,6 +646,7 @@ export class ClaudeSession {
 
                 // Run plugin interceptors
                 const sessionCtx = this.getSessionContext();
+                let pluginAllowed = false;
                 for (const plugin of this.plugins) {
                   if (plugin.canUseToolInterceptor) {
                     const result = await plugin.canUseToolInterceptor(toolName, toolInput, sessionCtx);
@@ -552,19 +661,37 @@ export class ClaudeSession {
                           },
                         };
                       }
-                      // Plugin explicitly allowed
+                      // Plugin explicitly allowed — continue to bash wrapping check
                       console.log(`[Hook] PreToolUse ALLOWED by plugin: ${toolName}`);
-                      return {
-                        hookSpecificOutput: {
-                          hookEventName: "PreToolUse",
-                          permissionDecision: "allow",
-                        },
-                      };
+                      pluginAllowed = true;
+                      break;
                     }
                   }
                 }
 
-                // No plugin intercepted — allow
+                // Wrap Bash commands with tee for live streaming output
+                if (toolName === "Bash" && toolInput.command) {
+                  const outFile = "/tmp/claude-bash-live.log";
+                  try { fs.writeFileSync(outFile, ""); } catch {}
+                  const wrapped = `set -o pipefail; (${toolInput.command}) 2>&1 | stdbuf -oL tee ${outFile}`;
+                  return {
+                    hookSpecificOutput: {
+                      hookEventName: "PreToolUse",
+                      permissionDecision: "allow",
+                      updatedInput: { command: wrapped },
+                    },
+                  };
+                }
+
+                // No modification needed — allow
+                if (pluginAllowed) {
+                  return {
+                    hookSpecificOutput: {
+                      hookEventName: "PreToolUse",
+                      permissionDecision: "allow",
+                    },
+                  };
+                }
                 return { continue: true };
               }],
             }],
@@ -1083,6 +1210,7 @@ export class ClaudeSession {
           ) {
             currentText += event.delta.text;
             this._streamingText += event.delta.text;
+            this._streamingThinking = "";  // thinking block ended
             this.send({
               type: "text",
               content: event.delta.text,
@@ -1097,6 +1225,7 @@ export class ClaudeSession {
             event?.type === "content_block_delta" &&
             event.delta?.type === "thinking_delta"
           ) {
+            this._streamingThinking += event.delta.thinking || "";
             this.send({
               type: "thinking",
               content: event.delta.thinking || "",
@@ -1136,8 +1265,9 @@ export class ClaudeSession {
             } as any);
           }
 
-          // Reset streaming text — this assistant turn is complete
+          // Reset streaming text/thinking — this assistant turn is complete
           this._streamingText = "";
+          this._streamingThinking = "";
           // Log the full assistant text once the message is complete
           const apiMessage = (message as any).message;
           if (apiMessage?.content && Array.isArray(apiMessage.content)) {
@@ -1219,6 +1349,9 @@ export class ClaudeSession {
                 }
 
                 console.log(`[SDK] >>> tool_call: ${block.name} toolUseId=${block.id}`);
+                // Track the currently-executing tool call
+                this._activeToolUseId = block.id;
+                this._activeToolName = block.name;
                 this.send({
                   type: "tool_call",
                   tool: block.name,
@@ -1248,18 +1381,30 @@ export class ClaudeSession {
                   this._startBashWatcher("/tmp/claude-bash-live.log");
                 }
 
-                // Detect background task launches and send a start notification
-                if (block.name === "Task" && (block.input as any)?.run_in_background) {
-                  const desc = (block.input as any)?.description || "Background task";
-                  console.log(`[SDK] Background task launched: ${desc} (toolUseId=${block.id})`);
-                  this._backgroundTaskToolUseIds.add(block.id);
-                  this.send({
-                    type: "task_notification",
-                    taskId: block.id,
-                    status: "started",
-                    summary: desc,
-                    sessionId: this.sessionId || "",
-                  } as any);
+                // Track all Task (subagent) tool calls
+                if (block.name === "Task") {
+                  const desc = (block.input as any)?.description || "Task";
+                  const subagentType = (block.input as any)?.subagent_type || "";
+                  this._activeSubagents.set(block.id, {
+                    toolUseId: block.id,
+                    description: desc,
+                    subagentType,
+                    startedAt: now(),
+                  });
+                  console.log(`[SDK] Subagent started: ${desc} (toolUseId=${block.id}, type=${subagentType})`);
+
+                  // Background task notification
+                  if ((block.input as any)?.run_in_background) {
+                    console.log(`[SDK] Background task launched: ${desc} (toolUseId=${block.id})`);
+                    this._backgroundTaskToolUseIds.add(block.id);
+                    this.send({
+                      type: "task_notification",
+                      taskId: block.id,
+                      status: "started",
+                      summary: desc,
+                      sessionId: this.sessionId || "",
+                    } as any);
+                  }
                 }
 
                 if (this.sessionId) {
@@ -1380,6 +1525,13 @@ export class ClaudeSession {
                   this._stopBashWatcher();
                 }
 
+                // Remove completed subagent from active tracking
+                if (this._activeSubagents.has(toolUseId)) {
+                  const info = this._activeSubagents.get(toolUseId)!;
+                  console.log(`[SDK] Subagent completed: ${info.description} (toolUseId=${toolUseId})`);
+                  this._activeSubagents.delete(toolUseId);
+                }
+
                 // Track background task agentId → toolUseId mapping
                 if (this._backgroundTaskToolUseIds.has(toolUseId)) {
                   this._backgroundTaskToolUseIds.delete(toolUseId);
@@ -1390,6 +1542,10 @@ export class ClaudeSession {
                     console.log(`[SDK] Background task mapping: agentId=${agentId} → toolUseId=${toolUseId}`);
                   }
                 }
+
+                // Clear active tool tracking — tool has completed
+                this._activeToolUseId = null;
+                this._activeToolName = null;
 
                 // Stream large tool output in chunks for progressive rendering
                 const CHUNK_THRESHOLD = 500; // Only chunk if output > 500 chars

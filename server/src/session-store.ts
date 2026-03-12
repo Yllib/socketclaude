@@ -162,6 +162,34 @@ export function getHistoryPage(
   return { entries: all.slice(start, end), total, offset: start };
 }
 
+/**
+ * Get history page that includes at least back to the user's most recent prompt.
+ * Ensures the app has enough context to render subagent tasks properly.
+ */
+export function getHistoryPageToLastPrompt(
+  sessionId: string,
+  minEntries: number = 50
+): { entries: HistoryEntry[]; total: number; offset: number } {
+  const all = getHistory(sessionId);
+  const total = all.length;
+  if (total === 0) {
+    return { entries: [], total: 0, offset: 0 };
+  }
+
+  // Default start: last minEntries
+  let start = Math.max(0, total - minEntries);
+
+  // Find the last user message and ensure we include it
+  for (let i = total - 1; i >= 0; i--) {
+    if (all[i].role === "user") {
+      start = Math.min(start, i);
+      break;
+    }
+  }
+
+  return { entries: all.slice(start), total, offset: start };
+}
+
 // ── Per-session todo list ──
 
 const TODOS_DIR = path.join(STORE_DIR, "todos");
@@ -197,7 +225,7 @@ export function getTodos(sessionId: string): any[] {
 /** Build the path to Claude Code's JSONL session file */
 export function getJsonlPath(sessionId: string, cwd: string): string {
   const homeDir = process.env.HOME || require("os").homedir();
-  const projectDir = cwd.replace(/^\//, "").replace(/\//g, "-");
+  const projectDir = cwd.replace(/^\//, "").replace(/[\/ ]/g, "-");
   return path.join(homeDir, ".claude", "projects", `-${projectDir}`, `${sessionId}.jsonl`);
 }
 
@@ -457,4 +485,169 @@ export function cleanupPendingToolCalls(): void {
       console.log(`Cleaned up pending tool calls in ${file}`);
     }
   }
+}
+
+// ── SDK session discovery ──
+
+export interface SdkSessionEntry {
+  sessionId: string;
+  firstMessage: string;
+  createdAt: string;
+  lastActive: string;
+  tracked: boolean; // true if already in SocketClaude store
+}
+
+/**
+ * Build a map of sessionId → last user prompt from ~/.claude/history.jsonl.
+ * This file stores every prompt the user sent, with `display`, `sessionId`, and `project`.
+ */
+function loadPromptHistory(cwd: string): Map<string, string> {
+  const homeDir = process.env.HOME || require("os").homedir();
+  const historyPath = path.join(homeDir, ".claude", "history.jsonl");
+  const map = new Map<string, string>();
+  if (!fs.existsSync(historyPath)) return map;
+
+  try {
+    const lines = fs.readFileSync(historyPath, "utf-8").split("\n").filter(Boolean);
+    for (const line of lines) {
+      let obj: any;
+      try { obj = JSON.parse(line); } catch { continue; }
+      // Match sessions for this project (CWD)
+      if (obj.project === cwd && obj.sessionId && obj.display) {
+        map.set(obj.sessionId, obj.display); // last prompt wins
+      }
+    }
+  } catch { /* ignore */ }
+  return map;
+}
+
+/**
+ * List Claude Code SDK sessions for a given CWD.
+ * Scans ~/.claude/projects/-{cwd-sanitized}/ for JSONL files.
+ * Uses ~/.claude/history.jsonl for session preview text.
+ * Includes both tracked (already in SocketClaude store) and untracked sessions.
+ */
+export function listSdkSessions(cwd: string, limit = 30): SdkSessionEntry[] {
+  const homeDir = process.env.HOME || require("os").homedir();
+  const projectDir = cwd.replace(/^\//, "").replace(/[\/ ]/g, "-");
+  const projectPath = path.join(homeDir, ".claude", "projects", `-${projectDir}`);
+
+  if (!fs.existsSync(projectPath)) return [];
+
+  let files: string[];
+  try {
+    // Filter out agent-* files (subagent sessions — not independently resumable)
+    files = fs.readdirSync(projectPath).filter(f => f.endsWith(".jsonl") && !f.startsWith("agent-"));
+  } catch {
+    return [];
+  }
+
+  // Build lookup of tracked sessions for this CWD
+  const store = readStore();
+  const trackedMap = new Map<string, SessionInfo>();
+  for (const s of store) {
+    if (s.cwd === cwd) trackedMap.set(s.id, s);
+  }
+
+  // Load prompt history from ~/.claude/history.jsonl
+  const promptHistory = loadPromptHistory(cwd);
+
+  // Sort by mtime, scan more files than the limit since some will be skipped as stubs
+  const scanLimit = limit * 5;
+  const fileStats = files
+    .map(f => {
+      try {
+        const mtime = fs.statSync(path.join(projectPath, f)).mtimeMs;
+        return { file: f, mtime };
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean)
+    .sort((a, b) => b!.mtime - a!.mtime)
+    .slice(0, scanLimit) as { file: string; mtime: number }[];
+
+  const results: SdkSessionEntry[] = [];
+
+  for (const { file, mtime } of fileStats) {
+    const sessionId = file.replace(".jsonl", "");
+    const tracked = trackedMap.get(sessionId);
+
+    // For tracked sessions, use stored preview instead of parsing JSONL
+    if (tracked) {
+      results.push({
+        sessionId,
+        firstMessage: tracked.messagePreview || tracked.title || "Untitled",
+        createdAt: tracked.createdAt,
+        lastActive: tracked.lastActive,
+        tracked: true,
+      });
+      continue;
+    }
+
+    // Use prompt history for the preview (last user prompt for this session)
+    const promptPreview = promptHistory.get(sessionId);
+    if (promptPreview) {
+      results.push({
+        sessionId,
+        firstMessage: promptPreview.slice(0, 200),
+        createdAt: new Date(mtime).toISOString(),
+        lastActive: new Date(mtime).toISOString(),
+        tracked: false,
+      });
+      continue;
+    }
+
+    // Fallback: parse the JSONL for the first real (non-Warmup) user message
+    const filePath = path.join(projectPath, file);
+    let userMessage = "";
+
+    try {
+      const stat = fs.statSync(filePath);
+      // Read up to 256KB from the head — the real prompt is usually near the start
+      const readSize = Math.min(256 * 1024, stat.size);
+      const fd = fs.openSync(filePath, "r");
+      const buf = Buffer.alloc(readSize);
+      fs.readSync(fd, buf, 0, readSize, 0);
+      fs.closeSync(fd);
+
+      const lines = buf.toString("utf-8").split("\n").filter(Boolean);
+      for (const line of lines) {
+        let obj: any;
+        try { obj = JSON.parse(line); } catch { continue; }
+
+        if (obj.type === "user" && obj.message?.content) {
+          const content = obj.message.content;
+          let text = "";
+          if (Array.isArray(content)) {
+            const textBlock = content.find((b: any) => b.type === "text");
+            if (textBlock?.text) text = textBlock.text;
+          } else if (typeof content === "string") {
+            text = content;
+          }
+          // Skip warmup/internal messages, keep looking
+          if (text && !/^\s*Warmup\s*$/i.test(text)) {
+            userMessage = text.slice(0, 200);
+            break;
+          }
+        }
+      }
+    } catch { /* ignore */ }
+
+    // Skip sessions with no discoverable user message (true stubs)
+    if (!userMessage) continue;
+
+    results.push({
+      sessionId,
+      firstMessage: userMessage,
+      createdAt: new Date(mtime).toISOString(),
+      lastActive: new Date(mtime).toISOString(),
+      tracked: false,
+    });
+
+    // Stop once we have enough results
+    if (results.length >= limit) break;
+  }
+
+  return results;
 }

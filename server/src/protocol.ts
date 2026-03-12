@@ -155,6 +155,47 @@ export interface SyncDesktopMessage {
   sessionId: string;
 }
 
+export interface ListSdkSessionsMessage {
+  type: "list_sdk_sessions";
+  cwd: string;
+}
+
+export interface ScheduleTaskMessage {
+  type: "schedule_task";
+  prompt: string;
+  cwd: string;
+  scheduledTime: string;
+  recurrence?: {
+    type: "once" | "daily" | "weekly" | "monthly" | "custom";
+    intervalMs?: number;
+  };
+  reuseSession?: boolean;
+}
+
+export interface ListScheduledTasksMessage {
+  type: "list_scheduled_tasks";
+}
+
+export interface CancelScheduledTaskMessage {
+  type: "cancel_scheduled_task";
+  taskId: string;
+}
+
+export interface UpdateScheduledTaskMessage {
+  type: "update_scheduled_task";
+  taskId: string;
+  prompt?: string;
+  cwd?: string;
+  scheduledTime?: string;
+  recurrence?: { type: "once" | "daily" | "weekly" | "monthly" | "custom"; intervalMs?: number } | null;
+  reuseSession?: boolean;
+}
+
+export interface DeleteScheduledTaskMessage {
+  type: "delete_scheduled_task";
+  taskId: string;
+}
+
 export type ClientMessage =
   | PromptMessage
   | AnswerMessage
@@ -178,12 +219,18 @@ export type ClientMessage =
   | McpToggleMessage
   | RewindMessage
   | SyncDesktopMessage
+  | ListSdkSessionsMessage
   | RequestFileMessage
   | LoadMoreHistoryMessage
   | CheckCwdMessage
   | CreateCwdMessage
   | UploadStartMessage
-  | UploadChunkMessage;
+  | UploadChunkMessage
+  | ScheduleTaskMessage
+  | ListScheduledTasksMessage
+  | CancelScheduledTaskMessage
+  | UpdateScheduledTaskMessage
+  | DeleteScheduledTaskMessage;
 
 // ── Server → Client messages ──
 
@@ -292,6 +339,7 @@ export interface SessionInfo {
   messagePreview: string;
   running?: boolean;
   lastUsage?: UsageInfo & { costUsd?: number; numTurns?: number };
+  scheduledTaskId?: string;
 }
 
 export interface ErrorServerMessage {
@@ -428,6 +476,35 @@ export interface DesktopCliStatusServerMessage {
   pid?: number;
 }
 
+export interface ActiveSubagentsServerMessage {
+  type: "active_subagents";
+  sessionId: string;
+  tasks: {
+    agentId: string;
+    toolUseId: string;
+    description: string;
+    subagentType: string;
+    startedAt: string;
+  }[];
+}
+
+export interface ScheduledTaskListServerMessage {
+  type: "scheduled_task_list";
+  tasks: import("./scheduled-task-store").ScheduledTask[];
+}
+
+export interface ScheduledTaskUpdateServerMessage {
+  type: "scheduled_task_update";
+  task: import("./scheduled-task-store").ScheduledTask;
+}
+
+export interface ScheduledTaskNotificationServerMessage {
+  type: "scheduled_task_notification";
+  title: string;
+  body: string;
+  sessionId: string;
+}
+
 export type ServerMessage =
   | TextServerMessage
   | ToolCallServerMessage
@@ -451,4 +528,8 @@ export type ServerMessage =
   | TtsAudioServerMessage
   | ThinkingServerMessage
   | ToolImageServerMessage
-  | DesktopCliStatusServerMessage;
+  | DesktopCliStatusServerMessage
+  | ActiveSubagentsServerMessage
+  | ScheduledTaskListServerMessage
+  | ScheduledTaskUpdateServerMessage
+  | ScheduledTaskNotificationServerMessage;
