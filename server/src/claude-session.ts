@@ -1857,13 +1857,25 @@ export class ClaudeSession {
       });
       return;
     }
-    // If code contains '&' it's already a full query string (code=...&state=...)
-    // Otherwise it's just the code, and we use the stored state
+    // The user might paste:
+    //   1. Just the code: "abc123"
+    //   2. code#state from the redirect page: "abc123#stateXYZ"
+    //   3. A full URL or query string with code= and state=
+    let rawCode = code.trim();
+
     let queryString: string;
-    if (code.includes("=")) {
-      queryString = code;
+    if (rawCode.includes("=")) {
+      // Full query string — normalize # to &
+      const urlMatch = rawCode.match(/[?#](.*)/);
+      if (urlMatch) rawCode = urlMatch[1];
+      queryString = rawCode.replace(/#/g, "&");
+    } else if (rawCode.includes("#")) {
+      // code#state format from the redirect page
+      const [authCode, state] = rawCode.split("#", 2);
+      queryString = `code=${encodeURIComponent(authCode)}&state=${encodeURIComponent(state)}`;
     } else {
-      queryString = `code=${encodeURIComponent(code)}&state=${encodeURIComponent(this._authState || "")}`;
+      // Just the code — use stored state
+      queryString = `code=${encodeURIComponent(rawCode)}&state=${encodeURIComponent(this._authState || "")}`;
     }
     console.log(`[Auth] Hitting localhost:${this._authLocalPort}/callback?${queryString.substring(0, 80)}...`);
     const http = require("http");
