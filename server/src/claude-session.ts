@@ -51,6 +51,7 @@ export class ClaudeSession {
   private _authErrorSent = false;  // suppress duplicate exit-code error after auth failure
   private _authLoginProc: pty.IPty | null = null;  // pending `claude auth login` PTY process
   private _authLocalPort: number | null = null;  // local HTTP port the auth process listens on
+  private _authState: string | null = null;  // OAuth state param from the auth URL
   private _lastContextWindow = 0;  // last known context window size from modelUsage
   private _streamingText = "";  // accumulated text for the current streaming response
   private _streamingThinking = "";  // accumulated thinking for the current thinking block
@@ -1756,6 +1757,7 @@ export class ClaudeSession {
       this._authLoginProc = null;
     }
     this._authLocalPort = null;
+    this._authState = null;
     return new Promise((resolve) => {
       const claudePath = path.join(process.env.HOME || "", ".local", "bin", "claude");
       const proc = pty.spawn(claudePath, ["auth", "login"], {
@@ -1774,6 +1776,10 @@ export class ClaudeSession {
           const match = output.match(/https:\/\/claude\.ai\/oauth\/authorize\S+/);
           if (match) {
             resolved = true;
+            // Extract state param from the auth URL
+            const stateMatch = match[0].match(/state=([^&\s]+)/);
+            this._authState = stateMatch ? stateMatch[1] : null;
+            console.log(`[Auth] Extracted state: ${this._authState?.substring(0, 20)}...`);
             // Find the local port the CLI opened, then resolve
             this._findAuthPort(proc.pid).then((port) => {
               this._authLocalPort = port;
@@ -1837,9 +1843,17 @@ export class ClaudeSession {
       });
       return;
     }
-    console.log(`[Auth] Hitting localhost:${this._authLocalPort}/callback with code`);
+    // If code contains '&' it's already a full query string (code=...&state=...)
+    // Otherwise it's just the code, and we use the stored state
+    let queryString: string;
+    if (code.includes("=")) {
+      queryString = code;
+    } else {
+      queryString = `code=${encodeURIComponent(code)}&state=${encodeURIComponent(this._authState || "")}`;
+    }
+    console.log(`[Auth] Hitting localhost:${this._authLocalPort}/callback?${queryString.substring(0, 80)}...`);
     const http = require("http");
-    const callbackUrl = `http://127.0.0.1:${this._authLocalPort}/callback?${code}`;
+    const callbackUrl = `http://127.0.0.1:${this._authLocalPort}/callback?${queryString}`;
     http.get(callbackUrl, (res: any) => {
       let body = "";
       res.on("data", (d: string) => { body += d; });
