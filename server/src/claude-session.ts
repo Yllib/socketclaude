@@ -2,6 +2,7 @@ import { query, createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk"
 import { z } from "zod";
 import * as crypto from "crypto";
 import { execFile } from "child_process";
+import * as pty from "node-pty";
 import * as fs from "fs";
 import * as path from "path";
 import { WebSocket } from "ws";
@@ -48,7 +49,7 @@ export class ClaudeSession {
   private _readToolPaths: Map<string, string> = new Map();  // toolUseId → file_path for Read tool calls
   private _isCompacting = false;  // whether context compaction is in progress
   private _authErrorSent = false;  // suppress duplicate exit-code error after auth failure
-  private _authLoginProc: ReturnType<typeof execFile> | null = null;  // pending `claude auth login` process
+  private _authLoginProc: pty.IPty | null = null;  // pending `claude auth login` PTY process
   private _lastContextWindow = 0;  // last known context window size from modelUsage
   private _streamingText = "";  // accumulated text for the current streaming response
   private _streamingThinking = "";  // accumulated thinking for the current thinking block
@@ -1746,7 +1747,7 @@ export class ClaudeSession {
     }
   }
 
-  /** Spawn `claude auth login`, keep it alive, and return the OAuth URL. */
+  /** Spawn `claude auth login` in a PTY, keep it alive, and return the OAuth URL. */
   private _startAuthLogin(): Promise<string | null> {
     // Kill any previous auth process
     if (this._authLoginProc) {
@@ -1755,15 +1756,18 @@ export class ClaudeSession {
     }
     return new Promise((resolve) => {
       const claudePath = path.join(process.env.HOME || "", ".local", "bin", "claude");
-      const proc = execFile(claudePath, ["auth", "login"], {
-        timeout: 300000, // 5 min to complete auth
-        env: { ...process.env, BROWSER: "echo" },
+      const proc = pty.spawn(claudePath, ["auth", "login"], {
+        name: "xterm",
+        cols: 120,
+        rows: 30,
+        env: { ...process.env, BROWSER: "echo" } as Record<string, string>,
       });
       this._authLoginProc = proc;
       let output = "";
       let resolved = false;
-      proc.stdout?.on("data", (d: Buffer) => {
-        output += d.toString();
+      proc.onData((data: string) => {
+        output += data;
+        console.log(`[Auth] PTY output: ${data.trim()}`);
         if (!resolved) {
           const match = output.match(/https:\/\/claude\.ai\/oauth\/authorize\S+/);
           if (match) {
@@ -1772,15 +1776,11 @@ export class ClaudeSession {
           }
         }
       });
-      proc.stderr?.on("data", (d: Buffer) => {
-        output += d.toString();
-      });
-      proc.on("close", (code) => {
-        console.log(`[Auth] claude auth login exited with code ${code}`);
+      proc.onExit(({ exitCode }) => {
+        console.log(`[Auth] claude auth login exited with code ${exitCode}`);
         this._authLoginProc = null;
         if (!resolved) resolve(null);
-        // Notify app that auth is complete (success or failure)
-        if (code === 0) {
+        if (exitCode === 0) {
           this.send({
             type: "claude_auth_result",
             success: true,
@@ -1788,16 +1788,21 @@ export class ClaudeSession {
           } as any);
         }
       });
-      proc.on("error", () => {
-        this._authLoginProc = null;
-        if (!resolved) resolve(null);
-      });
+      // Timeout after 5 minutes
+      setTimeout(() => {
+        if (this._authLoginProc === proc) {
+          console.log("[Auth] Login process timed out");
+          try { proc.kill(); } catch {}
+          this._authLoginProc = null;
+          if (!resolved) resolve(null);
+        }
+      }, 300000);
     });
   }
 
-  /** Submit the auth code from the user to the pending `claude auth login` process. */
+  /** Submit the auth code from the user to the pending `claude auth login` PTY. */
   submitAuthCode(code: string): void {
-    if (!this._authLoginProc?.stdin) {
+    if (!this._authLoginProc) {
       console.error("[Auth] No pending auth login process");
       this.send({
         type: "error",
@@ -1806,6 +1811,6 @@ export class ClaudeSession {
       return;
     }
     console.log("[Auth] Submitting auth code to claude auth login");
-    this._authLoginProc.stdin.write(code + "\n");
+    this._authLoginProc.write(code + "\r");
   }
 }

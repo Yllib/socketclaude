@@ -11,6 +11,7 @@
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.2.44",
     "dotenv": "^16.4.7",
+    "node-pty": "^1.1.0",
     "qrcode-terminal": "^0.12.0",
     "sherpa-onnx-node": "^1.12.25",
     "tweetnacl": "^1.0.3",
