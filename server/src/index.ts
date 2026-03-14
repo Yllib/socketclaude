@@ -443,8 +443,13 @@ function createConnectionHandler(transport: ClientTransport) {
         activeSession.runQuery(msg.text, resumeId).then(() => {
           const sid = activeSession?.getSessionId();
           if (sid && activeSessions.get(sid) === activeSession) {
-            activeSessions.delete(sid);
-            console.log(`Session ${sid} completed, removed from active pool`);
+            // Keep session in pool if auth login is pending
+            if ((activeSession as any)._authLoginProc) {
+              console.log(`Session ${sid} query completed but auth login pending — keeping in active pool`);
+            } else {
+              activeSessions.delete(sid);
+              console.log(`Session ${sid} completed, removed from active pool`);
+            }
           }
           broadcastSessionList();
         }).catch((err) => {
