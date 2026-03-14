@@ -50,6 +50,7 @@ export class ClaudeSession {
   private _isCompacting = false;  // whether context compaction is in progress
   private _authErrorSent = false;  // suppress duplicate exit-code error after auth failure
   private _authLoginProc: pty.IPty | null = null;  // pending `claude auth login` PTY process
+  private _authLocalPort: number | null = null;  // local HTTP port the auth process listens on
   private _lastContextWindow = 0;  // last known context window size from modelUsage
   private _streamingText = "";  // accumulated text for the current streaming response
   private _streamingThinking = "";  // accumulated thinking for the current thinking block
@@ -1754,6 +1755,7 @@ export class ClaudeSession {
       try { this._authLoginProc.kill(); } catch {}
       this._authLoginProc = null;
     }
+    this._authLocalPort = null;
     return new Promise((resolve) => {
       const claudePath = path.join(process.env.HOME || "", ".local", "bin", "claude");
       const proc = pty.spawn(claudePath, ["auth", "login"], {
@@ -1772,13 +1774,19 @@ export class ClaudeSession {
           const match = output.match(/https:\/\/claude\.ai\/oauth\/authorize\S+/);
           if (match) {
             resolved = true;
-            resolve(match[0]);
+            // Find the local port the CLI opened, then resolve
+            this._findAuthPort(proc.pid).then((port) => {
+              this._authLocalPort = port;
+              console.log(`[Auth] Found local callback port: ${port}`);
+              resolve(match[0]);
+            });
           }
         }
       });
       proc.onExit(({ exitCode }) => {
         console.log(`[Auth] claude auth login exited with code ${exitCode}`);
         this._authLoginProc = null;
+        this._authLocalPort = null;
         if (!resolved) resolve(null);
         if (exitCode === 0) {
           this.send({
@@ -1794,23 +1802,53 @@ export class ClaudeSession {
           console.log("[Auth] Login process timed out");
           try { proc.kill(); } catch {}
           this._authLoginProc = null;
+          this._authLocalPort = null;
           if (!resolved) resolve(null);
         }
       }, 300000);
     });
   }
 
-  /** Submit the auth code from the user to the pending `claude auth login` PTY. */
+  /** Find the local HTTP port that the `claude auth login` process listens on. */
+  private _findAuthPort(pid: number): Promise<number | null> {
+    return new Promise((resolve) => {
+      const { execFile: execF } = require("child_process");
+      execF("ss", ["-tlnp"], { timeout: 5000 }, (err: any, stdout: string) => {
+        if (err) { resolve(null); return; }
+        // Find line with our PID
+        for (const line of stdout.split("\n")) {
+          if (line.includes(`pid=${pid},`)) {
+            const portMatch = line.match(/:(\d+)\s/);
+            if (portMatch) { resolve(parseInt(portMatch[1], 10)); return; }
+          }
+        }
+        resolve(null);
+      });
+    });
+  }
+
+  /** Submit the OAuth callback code+state to the pending `claude auth login` local server. */
   submitAuthCode(code: string): void {
-    if (!this._authLoginProc) {
-      console.error("[Auth] No pending auth login process");
+    if (!this._authLoginProc || !this._authLocalPort) {
+      console.error("[Auth] No pending auth login process or port");
       this.send({
         type: "error",
         message: "No pending login session. Try sending a message to trigger auth again.",
       });
       return;
     }
-    console.log("[Auth] Submitting auth code to claude auth login");
-    this._authLoginProc.write(code + "\r");
+    console.log(`[Auth] Hitting localhost:${this._authLocalPort}/callback with code`);
+    const http = require("http");
+    const callbackUrl = `http://127.0.0.1:${this._authLocalPort}/callback?${code}`;
+    http.get(callbackUrl, (res: any) => {
+      let body = "";
+      res.on("data", (d: string) => { body += d; });
+      res.on("end", () => {
+        console.log(`[Auth] Callback response (${res.statusCode}): ${body.substring(0, 200)}`);
+      });
+    }).on("error", (e: any) => {
+      console.error(`[Auth] Callback error: ${e.message}`);
+      this.send({ type: "error", message: `Auth callback failed: ${e.message}` });
+    });
   }
 }
