@@ -1850,20 +1850,42 @@ export class ClaudeSession {
     });
   }
 
-  /** Submit the OAuth code to the pending `claude auth login` PTY process. */
+  /** Submit the OAuth code to the pending `claude auth login` local HTTP server. */
   submitAuthCode(code: string): void {
     console.log(`[Auth] submitAuthCode called — proc=${!!this._authLoginProc}, port=${this._authLocalPort}, state=${!!this._authState}`);
-    if (!this._authLoginProc) {
-      console.error("[Auth] No pending auth login process");
+    if (!this._authLoginProc || !this._authLocalPort) {
+      console.error("[Auth] No pending auth login process or port");
       this.send({
         type: "error",
         message: "No pending login session. Try sending a message to trigger auth again.",
       });
       return;
     }
-    // Write the code directly to the PTY stdin, the way a user would paste it in terminal
-    const rawCode = code.trim();
-    console.log(`[Auth] Writing code to PTY stdin: ${rawCode.substring(0, 20)}...`);
-    this._authLoginProc.write(rawCode + "\r");
+    // The callback page shows code#state — user copies that.
+    // Split on # to get code and state separately.
+    const raw = code.trim();
+    let authCode: string;
+    let state: string;
+    if (raw.includes("#")) {
+      [authCode, state] = raw.split("#", 2);
+    } else {
+      authCode = raw;
+      state = this._authState || "";
+    }
+    const queryString = `code=${encodeURIComponent(authCode)}&state=${encodeURIComponent(state)}`;
+    console.log(`[Auth] Callback: code=${authCode.substring(0, 20)}... state=${state.substring(0, 20)}...`);
+    console.log(`[Auth] Hitting localhost:${this._authLocalPort}/callback?${queryString.substring(0, 80)}...`);
+    const http = require("http");
+    const callbackUrl = `http://127.0.0.1:${this._authLocalPort}/callback?${queryString}`;
+    http.get(callbackUrl, (res: any) => {
+      let body = "";
+      res.on("data", (d: string) => { body += d; });
+      res.on("end", () => {
+        console.log(`[Auth] Callback response (${res.statusCode}): ${body.substring(0, 200)}`);
+      });
+    }).on("error", (e: any) => {
+      console.error(`[Auth] Callback error: ${e.message}`);
+      this.send({ type: "error", message: `Auth callback failed: ${e.message}` });
+    });
   }
 }
