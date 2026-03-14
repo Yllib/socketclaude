@@ -1850,57 +1850,20 @@ export class ClaudeSession {
     });
   }
 
-  /** Submit the OAuth callback code+state to the pending `claude auth login` local server. */
+  /** Submit the OAuth code to the pending `claude auth login` PTY process. */
   submitAuthCode(code: string): void {
     console.log(`[Auth] submitAuthCode called — proc=${!!this._authLoginProc}, port=${this._authLocalPort}, state=${!!this._authState}`);
-    if (!this._authLocalPort && !this._authState) {
-      console.error("[Auth] No pending auth login — no port or state saved");
+    if (!this._authLoginProc) {
+      console.error("[Auth] No pending auth login process");
       this.send({
         type: "error",
         message: "No pending login session. Try sending a message to trigger auth again.",
       });
       return;
     }
-    if (!this._authLocalPort) {
-      console.error("[Auth] No port saved — auth process may have exited");
-      this.send({
-        type: "error",
-        message: "Auth login process exited. Try sending a message to trigger auth again.",
-      });
-      return;
-    }
-    // The user might paste:
-    //   1. Just the code: "abc123"
-    //   2. code#state from the redirect page: "abc123#stateXYZ"
-    //   3. A full URL or query string with code= and state=
-    let rawCode = code.trim();
-
-    let queryString: string;
-    if (rawCode.includes("=")) {
-      // Full query string — normalize # to &
-      const urlMatch = rawCode.match(/[?#](.*)/);
-      if (urlMatch) rawCode = urlMatch[1];
-      queryString = rawCode.replace(/#/g, "&");
-    } else if (rawCode.includes("#")) {
-      // code#state format from the redirect page
-      const [authCode, state] = rawCode.split("#", 2);
-      queryString = `code=${encodeURIComponent(authCode)}&state=${encodeURIComponent(state)}`;
-    } else {
-      // Just the code — use stored state
-      queryString = `code=${encodeURIComponent(rawCode)}&state=${encodeURIComponent(this._authState || "")}`;
-    }
-    console.log(`[Auth] Hitting localhost:${this._authLocalPort}/callback?${queryString.substring(0, 80)}...`);
-    const http = require("http");
-    const callbackUrl = `http://127.0.0.1:${this._authLocalPort}/callback?${queryString}`;
-    http.get(callbackUrl, (res: any) => {
-      let body = "";
-      res.on("data", (d: string) => { body += d; });
-      res.on("end", () => {
-        console.log(`[Auth] Callback response (${res.statusCode}): ${body.substring(0, 200)}`);
-      });
-    }).on("error", (e: any) => {
-      console.error(`[Auth] Callback error: ${e.message}`);
-      this.send({ type: "error", message: `Auth callback failed: ${e.message}` });
-    });
+    // Write the code directly to the PTY stdin, the way a user would paste it in terminal
+    const rawCode = code.trim();
+    console.log(`[Auth] Writing code to PTY stdin: ${rawCode.substring(0, 20)}...`);
+    this._authLoginProc.write(rawCode + "\r");
   }
 }
