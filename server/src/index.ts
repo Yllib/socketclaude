@@ -346,12 +346,14 @@ function createConnectionHandler(transport: ClientTransport) {
 
         // Always send status so the app resets its processing state on resume
         const resumeRunning = !!(existing && existing.isRunning);
+        const resumeCompacting = !!(existing && existing.isCompacting);
         const activeToolInfo = existing?.getActiveToolCall?.() || null;
-        console.log(`[Resume] sessionId=${msg.sessionId} existing=${!!existing} isRunning=${existing?.isRunning} → sending running=${resumeRunning} activeToolUseId=${activeToolInfo?.toolUseId || 'none'}`);
+        console.log(`[Resume] sessionId=${msg.sessionId} existing=${!!existing} isRunning=${existing?.isRunning} compacting=${resumeCompacting} → sending running=${resumeRunning} activeToolUseId=${activeToolInfo?.toolUseId || 'none'}`);
         sendJson({
           type: "status",
           sessionId: msg.sessionId,
           running: resumeRunning,
+          compacting: resumeCompacting,
           ...(activeToolInfo ? { activeToolUseId: activeToolInfo.toolUseId } : {}),
         });
 
@@ -1431,11 +1433,15 @@ function sendStatusSyncTo(ws: WebSocket): void {
 function buildStatusSyncMessage(): string {
   let anyRunning = false;
   const runningSessions: string[] = [];
+  const compactingSessions: string[] = [];
   const backgroundTaskIds: string[] = [];
   for (const [sid, session] of activeSessions) {
     if (session.isRunning) {
       anyRunning = true;
       runningSessions.push(sid);
+    }
+    if (session.isCompacting) {
+      compactingSessions.push(sid);
     }
     for (const [taskId] of session.activeBackgroundTasks) {
       backgroundTaskIds.push(taskId);
@@ -1445,6 +1451,7 @@ function buildStatusSyncMessage(): string {
     type: "status_sync",
     running: anyRunning,
     runningSessions,
+    compactingSessions,
     serverStartedAt: SERVER_STARTED_AT,
     serverPid: process.pid,
     backgroundTaskIds,

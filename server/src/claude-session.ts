@@ -1,6 +1,7 @@
 import { query, createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import * as crypto from "crypto";
+import { execFile } from "child_process";
 import * as fs from "fs";
 import * as path from "path";
 import { WebSocket } from "ws";
@@ -45,6 +46,8 @@ export class ClaudeSession {
   private _activeToolUseId: string | null = null;  // currently-executing tool call
   private _activeToolName: string | null = null;
   private _readToolPaths: Map<string, string> = new Map();  // toolUseId → file_path for Read tool calls
+  private _isCompacting = false;  // whether context compaction is in progress
+  private _lastContextWindow = 0;  // last known context window size from modelUsage
   private _streamingText = "";  // accumulated text for the current streaming response
   private _streamingThinking = "";  // accumulated thinking for the current thinking block
   private _lastPreview: string = "";
@@ -194,6 +197,10 @@ export class ClaudeSession {
 
   get isRunning(): boolean {
     return this._isRunning;
+  }
+
+  get isCompacting(): boolean {
+    return this._isCompacting;
   }
 
   /** Active background task IDs (agentId → toolUseId) */
@@ -1141,9 +1148,10 @@ export class ClaudeSession {
         if (message.type === "system" && (message as any).subtype === "status") {
           const status = (message as any).status as string | null;
           console.log(`[SDK] Status change: ${status}`);
+          this._isCompacting = status === "compacting";
           this.send({
             type: "compacting",
-            active: status === "compacting",
+            active: this._isCompacting,
             sessionId: this.sessionId || "",
           } as any);
         }
@@ -1256,6 +1264,16 @@ export class ClaudeSession {
             lastTurnCacheCreateTokens = u.cache_creation_input_tokens || 0;
             lastTurnOutputTokens = 0; // Reset, will be set by message_delta
             console.log(`[Usage] message_start: input=${lastTurnInputTokens} cacheRead=${lastTurnCacheReadTokens} cacheCreate=${lastTurnCacheCreateTokens}`);
+            // Send mid-query usage update to the app
+            this.send({
+              type: "usage_update",
+              inputTokens: lastTurnInputTokens,
+              outputTokens: 0,
+              cacheReadTokens: lastTurnCacheReadTokens,
+              cacheCreateTokens: lastTurnCacheCreateTokens,
+              contextWindow: this._lastContextWindow,
+              sessionId: this.sessionId || "",
+            } as any);
           }
 
           // Track output tokens from message_delta (end of turn)
@@ -1639,6 +1657,10 @@ export class ClaudeSession {
               }
             }
           }
+          // Cache contextWindow for mid-query usage updates in future queries
+          if (contextWindow > 0) {
+            this._lastContextWindow = contextWindow;
+          }
           console.log(`[Usage] Last turn: input=${lastTurnInputTokens} output=${lastTurnOutputTokens} cacheRead=${lastTurnCacheReadTokens} cacheCreate=${lastTurnCacheCreateTokens} contextWindow=${contextWindow}`);
 
           const usageInfo = {
@@ -1680,13 +1702,47 @@ export class ClaudeSession {
       const errMsg = err.message || "Unknown error during query";
       console.error("Query error:", errMsg);
       if (err.stack) console.error(err.stack);
-      this.send({
-        type: "error",
-        message: errMsg,
-      });
+
+      // Detect auth/token expiry errors and get login URL
+      const isAuthError = /401|oauth.*expired|authentication_error|token.*expired/i.test(errMsg);
+      if (isAuthError) {
+        this._getLoginUrl().then((url) => {
+          if (url) {
+            this.send({
+              type: "error",
+              message: `Authentication expired. Login here:\n\n${url}`,
+            });
+          } else {
+            this.send({ type: "error", message: errMsg });
+          }
+        }).catch(() => {
+          this.send({ type: "error", message: errMsg });
+        });
+      } else {
+        this.send({
+          type: "error",
+          message: errMsg,
+        });
+      }
     } finally {
       this._isRunning = false;
       this.activeQuery = null;
     }
+  }
+
+  /** Spawn `claude auth login` and extract the login URL from its output. */
+  private _getLoginUrl(): Promise<string | null> {
+    return new Promise((resolve) => {
+      const claudePath = path.join(process.env.HOME || "", ".local", "bin", "claude");
+      const proc = execFile(claudePath, ["auth", "login"], { timeout: 10000, env: { ...process.env, BROWSER: "echo" } });
+      let output = "";
+      proc.stdout?.on("data", (d: Buffer) => { output += d.toString(); });
+      proc.stderr?.on("data", (d: Buffer) => { output += d.toString(); });
+      proc.on("close", () => {
+        const match = output.match(/https:\/\/claude\.ai\/oauth\/authorize\S+/);
+        resolve(match ? match[0] : null);
+      });
+      proc.on("error", () => resolve(null));
+    });
   }
 }
