@@ -1841,6 +1841,8 @@ export class ClaudeSession {
       headers: {
         "Content-Type": "application/x-www-form-urlencoded",
         "Content-Length": Buffer.byteLength(postData),
+        "Accept": "application/json",
+        "anthropic-beta": "oauth-2025-04-20",
       },
     }, (res: any) => {
       let body = "";
