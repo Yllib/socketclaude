@@ -49,8 +49,6 @@ export class ClaudeSession {
   private _readToolPaths: Map<string, string> = new Map();  // toolUseId → file_path for Read tool calls
   private _isCompacting = false;  // whether context compaction is in progress
   private _authErrorSent = false;  // suppress duplicate exit-code error after auth failure
-  private _authLoginProc: pty.IPty | null = null;  // pending `claude auth login` PTY process
-  private _authLocalPort: number | null = null;  // local HTTP port the auth process listens on
   private _authState: string | null = null;  // OAuth state param from the auth URL
   private _lastContextWindow = 0;  // last known context window size from modelUsage
   private _streamingText = "";  // accumulated text for the current streaming response
@@ -1757,135 +1755,165 @@ export class ClaudeSession {
     }
   }
 
-  /** Spawn `claude auth login` in a PTY, keep it alive, and return the OAuth URL. */
+  // OAuth PKCE config (extracted from Claude CLI binary)
+  private static readonly OAUTH_CONFIG = {
+    CLIENT_ID: "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+    AUTH_URL: "https://claude.ai/oauth/authorize",
+    TOKEN_URL: "https://platform.claude.com/v1/oauth/token",
+    REDIRECT_URI: "https://platform.claude.com/oauth/code/callback",
+    SCOPES: ["user:profile", "user:inference", "user:sessions:claude_code", "user:mcp_servers", "user:file_upload"],
+  };
+
+  private _authCodeVerifier: string | null = null;  // PKCE code_verifier for pending auth
+
+  /** Generate our own OAuth PKCE auth URL (no CLI subprocess needed). */
   private _startAuthLogin(): Promise<string | null> {
-    // Kill any previous auth process
-    if (this._authLoginProc) {
-      try { this._authLoginProc.kill(); } catch {}
-      this._authLoginProc = null;
-    }
-    this._authLocalPort = null;
+    // Cancel any previous auth flow
+    this._authCodeVerifier = null;
     this._authState = null;
-    return new Promise((resolve) => {
-      const claudePath = path.join(process.env.HOME || "", ".local", "bin", "claude");
-      const proc = pty.spawn(claudePath, ["auth", "login"], {
-        name: "xterm",
-        cols: 120,
-        rows: 30,
-        env: { ...process.env, BROWSER: "echo" } as Record<string, string>,
-      });
-      this._authLoginProc = proc;
-      let output = "";
-      let resolved = false;
-      proc.onData((data: string) => {
-        output += data;
-        console.log(`[Auth] PTY output: ${data.trim()}`);
-        if (!resolved) {
-          const match = output.match(/https:\/\/claude\.ai\/oauth\/authorize\S+/);
-          if (match) {
-            resolved = true;
-            // Extract state param from the auth URL
-            const stateMatch = match[0].match(/state=([^&\s]+)/);
-            this._authState = stateMatch ? stateMatch[1] : null;
-            console.log(`[Auth] Extracted state: ${this._authState?.substring(0, 20)}...`);
-            // Find the local port the CLI opened, then resolve
-            this._findAuthPort(proc.pid).then((port) => {
-              this._authLocalPort = port;
-              console.log(`[Auth] Found local callback port: ${port}`);
-              resolve(match[0]);
-            });
-          }
-        }
-      });
-      proc.onExit(({ exitCode }) => {
-        console.log(`[Auth] claude auth login (pid ${proc.pid}) exited with code ${exitCode}`);
-        // Only clear refs if this is still the current auth process
-        if (this._authLoginProc === proc) {
-          this._authLoginProc = null;
-          this._authLocalPort = null;
-        }
-        if (!resolved) resolve(null);
-        const success = exitCode === 0;
-        this.send({
-          type: "claude_auth_result",
-          success,
-          sessionId: this.sessionId || "",
-        } as any);
-        if (this.sessionId) {
-          appendHistory(this.sessionId, {
-            role: "assistant",
-            content: `[claude_auth_result:${success ? "success" : "failure"}]`,
-            timestamp: new Date().toISOString(),
-          });
-        }
-      });
-      // Timeout after 5 minutes
-      setTimeout(() => {
-        if (this._authLoginProc === proc) {
-          console.log("[Auth] Login process timed out");
-          try { proc.kill(); } catch {}
-          this._authLoginProc = null;
-          this._authLocalPort = null;
-          if (!resolved) resolve(null);
-        }
-      }, 300000);
+
+    // Generate PKCE code_verifier and code_challenge
+    const codeVerifier = crypto.randomBytes(32).toString("base64url");
+    const codeChallenge = crypto.createHash("sha256").update(codeVerifier).digest("base64url");
+    this._authCodeVerifier = codeVerifier;
+
+    // Generate state
+    const state = crypto.randomBytes(16).toString("base64url");
+    this._authState = state;
+
+    const params = new URLSearchParams({
+      response_type: "code",
+      client_id: ClaudeSession.OAUTH_CONFIG.CLIENT_ID,
+      redirect_uri: ClaudeSession.OAUTH_CONFIG.REDIRECT_URI,
+      scope: ClaudeSession.OAUTH_CONFIG.SCOPES.join(" "),
+      state,
+      code_challenge: codeChallenge,
+      code_challenge_method: "S256",
     });
+
+    const authUrl = `${ClaudeSession.OAUTH_CONFIG.AUTH_URL}?${params.toString()}`;
+    console.log(`[Auth] Generated OAuth URL with our own PKCE flow`);
+    console.log(`[Auth] code_verifier: ${codeVerifier.substring(0, 10)}...`);
+    console.log(`[Auth] state: ${state.substring(0, 10)}...`);
+
+    return Promise.resolve(authUrl);
   }
 
-  /** Find the local HTTP port that the `claude auth login` process listens on. */
-  private _findAuthPort(pid: number): Promise<number | null> {
-    return new Promise((resolve) => {
-      const { execFile: execF } = require("child_process");
-      execF("ss", ["-tlnp"], { timeout: 5000 }, (err: any, stdout: string) => {
-        if (err) { resolve(null); return; }
-        // Find line with our PID
-        for (const line of stdout.split("\n")) {
-          if (line.includes(`pid=${pid},`)) {
-            const portMatch = line.match(/:(\d+)\s/);
-            if (portMatch) { resolve(parseInt(portMatch[1], 10)); return; }
-          }
-        }
-        resolve(null);
-      });
-    });
-  }
-
-  /** Submit the OAuth code to the pending `claude auth login` local HTTP server. */
+  /** Exchange the OAuth code for tokens and save to ~/.claude/.credentials.json */
   submitAuthCode(code: string): void {
-    console.log(`[Auth] submitAuthCode called — proc=${!!this._authLoginProc}, port=${this._authLocalPort}, state=${!!this._authState}`);
-    if (!this._authLoginProc || !this._authLocalPort) {
-      console.error("[Auth] No pending auth login process or port");
+    console.log(`[Auth] submitAuthCode called — codeVerifier=${!!this._authCodeVerifier}, state=${!!this._authState}`);
+    if (!this._authCodeVerifier || !this._authState) {
+      console.error("[Auth] No pending auth flow (missing code_verifier or state)");
       this.send({
         type: "error",
         message: "No pending login session. Try sending a message to trigger auth again.",
       });
       return;
     }
+
     // The callback page shows code#state — user copies that.
-    // Split on # to get code and state separately.
     const raw = code.trim();
     let authCode: string;
-    let state: string;
     if (raw.includes("#")) {
-      [authCode, state] = raw.split("#", 2);
+      [authCode] = raw.split("#", 2);
     } else {
       authCode = raw;
-      state = this._authState || "";
     }
-    const queryString = `code=${encodeURIComponent(authCode)}&state=${encodeURIComponent(state)}`;
-    console.log(`[Auth] Callback: code=${authCode.substring(0, 20)}... state=${state.substring(0, 20)}...`);
-    console.log(`[Auth] Hitting localhost:${this._authLocalPort}/callback?${queryString.substring(0, 80)}...`);
-    const http = require("http");
-    const callbackUrl = `http://127.0.0.1:${this._authLocalPort}/callback?${queryString}`;
-    http.get(callbackUrl, (res: any) => {
+
+    console.log(`[Auth] Exchanging code for token: code=${authCode.substring(0, 20)}...`);
+
+    // POST to token endpoint
+    const postData = new URLSearchParams({
+      grant_type: "authorization_code",
+      client_id: ClaudeSession.OAUTH_CONFIG.CLIENT_ID,
+      code: authCode,
+      redirect_uri: ClaudeSession.OAUTH_CONFIG.REDIRECT_URI,
+      code_verifier: this._authCodeVerifier,
+    }).toString();
+
+    const https = require("https");
+    const url = new URL(ClaudeSession.OAUTH_CONFIG.TOKEN_URL);
+    const req = https.request({
+      hostname: url.hostname,
+      path: url.pathname,
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Content-Length": Buffer.byteLength(postData),
+      },
+    }, (res: any) => {
       let body = "";
       res.on("data", (d: string) => { body += d; });
       res.on("end", () => {
-        console.log(`[Auth] Callback response (${res.statusCode}): ${body.substring(0, 200)}`);
+        console.log(`[Auth] Token response (${res.statusCode}): ${body.substring(0, 300)}`);
+        if (res.statusCode === 200) {
+          try {
+            const tokens = JSON.parse(body);
+            this._saveOAuthTokens(tokens);
+          } catch (e: any) {
+            console.error(`[Auth] Failed to parse token response: ${e.message}`);
+            this._sendAuthResult(false);
+          }
+        } else {
+          console.error(`[Auth] Token exchange failed: ${res.statusCode} ${body}`);
+          this.send({ type: "error", message: `Authentication failed (${res.statusCode}). Try again.` });
+          this._sendAuthResult(false);
+        }
       });
-    }).on("error", (e: any) => {
-      console.error(`[Auth] Callback error: ${e.message}`);
-      this.send({ type: "error", message: `Auth callback failed: ${e.message}` });
     });
+    req.on("error", (e: any) => {
+      console.error(`[Auth] Token request error: ${e.message}`);
+      this.send({ type: "error", message: `Auth token request failed: ${e.message}` });
+      this._sendAuthResult(false);
+    });
+    req.write(postData);
+    req.end();
+  }
+
+  /** Save OAuth tokens to ~/.claude/.credentials.json (same format the CLI uses). */
+  private _saveOAuthTokens(tokens: any): void {
+    const credPath = path.join(process.env.HOME || "", ".claude", ".credentials.json");
+    const expiresAt = tokens.expires_in
+      ? Date.now() + tokens.expires_in * 1000
+      : Date.now() + 3600 * 1000;
+
+    const credData = {
+      claudeAiOauth: {
+        accessToken: tokens.access_token,
+        refreshToken: tokens.refresh_token || null,
+        expiresAt,
+        scopes: tokens.scope ? tokens.scope.split(" ") : ClaudeSession.OAUTH_CONFIG.SCOPES,
+        subscriptionType: null,
+        rateLimitTier: null,
+      },
+    };
+
+    try {
+      fs.mkdirSync(path.dirname(credPath), { recursive: true });
+      fs.writeFileSync(credPath, JSON.stringify(credData), { mode: 0o600 });
+      console.log(`[Auth] Saved OAuth tokens to ${credPath}`);
+      this._sendAuthResult(true);
+    } catch (e: any) {
+      console.error(`[Auth] Failed to save credentials: ${e.message}`);
+      this.send({ type: "error", message: `Failed to save credentials: ${e.message}` });
+      this._sendAuthResult(false);
+    }
+  }
+
+  private _sendAuthResult(success: boolean): void {
+    this._authCodeVerifier = null;
+    this._authState = null;
+    this.send({
+      type: "claude_auth_result",
+      success,
+      sessionId: this.sessionId || "",
+    } as any);
+    if (this.sessionId) {
+      appendHistory(this.sessionId, {
+        role: "assistant",
+        content: `[claude_auth_result:${success ? "success" : "failure"}]`,
+        timestamp: new Date().toISOString(),
+      });
+    }
   }
 }

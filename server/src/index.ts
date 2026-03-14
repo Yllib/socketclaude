@@ -444,8 +444,8 @@ function createConnectionHandler(transport: ClientTransport) {
           const sid = activeSession?.getSessionId();
           if (sid && activeSessions.get(sid) === activeSession) {
             // Keep session in pool if auth login is pending
-            if ((activeSession as any)._authLoginProc) {
-              console.log(`Session ${sid} query completed but auth login pending — keeping in active pool`);
+            if ((activeSession as any)._authCodeVerifier) {
+              console.log(`Session ${sid} query completed but auth flow pending — keeping in active pool`);
             } else {
               activeSessions.delete(sid);
               console.log(`Session ${sid} completed, removed from active pool`);
