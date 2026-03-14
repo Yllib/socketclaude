@@ -1303,6 +1303,13 @@ export class ClaudeSession {
                     url,
                     sessionId: this.sessionId || "",
                   } as any);
+                  if (this.sessionId) {
+                    appendHistory(this.sessionId, {
+                      role: "assistant",
+                      content: `[claude_auth:${url}]`,
+                      timestamp: now(),
+                    });
+                  }
                 } else {
                   this.send({
                     type: "error",
@@ -1333,6 +1340,7 @@ export class ClaudeSession {
           this._streamingText = "";
           this._streamingThinking = "";
           // Log the full assistant text once the message is complete
+          // Skip persisting the raw error text when auth login is being handled
           const apiMessage = (message as any).message;
           if (apiMessage?.content && Array.isArray(apiMessage.content)) {
             // Extract full text from assistant message
@@ -1342,7 +1350,7 @@ export class ClaudeSession {
             if (textParts.length > 0) {
               this._lastPreview = textParts.join("").slice(0, 200);
               this.onActivity?.();
-              if (this.sessionId) {
+              if (this.sessionId && !this._authErrorSent) {
                 appendHistory(this.sessionId, {
                   role: "assistant",
                   content: textParts.join(""),
@@ -1794,12 +1802,18 @@ export class ClaudeSession {
         this._authLoginProc = null;
         this._authLocalPort = null;
         if (!resolved) resolve(null);
-        if (exitCode === 0) {
-          this.send({
-            type: "claude_auth_result",
-            success: true,
-            sessionId: this.sessionId || "",
-          } as any);
+        const success = exitCode === 0;
+        this.send({
+          type: "claude_auth_result",
+          success,
+          sessionId: this.sessionId || "",
+        } as any);
+        if (this.sessionId) {
+          appendHistory(this.sessionId, {
+            role: "assistant",
+            content: `[claude_auth_result:${success ? "success" : "failure"}]`,
+            timestamp: new Date().toISOString(),
+          });
         }
       });
       // Timeout after 5 minutes
