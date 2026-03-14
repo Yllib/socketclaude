@@ -48,6 +48,7 @@ export class ClaudeSession {
   private _readToolPaths: Map<string, string> = new Map();  // toolUseId → file_path for Read tool calls
   private _isCompacting = false;  // whether context compaction is in progress
   private _authErrorSent = false;  // suppress duplicate exit-code error after auth failure
+  private _authLoginProc: ReturnType<typeof execFile> | null = null;  // pending `claude auth login` process
   private _lastContextWindow = 0;  // last known context window size from modelUsage
   private _streamingText = "";  // accumulated text for the current streaming response
   private _streamingThinking = "";  // accumulated thinking for the current thinking block
@@ -1292,15 +1293,21 @@ export class ClaudeSession {
             console.error(`[SDK] Assistant error: ${assistantError}`);
             if (/auth/i.test(assistantError)) {
               this._authErrorSent = true;
-              this._getLoginUrl().then((url) => {
-                this.send({
-                  type: "error",
-                  message: url
-                    ? `Authentication expired. Login here:\n\n${url}`
-                    : `Authentication failed. Run \`claude auth login\` on the server to re-authenticate.`,
-                  errorType: assistantError,
-                  sessionId: this.sessionId || "",
-                } as any);
+              this._startAuthLogin().then((url) => {
+                if (url) {
+                  this.send({
+                    type: "claude_auth",
+                    url,
+                    sessionId: this.sessionId || "",
+                  } as any);
+                } else {
+                  this.send({
+                    type: "error",
+                    message: `Authentication failed. Run \`claude auth login\` on the server to re-authenticate.`,
+                    errorType: assistantError,
+                    sessionId: this.sessionId || "",
+                  } as any);
+                }
               }).catch(() => {
                 this.send({
                   type: "error",
@@ -1739,19 +1746,66 @@ export class ClaudeSession {
     }
   }
 
-  /** Spawn `claude auth login` and extract the login URL from its output. */
-  private _getLoginUrl(): Promise<string | null> {
+  /** Spawn `claude auth login`, keep it alive, and return the OAuth URL. */
+  private _startAuthLogin(): Promise<string | null> {
+    // Kill any previous auth process
+    if (this._authLoginProc) {
+      try { this._authLoginProc.kill(); } catch {}
+      this._authLoginProc = null;
+    }
     return new Promise((resolve) => {
       const claudePath = path.join(process.env.HOME || "", ".local", "bin", "claude");
-      const proc = execFile(claudePath, ["auth", "login"], { timeout: 10000, env: { ...process.env, BROWSER: "echo" } });
-      let output = "";
-      proc.stdout?.on("data", (d: Buffer) => { output += d.toString(); });
-      proc.stderr?.on("data", (d: Buffer) => { output += d.toString(); });
-      proc.on("close", () => {
-        const match = output.match(/https:\/\/claude\.ai\/oauth\/authorize\S+/);
-        resolve(match ? match[0] : null);
+      const proc = execFile(claudePath, ["auth", "login"], {
+        timeout: 300000, // 5 min to complete auth
+        env: { ...process.env, BROWSER: "echo" },
       });
-      proc.on("error", () => resolve(null));
+      this._authLoginProc = proc;
+      let output = "";
+      let resolved = false;
+      proc.stdout?.on("data", (d: Buffer) => {
+        output += d.toString();
+        if (!resolved) {
+          const match = output.match(/https:\/\/claude\.ai\/oauth\/authorize\S+/);
+          if (match) {
+            resolved = true;
+            resolve(match[0]);
+          }
+        }
+      });
+      proc.stderr?.on("data", (d: Buffer) => {
+        output += d.toString();
+      });
+      proc.on("close", (code) => {
+        console.log(`[Auth] claude auth login exited with code ${code}`);
+        this._authLoginProc = null;
+        if (!resolved) resolve(null);
+        // Notify app that auth is complete (success or failure)
+        if (code === 0) {
+          this.send({
+            type: "claude_auth_result",
+            success: true,
+            sessionId: this.sessionId || "",
+          } as any);
+        }
+      });
+      proc.on("error", () => {
+        this._authLoginProc = null;
+        if (!resolved) resolve(null);
+      });
     });
+  }
+
+  /** Submit the auth code from the user to the pending `claude auth login` process. */
+  submitAuthCode(code: string): void {
+    if (!this._authLoginProc?.stdin) {
+      console.error("[Auth] No pending auth login process");
+      this.send({
+        type: "error",
+        message: "No pending login session. Try sending a message to trigger auth again.",
+      });
+      return;
+    }
+    console.log("[Auth] Submitting auth code to claude auth login");
+    this._authLoginProc.stdin.write(code + "\n");
   }
 }

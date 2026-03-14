@@ -249,7 +249,8 @@ export type ClientMessage =
   | ListScheduledTasksMessage
   | CancelScheduledTaskMessage
   | UpdateScheduledTaskMessage
-  | DeleteScheduledTaskMessage;
+  | DeleteScheduledTaskMessage
+  | { type: "auth_code"; code: string; sessionId?: string };
 
 // ── Server → Client messages ──
 

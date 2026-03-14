@@ -691,6 +691,20 @@ function createConnectionHandler(transport: ClientTransport) {
         break;
       }
 
+      case "auth_code": {
+        const code = (msg as any).code as string;
+        const targetSid = (msg as any).sessionId || activeSessionId;
+        const session = targetSid ? activeSessions.get(targetSid) : null;
+        if (session) {
+          session.submitAuthCode(code);
+        } else if (activeSession) {
+          activeSession.submitAuthCode(code);
+        } else {
+          sendJson({ type: "error", message: "No active session for auth code" });
+        }
+        break;
+      }
+
       case "abort": {
         // Always use the explicit session ID from the client
         const targetSid = msg.sessionId || activeSessionId;
