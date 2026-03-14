@@ -1823,14 +1823,15 @@ export class ClaudeSession {
 
     console.log(`[Auth] Exchanging code for token: code=${authCode.substring(0, 20)}...`);
 
-    // POST to token endpoint
-    const postData = new URLSearchParams({
+    // POST to token endpoint — CLI sends JSON, not form-urlencoded
+    const postData = JSON.stringify({
       grant_type: "authorization_code",
-      client_id: ClaudeSession.OAUTH_CONFIG.CLIENT_ID,
       code: authCode,
       redirect_uri: ClaudeSession.OAUTH_CONFIG.REDIRECT_URI,
+      client_id: ClaudeSession.OAUTH_CONFIG.CLIENT_ID,
       code_verifier: this._authCodeVerifier,
-    }).toString();
+      state: this._authState,
+    });
 
     const https = require("https");
     const url = new URL(ClaudeSession.OAUTH_CONFIG.TOKEN_URL);
@@ -1839,10 +1840,8 @@ export class ClaudeSession {
       path: url.pathname,
       method: "POST",
       headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
+        "Content-Type": "application/json",
         "Content-Length": Buffer.byteLength(postData),
-        "Accept": "application/json",
-        "anthropic-beta": "oauth-2025-04-20",
       },
     }, (res: any) => {
       let body = "";
