@@ -1761,7 +1761,7 @@ export class ClaudeSession {
     AUTH_URL: "https://claude.ai/oauth/authorize",
     TOKEN_URL: "https://platform.claude.com/v1/oauth/token",
     REDIRECT_URI: "https://platform.claude.com/oauth/code/callback",
-    SCOPES: ["user:profile", "user:inference", "user:sessions:claude_code", "user:mcp_servers", "user:file_upload"],
+    SCOPES: ["org:create_api_key", "user:profile", "user:inference", "user:sessions:claude_code", "user:mcp_servers", "user:file_upload"],
   };
 
   private _authCodeVerifier: string | null = null;  // PKCE code_verifier for pending auth
@@ -1782,8 +1782,9 @@ export class ClaudeSession {
     this._authState = state;
 
     const params = new URLSearchParams({
-      response_type: "code",
+      code: "true",
       client_id: ClaudeSession.OAUTH_CONFIG.CLIENT_ID,
+      response_type: "code",
       redirect_uri: ClaudeSession.OAUTH_CONFIG.REDIRECT_URI,
       scope: ClaudeSession.OAUTH_CONFIG.SCOPES.join(" "),
       state,
