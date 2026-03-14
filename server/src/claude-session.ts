@@ -47,6 +47,7 @@ export class ClaudeSession {
   private _activeToolName: string | null = null;
   private _readToolPaths: Map<string, string> = new Map();  // toolUseId → file_path for Read tool calls
   private _isCompacting = false;  // whether context compaction is in progress
+  private _authErrorSent = false;  // suppress duplicate exit-code error after auth failure
   private _lastContextWindow = 0;  // last known context window size from modelUsage
   private _streamingText = "";  // accumulated text for the current streaming response
   private _streamingThinking = "";  // accumulated thinking for the current thinking block
@@ -423,6 +424,7 @@ export class ClaudeSession {
   async runQuery(prompt: string, resumeSessionId?: string): Promise<void> {
     this.abortController = new AbortController();
     this._isRunning = true;
+    this._authErrorSent = false;
     this._streamingText = "";
     this._streamingThinking = "";
     this._lastPreview = "";
@@ -1288,12 +1290,33 @@ export class ClaudeSession {
           const assistantError = (message as any).error;
           if (assistantError) {
             console.error(`[SDK] Assistant error: ${assistantError}`);
-            this.send({
-              type: "error",
-              message: `Assistant error: ${assistantError}`,
-              errorType: assistantError,
-              sessionId: this.sessionId || "",
-            } as any);
+            if (/auth/i.test(assistantError)) {
+              this._authErrorSent = true;
+              this._getLoginUrl().then((url) => {
+                this.send({
+                  type: "error",
+                  message: url
+                    ? `Authentication expired. Login here:\n\n${url}`
+                    : `Authentication failed. Run \`claude auth login\` on the server to re-authenticate.`,
+                  errorType: assistantError,
+                  sessionId: this.sessionId || "",
+                } as any);
+              }).catch(() => {
+                this.send({
+                  type: "error",
+                  message: `Authentication failed. Run \`claude auth login\` on the server to re-authenticate.`,
+                  errorType: assistantError,
+                  sessionId: this.sessionId || "",
+                } as any);
+              });
+            } else {
+              this.send({
+                type: "error",
+                message: `Assistant error: ${assistantError}`,
+                errorType: assistantError,
+                sessionId: this.sessionId || "",
+              } as any);
+            }
           }
 
           // Reset streaming text/thinking — this assistant turn is complete
@@ -1703,22 +1726,8 @@ export class ClaudeSession {
       console.error("Query error:", errMsg);
       if (err.stack) console.error(err.stack);
 
-      // Detect auth/token expiry errors and get login URL
-      const isAuthError = /401|oauth.*expired|authentication_error|token.*expired/i.test(errMsg);
-      if (isAuthError) {
-        this._getLoginUrl().then((url) => {
-          if (url) {
-            this.send({
-              type: "error",
-              message: `Authentication expired. Login here:\n\n${url}`,
-            });
-          } else {
-            this.send({ type: "error", message: errMsg });
-          }
-        }).catch(() => {
-          this.send({ type: "error", message: errMsg });
-        });
-      } else {
+      // Skip if we already sent a login URL for this auth failure
+      if (!this._authErrorSent) {
         this.send({
           type: "error",
           message: errMsg,
