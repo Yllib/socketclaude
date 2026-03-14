@@ -1798,9 +1798,12 @@ export class ClaudeSession {
         }
       });
       proc.onExit(({ exitCode }) => {
-        console.log(`[Auth] claude auth login exited with code ${exitCode}`);
-        this._authLoginProc = null;
-        this._authLocalPort = null;
+        console.log(`[Auth] claude auth login (pid ${proc.pid}) exited with code ${exitCode}`);
+        // Only clear refs if this is still the current auth process
+        if (this._authLoginProc === proc) {
+          this._authLoginProc = null;
+          this._authLocalPort = null;
+        }
         if (!resolved) resolve(null);
         const success = exitCode === 0;
         this.send({
@@ -1849,11 +1852,20 @@ export class ClaudeSession {
 
   /** Submit the OAuth callback code+state to the pending `claude auth login` local server. */
   submitAuthCode(code: string): void {
-    if (!this._authLoginProc || !this._authLocalPort) {
-      console.error("[Auth] No pending auth login process or port");
+    console.log(`[Auth] submitAuthCode called — proc=${!!this._authLoginProc}, port=${this._authLocalPort}, state=${!!this._authState}`);
+    if (!this._authLocalPort && !this._authState) {
+      console.error("[Auth] No pending auth login — no port or state saved");
       this.send({
         type: "error",
         message: "No pending login session. Try sending a message to trigger auth again.",
+      });
+      return;
+    }
+    if (!this._authLocalPort) {
+      console.error("[Auth] No port saved — auth process may have exited");
+      this.send({
+        type: "error",
+        message: "Auth login process exited. Try sending a message to trigger auth again.",
       });
       return;
     }
