@@ -1772,30 +1772,30 @@ export class ClaudeSession {
     this._authCodeVerifier = null;
     this._authState = null;
 
-    // Generate PKCE code_verifier and code_challenge
+    // Generate PKCE code_verifier and code_challenge (32 bytes each, matching CLI)
     const codeVerifier = crypto.randomBytes(32).toString("base64url");
     const codeChallenge = crypto.createHash("sha256").update(codeVerifier).digest("base64url");
     this._authCodeVerifier = codeVerifier;
 
-    // Generate state
-    const state = crypto.randomBytes(16).toString("base64url");
+    // Generate state (32 bytes to match CLI's state length)
+    const state = crypto.randomBytes(32).toString("base64url");
     this._authState = state;
 
-    const params = new URLSearchParams({
-      code: "true",
-      client_id: ClaudeSession.OAUTH_CONFIG.CLIENT_ID,
-      response_type: "code",
-      redirect_uri: ClaudeSession.OAUTH_CONFIG.REDIRECT_URI,
-      scope: ClaudeSession.OAUTH_CONFIG.SCOPES.join(" "),
-      state,
-      code_challenge: codeChallenge,
-      code_challenge_method: "S256",
-    });
+    // Build params in exact same order as CLI binary:
+    // code, client_id, response_type, redirect_uri, scope, code_challenge, code_challenge_method, state
+    const params = new URLSearchParams();
+    params.append("code", "true");
+    params.append("client_id", ClaudeSession.OAUTH_CONFIG.CLIENT_ID);
+    params.append("response_type", "code");
+    params.append("redirect_uri", ClaudeSession.OAUTH_CONFIG.REDIRECT_URI);
+    params.append("scope", ClaudeSession.OAUTH_CONFIG.SCOPES.join(" "));
+    params.append("code_challenge", codeChallenge);
+    params.append("code_challenge_method", "S256");
+    params.append("state", state);
 
     const authUrl = `${ClaudeSession.OAUTH_CONFIG.AUTH_URL}?${params.toString()}`;
-    console.log(`[Auth] Generated OAuth URL with our own PKCE flow`);
+    console.log(`[Auth] Generated OAuth URL: ${authUrl}`);
     console.log(`[Auth] code_verifier: ${codeVerifier.substring(0, 10)}...`);
-    console.log(`[Auth] state: ${state.substring(0, 10)}...`);
 
     return Promise.resolve(authUrl);
   }
