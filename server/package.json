@@ -9,7 +9,7 @@
     "dev": "tsc && node dist/index.js"
   },
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "^0.2.44",
+    "@anthropic-ai/claude-agent-sdk": "^0.2.76",
     "dotenv": "^16.4.7",
     "node-pty": "^1.1.0",
     "qrcode-terminal": "^0.12.0",
