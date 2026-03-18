@@ -111,11 +111,44 @@ if ($portInUse) {
 }
 
 # ══════════════════════════════════════════════
-#  Phase 1: Node.js
+#  Phase 1: Node.js & Git
 # ══════════════════════════════════════════════
 
-Write-Phase "Phase 1: Node.js"
+Write-Phase "Phase 1: Node.js & Git"
 
+# ── Git ──
+$gitCmd = Get-Command git -ErrorAction SilentlyContinue
+if ($gitCmd) {
+    $gitVer = & git --version 2>$null
+    Write-Ok "Git already installed ($gitVer)"
+} else {
+    Write-Host "  Git is required for auto-updates. Installing..."
+    if (Test-CommandExists "winget") {
+        & winget install Git.Git --accept-source-agreements --accept-package-agreements --silent
+        if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne -1978335189) {
+            throw "winget install Git failed (exit code $LASTEXITCODE)"
+        }
+    } else {
+        Write-Host "  winget not found. Downloading Git installer..."
+        $gitUrl = "https://github.com/git-for-windows/git/releases/download/v2.47.1.windows.2/Git-2.47.1.2-64-bit.exe"
+        $gitPath = Join-Path $env:TEMP "git-installer.exe"
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        Invoke-WebRequest -Uri $gitUrl -OutFile $gitPath -UseBasicParsing
+        Write-Host "  Running Git installer (may request admin)..."
+        Start-Process $gitPath -ArgumentList "/VERYSILENT /NORESTART" -Verb RunAs -Wait
+    }
+
+    Refresh-Path
+
+    $gitVer = & git --version 2>$null
+    if (-not $gitVer) {
+        Write-Warn "Git installation may require a terminal restart. Auto-updates will be unavailable until git is on PATH."
+    } else {
+        Write-Ok "Git installed ($gitVer)"
+    }
+}
+
+# ── Node.js ──
 $nodeInstalled = $false
 $nodeCmd = Get-Command node -ErrorAction SilentlyContinue
 if ($nodeCmd) {
