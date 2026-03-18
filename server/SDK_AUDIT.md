@@ -143,9 +143,9 @@
 - **Issue:** Plugin `canUseToolInterceptor` called in both PreToolUse hook and canUseTool.
 
 ### 29. Double bash output streaming
-- **Status:** [ ] TODO
+- **Status:** [x] Resolved
 - **File:** `claude-session.ts:697-708 + 739-749`
-- **Issue:** Bash output streams via tee file watcher AND stderr callback. Overlap.
+- **Issue:** Bash output streams via tee file watcher AND stderr callback. Overlap. Fixed: stderr now filters SDK internal errors, tee watcher is the primary streaming path. CONTAINER_ID env var enables bash_progress events.
 
 ### 30. `_backgroundTaskToolUseIds` tracking redundant (covered by #8)
 - **Status:** [x] Done
@@ -160,14 +160,14 @@
 - **Issue:** `webSearchRequests`, `maxOutputTokens`, `costUSD` not forwarded. `contextWindow` extracted indirectly.
 
 ### 32. `outputTokens` tracked but invisible
-- **Status:** [ ] TODO
-- **Issue:** App token bar only shows input segments. Users can't see generation cost.
+- **Status:** [~] Partial
+- **Issue:** App token bar only shows input segments. Users can't see generation cost. totalUsage (with outputTokens) is now sent to the app but not yet visualized in the token bar.
 
 ### 33. Agent tool name: `Agent` vs `Task`
 - **Status:** [x] OK
 - **Issue:** SDK inconsistent. Dual check at line 1455 is correct.
 
 ### 34. `ExitPlanMode` — `planFilePath` available but unused
-- **Status:** [ ] TODO
+- **Status:** [x] Done
 - **File:** `claude-session.ts:819-838`
 - **Issue:** v0.2.76 added `planFilePath` to ExitPlanMode input. Code manually searches `~/.claude/plans/`.

@@ -702,9 +702,12 @@ export class ClaudeSession {
                 // Run plugin interceptors
                 const sessionCtx = this.getSessionContext();
                 let pluginAllowed = false;
+                console.log(`[Hook] PreToolUse: tool=${toolName} plugins=${this.plugins.length} cmd=${toolName === 'Bash' ? String(toolInput.command || '').slice(0, 100) : '...'}`);
                 for (const plugin of this.plugins) {
                   if (plugin.canUseToolInterceptor) {
+                    console.log(`[Hook] Running plugin interceptor: ${plugin.name || 'unnamed'}`);
                     const result = await plugin.canUseToolInterceptor(toolName, toolInput, sessionCtx);
+                    console.log(`[Hook] Plugin result: ${JSON.stringify(result)?.slice(0, 200)}`);
                     if (result !== null && result !== undefined) {
                       if (result.behavior === "deny") {
                         console.log(`[Hook] PreToolUse DENIED by plugin: ${toolName}`);
@@ -863,23 +866,30 @@ export class ClaudeSession {
 
             // Intercept ExitPlanMode — show plan to user for approval
             if (toolName === "ExitPlanMode") {
-              // Find the most recent plan file
-              const homeDir = process.env.HOME || require("os").homedir();
-              const plansDir = path.join(homeDir, ".claude", "plans");
+              // Use planFilePath from SDK input (v0.2.76+), fall back to directory search
+              const planFilePath = (input as any).planFilePath;
               let planContent = "";
               try {
-                if (fs.existsSync(plansDir)) {
-                  const files = fs.readdirSync(plansDir)
-                    .filter(f => f.endsWith(".md"))
-                    .map(f => ({
-                      name: f,
-                      mtime: fs.statSync(path.join(plansDir, f)).mtimeMs,
-                    }))
-                    .sort((a, b) => b.mtime - a.mtime);
-                  if (files.length > 0) {
-                    planContent = fs.readFileSync(
-                      path.join(plansDir, files[0].name), "utf-8"
-                    );
+                if (planFilePath && fs.existsSync(planFilePath)) {
+                  planContent = fs.readFileSync(planFilePath, "utf-8");
+                  console.log(`[Plan] Read plan from SDK planFilePath: ${planFilePath}`);
+                } else {
+                  // Fallback: search plans directory for most recent .md file
+                  const homeDir = process.env.HOME || require("os").homedir();
+                  const plansDir = path.join(homeDir, ".claude", "plans");
+                  if (fs.existsSync(plansDir)) {
+                    const files = fs.readdirSync(plansDir)
+                      .filter(f => f.endsWith(".md"))
+                      .map(f => ({
+                        name: f,
+                        mtime: fs.statSync(path.join(plansDir, f)).mtimeMs,
+                      }))
+                      .sort((a, b) => b.mtime - a.mtime);
+                    if (files.length > 0) {
+                      planContent = fs.readFileSync(
+                        path.join(plansDir, files[0].name), "utf-8"
+                      );
+                    }
                   }
                 }
               } catch (e) {
@@ -925,6 +935,12 @@ export class ClaudeSession {
 
               const firstAnswer = Object.values(answers)[0] || "";
               if (firstAnswer.toLowerCase().includes("approve")) {
+                // Notify app that we're exiting plan mode
+                this.send({
+                  type: "permission_mode_changed",
+                  permissionMode: "bypassPermissions",
+                  sessionId: this.sessionId || "",
+                } as any);
                 return { behavior: "allow" as const, updatedInput: input };
               } else {
                 return { behavior: "deny" as const, message: "User rejected the plan." };
@@ -1145,8 +1161,10 @@ export class ClaudeSession {
             });
 
             // Query available commands and agents (#18)
+            console.log(`[Init] Querying supportedCommands...`);
             this.activeQuery.supportedCommands().then((commands: any) => {
-              if (commands) {
+              console.log(`[Init] supportedCommands returned: ${Array.isArray(commands) ? commands.length + ' commands' : typeof commands}`);
+              if (commands && Array.isArray(commands) && commands.length > 0) {
                 this._lastSupportedCommands = {
                   type: "supported_commands",
                   commands,
@@ -1158,8 +1176,10 @@ export class ClaudeSession {
               console.error(`[Init] Failed to get supported commands: ${e}`);
             });
 
+            console.log(`[Init] Querying supportedAgents...`);
             this.activeQuery.supportedAgents().then((agents: any) => {
-              if (agents) {
+              console.log(`[Init] supportedAgents returned: ${Array.isArray(agents) ? agents.length + ' agents' : typeof agents}`);
+              if (agents && Array.isArray(agents) && agents.length > 0) {
                 this._lastSupportedAgents = {
                   type: "supported_agents",
                   agents,
@@ -1225,13 +1245,22 @@ export class ClaudeSession {
         // Detect context compaction status changes
         if (message.type === "system" && (message as any).subtype === "status") {
           const status = (message as any).status as string | null;
-          console.log(`[SDK] Status change: ${status}`);
+          const permMode = (message as any).permissionMode as string | undefined;
+          console.log(`[SDK] Status change: ${status}${permMode ? ` permissionMode=${permMode}` : ''}`);
           this._isCompacting = status === "compacting";
           this.send({
             type: "compacting",
             active: this._isCompacting,
             sessionId: this.sessionId || "",
           } as any);
+          // Forward permission mode changes (e.g., entering/exiting plan mode)
+          if (permMode) {
+            this.send({
+              type: "permission_mode_changed",
+              permissionMode: permMode,
+              sessionId: this.sessionId || "",
+            } as any);
+          }
         }
 
         // Forward compact boundary events (token count before compaction)
@@ -1499,6 +1528,7 @@ export class ClaudeSession {
           // Log the full assistant text once the message is complete
           // Skip persisting the raw error text when auth login is being handled
           const apiMessage = (message as any).message;
+          console.log(`[SDK] Assistant message: content_blocks=${apiMessage?.content?.length || 0} types=${apiMessage?.content?.map((b: any) => b.type).join(',') || 'none'}`);
           if (apiMessage?.content && Array.isArray(apiMessage.content)) {
             // Extract full text from assistant message
             const textParts = apiMessage.content
@@ -1833,6 +1863,25 @@ export class ClaudeSession {
           }
           lastResultContent =
             result.result || currentText || "Task completed.";
+          console.log(`[SDK] Result: subtype=${result.subtype} num_turns=${result.num_turns} result_len=${result.result?.length || 0} currentText_len=${currentText.length}`);
+
+          // For slash commands / local commands: if result has content but no text
+          // was streamed during this query, send the result as a text message
+          if (result.result && !currentText) {
+            console.log(`[SDK] Slash command result: ${result.result.slice(0, 100)}`);
+            this.send({
+              type: "text",
+              content: result.result,
+              sessionId: this.sessionId || "",
+            });
+            if (this.sessionId) {
+              appendHistory(this.sessionId, {
+                role: "assistant",
+                content: result.result,
+                timestamp: now(),
+              });
+            }
+          }
 
           // Use last turn's per-turn usage (from stream events) for current context size.
           // modelUsage contains cumulative totals across ALL turns — not useful for context fill.
