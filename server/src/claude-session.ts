@@ -56,6 +56,8 @@ export class ClaudeSession {
   private _lastPreview: string = "";
   private _lastSessionInit: ServerMessage | null = null;
   private _lastSupportedModels: ServerMessage | null = null;
+  private _lastSupportedCommands: ServerMessage | null = null;
+  private _lastSupportedAgents: ServerMessage | null = null;
   public onActivity?: () => void;
   // When set, this fresh session replaces an old cleared session — remap the ID in the store
   public replacesSessionId?: string;
@@ -164,6 +166,7 @@ export class ClaudeSession {
 
   private _startBashWatcher(filePath: string): void {
     this._stopBashWatcher();  // clean up any previous watcher
+    console.log(`[BashWatcher] Starting on ${filePath}`);
     const state = { interval: null as any, filePath, lastSize: 0 };
     state.interval = setInterval(() => {
       try {
@@ -256,6 +259,8 @@ export class ClaudeSession {
     // Re-send cached session init and models so app UI populates immediately
     if (this._lastSessionInit) this.send(this._lastSessionInit);
     if (this._lastSupportedModels) this.send(this._lastSupportedModels);
+    if (this._lastSupportedCommands) this.send(this._lastSupportedCommands);
+    if (this._lastSupportedAgents) this.send(this._lastSupportedAgents);
     // Send any thinking accumulated during the current thinking block
     if (this._streamingThinking.length > 0) {
       this.send({
@@ -384,10 +389,11 @@ export class ClaudeSession {
     return null;
   }
 
-  /** Inject a user message into the running conversation between turns */
-  async injectMessage(text: string): Promise<void> {
+  /** Inject a user message into the running conversation between turns.
+   *  priority: 'now' = interrupt current tool, 'next' = between turns, 'later' = after current task */
+  async injectMessage(text: string, priority: 'now' | 'next' | 'later' = 'now'): Promise<void> {
     if (!this.activeQuery || !this._isRunning) return;
-    console.log(`[Inject] Queuing message: ${text.slice(0, 80)}...`);
+    console.log(`[Inject] Queuing message (priority=${priority}): ${text.slice(0, 80)}...`);
 
     const sessionId = this.sessionId || "";
 
@@ -409,6 +415,7 @@ export class ClaudeSession {
       },
       parent_tool_use_id: null,
       session_id: sessionId,
+      priority,
     };
 
     const singleMessageStream = async function* () {
@@ -445,6 +452,14 @@ export class ClaudeSession {
       if (sid) cleanEnv["CLAUDE_SESSION_ID"] = sid;
       // Enable file checkpointing for rewind support
       cleanEnv["CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING"] = "1";
+      // Give MCP tool results more time to propagate before stream closes
+      cleanEnv["CLAUDE_CODE_STREAM_CLOSE_TIMEOUT"] = "10000";
+      // Force-enable prompt suggestions
+      cleanEnv["CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION"] = "1";
+      // Enable fine-grained tool output streaming (streams bash output incrementally)
+      cleanEnv["CLAUDE_CODE_ENABLE_FINE_GRAINED_TOOL_STREAMING"] = "1";
+      // Enable bash_progress events in tool_progress (SDK only emits in remote/container mode)
+      cleanEnv["CLAUDE_CODE_CONTAINER_ID"] = "socketclaude";
 
       // Merge plugin environment variables
       for (const plugin of this.plugins) {
@@ -462,28 +477,35 @@ export class ClaudeSession {
             "Speak text aloud to the user via text-to-speech. Use this to provide a concise spoken summary of your response. Keep it natural and conversational — no markdown, no code, no formatting. Summarize rather than reading everything verbatim. Only call this once per response. Avoid starting with a very short sentence — lead with a substantial opening sentence so audio playback begins with meaningful content.",
             { text: z.string().describe("The text to speak aloud to the user") },
             async (args) => {
-              this.send({
-                type: "speak",
-                text: args.text,
-                sessionId: this.sessionId || "",
-              } as any);
-              // If server-side Kokoro TTS is active, generate and send audio
-              if (this._ttsEngine === "kokoro_server") {
-                try {
-                  const wavBuffer = generateKokoroAudio(args.text, this._kokoroVoice, this._kokoroSpeed);
-                  if (wavBuffer) {
-                    this.send({
-                      type: "tts_audio",
-                      audioData: wavBuffer.toString("base64"),
-                      text: args.text,
-                      sessionId: this.sessionId || "",
-                    } as any);
+              try {
+                console.log(`[MCP:Speak] Called with ${args.text.length} chars`);
+                this.send({
+                  type: "speak",
+                  text: args.text,
+                  sessionId: this.sessionId || "",
+                } as any);
+                // If server-side Kokoro TTS is active, generate and send audio
+                if (this._ttsEngine === "kokoro_server") {
+                  try {
+                    const wavBuffer = generateKokoroAudio(args.text, this._kokoroVoice, this._kokoroSpeed);
+                    if (wavBuffer) {
+                      this.send({
+                        type: "tts_audio",
+                        audioData: wavBuffer.toString("base64"),
+                        text: args.text,
+                        sessionId: this.sessionId || "",
+                      } as any);
+                    }
+                  } catch (e) {
+                    console.error(`[KokoroTTS] Error generating audio:`, e);
                   }
-                } catch (e) {
-                  console.error(`[KokoroTTS] Error generating audio:`, e);
                 }
+                console.log(`[MCP:Speak] Returning result`);
+                return { content: [{ type: "text" as const, text: "Speaking to user." }] };
+              } catch (e: any) {
+                console.error(`[MCP:Speak] Error: ${e.message}`, e.stack);
+                return { content: [{ type: "text" as const, text: `Speak error: ${e.message}` }], isError: true };
               }
-              return { content: [{ type: "text" as const, text: "Speaking to user." }] };
             }
           ),
           tool(
@@ -493,26 +515,33 @@ export class ClaudeSession {
               file_path: z.string().describe("Absolute path to the file to send"),
             },
             async (args) => {
-              const filePath = args.file_path;
-              if (!fs.existsSync(filePath)) {
-                return { content: [{ type: "text" as const, text: `File not found: ${filePath}` }] };
+              try {
+                const filePath = args.file_path;
+                console.log(`[MCP:SendFile] Called with path=${filePath}`);
+                if (!fs.existsSync(filePath)) {
+                  return { content: [{ type: "text" as const, text: `File not found: ${filePath}` }] };
+                }
+                const stat = fs.statSync(filePath);
+                const fileName = path.basename(filePath);
+                const fileId = crypto.createHash("md5").update(`${filePath}:${stat.mtimeMs}:${stat.size}`).digest("hex").slice(0, 12);
+                // Send metadata only — file data transferred on-demand when user taps download
+                this.send({
+                  type: "file",
+                  fileId,
+                  fileName,
+                  filePath,
+                  fileSize: stat.size,
+                  sessionId: this.sessionId || "",
+                } as any);
+                const sizeStr = stat.size > 1024 * 1024
+                  ? `${(stat.size / 1024 / 1024).toFixed(1)} MB`
+                  : `${(stat.size / 1024).toFixed(1)} KB`;
+                console.log(`[MCP:SendFile] Returning result for ${fileName} (${sizeStr})`);
+                return { content: [{ type: "text" as const, text: `File ready for download: ${fileName} (${sizeStr})` }] };
+              } catch (e: any) {
+                console.error(`[MCP:SendFile] Error: ${e.message}`, e.stack);
+                return { content: [{ type: "text" as const, text: `SendFile error: ${e.message}` }], isError: true };
               }
-              const stat = fs.statSync(filePath);
-              const fileName = path.basename(filePath);
-              const fileId = crypto.createHash("md5").update(`${filePath}:${stat.mtimeMs}:${stat.size}`).digest("hex").slice(0, 12);
-              // Send metadata only — file data transferred on-demand when user taps download
-              this.send({
-                type: "file",
-                fileId,
-                fileName,
-                filePath,
-                fileSize: stat.size,
-                sessionId: this.sessionId || "",
-              } as any);
-              const sizeStr = stat.size > 1024 * 1024
-                ? `${(stat.size / 1024 / 1024).toFixed(1)} MB`
-                : `${(stat.size / 1024).toFixed(1)} KB`;
-              return { content: [{ type: "text" as const, text: `File ready for download: ${fileName} (${sizeStr})` }] };
             }
           ),
           tool(
@@ -646,6 +675,9 @@ export class ClaudeSession {
           tools: { type: "preset", preset: "claude_code" },
           ...(this._disallowedTools.length ? { disallowedTools: this._disallowedTools } : {}),
           enableFileCheckpointing: true,
+          promptSuggestions: true,
+          agentProgressSummaries: true,
+          toolConfig: { askUserQuestion: { previewFormat: 'markdown' } },
           settingSources: ["user", "project"],
           mcpServers: (() => {
             const servers: Record<string, any> = { "app": appTools };
@@ -693,18 +725,30 @@ export class ClaudeSession {
                   }
                 }
 
+                // Stop our file watcher before TaskOutput reads the same file
+                if (toolName === "TaskOutput") {
+                  console.log(`[Hook] PreToolUse TaskOutput — stopping bash watcher to avoid conflict`);
+                  this._stopBashWatcher();
+                  return { continue: true };
+                }
+
                 // Wrap Bash commands with tee for live streaming output
                 if (toolName === "Bash" && toolInput.command) {
-                  const outFile = "/tmp/claude-bash-live.log";
+                  const toolUseId = input.tool_use_id || "unknown";
+                  const outFile = `/tmp/claude-bash-${toolUseId}.log`;
                   try { fs.writeFileSync(outFile, ""); } catch {}
                   const wrapped = `set -o pipefail; (${toolInput.command}) 2>&1 | stdbuf -oL tee ${outFile}`;
-                  return {
+                  console.log(`[Hook] Bash tee: toolUseId=${toolUseId} outFile=${outFile}`);
+                  // Log the updatedInput to verify it's being applied
+                  const result = {
                     hookSpecificOutput: {
-                      hookEventName: "PreToolUse",
-                      permissionDecision: "allow",
+                      hookEventName: "PreToolUse" as const,
+                      permissionDecision: "allow" as const,
                       updatedInput: { command: wrapped },
                     },
                   };
+                  console.log(`[Hook] Bash returning updatedInput command length=${wrapped.length}`);
+                  return result;
                 }
 
                 // No modification needed — allow
@@ -721,17 +765,21 @@ export class ClaudeSession {
             }],
             SubagentStart: [{
               hooks: [async (input: any) => {
-                const agentId = input.agent_id || "";
-                const agentType = input.agent_type || "";
-                console.log(`[Hook] SubagentStart: agentId=${agentId} type=${agentType}`);
+                try {
+                  const agentId = input.agent_id || "";
+                  const agentType = input.agent_type || "";
+                  console.log(`[Hook] SubagentStart: agentId=${agentId} type=${agentType}`);
+                } catch {}
                 return { continue: true };
               }],
             }],
             SubagentStop: [{
               hooks: [async (input: any) => {
-                const agentId = input.agent_id || "";
-                const agentType = input.agent_type || "";
-                console.log(`[Hook] SubagentStop: agentId=${agentId} type=${agentType}`);
+                try {
+                  const agentId = input.agent_id || "";
+                  const agentType = input.agent_type || "";
+                  console.log(`[Hook] SubagentStop: agentId=${agentId} type=${agentType}`);
+                } catch {}
                 return { continue: true };
               }],
             }],
@@ -739,6 +787,11 @@ export class ClaudeSession {
           stderr: (data: string) => {
             const trimmed = data.trimEnd();
             if (trimmed) {
+              // Filter out SDK internal errors (stream closing race conditions)
+              if (/Error in hook callback.*Stream closed/i.test(trimmed)) {
+                console.warn(`[Claude stderr] (suppressed SDK hook error) ${trimmed.slice(0, 100)}`);
+                return;
+              }
               console.error(`[Claude stderr] ${trimmed}`);
               // Forward stderr as streaming tool output to the app
               this.send({
@@ -751,14 +804,8 @@ export class ClaudeSession {
           canUseTool: async (toolName, input, { signal, suggestions, blockedPath, decisionReason, toolUseID, agentID } = {} as any) => {
             console.log(`canUseTool called: ${toolName}${agentID ? ` (agent: ${agentID})` : ''}${decisionReason ? ` reason: ${decisionReason}` : ''}`);
 
-            // Run plugin interceptors first
-            const sessionCtx = this.getSessionContext();
-            for (const plugin of this.plugins) {
-              if (plugin.canUseToolInterceptor) {
-                const result = await plugin.canUseToolInterceptor(toolName, input as any, sessionCtx);
-                if (result !== null) return result;
-              }
-            }
+            // NOTE: Plugin interceptors run in PreToolUse hook (not here).
+            // In bypassPermissions mode, canUseTool is only called for interactive tools.
 
             if (toolName === "AskUserQuestion") {
               const qId = `q${++this.questionCounter}`;
@@ -774,6 +821,7 @@ export class ClaudeSession {
                       ? q.options.map((o: any) => ({
                           label: o.label || "",
                           description: o.description,
+                          preview: o.preview || undefined,
                         }))
                       : [],
                     multiSelect: q.multiSelect,
@@ -1096,6 +1144,33 @@ export class ClaudeSession {
             }).catch((e: any) => {
               console.error(`[Init] Failed to get supported models: ${e}`);
             });
+
+            // Query available commands and agents (#18)
+            this.activeQuery.supportedCommands().then((commands: any) => {
+              if (commands) {
+                this._lastSupportedCommands = {
+                  type: "supported_commands",
+                  commands,
+                  sessionId: this.sessionId || "",
+                } as any;
+                this.send(this._lastSupportedCommands!);
+              }
+            }).catch((e: any) => {
+              console.error(`[Init] Failed to get supported commands: ${e}`);
+            });
+
+            this.activeQuery.supportedAgents().then((agents: any) => {
+              if (agents) {
+                this._lastSupportedAgents = {
+                  type: "supported_agents",
+                  agents,
+                  sessionId: this.sessionId || "",
+                } as any;
+                this.send(this._lastSupportedAgents!);
+              }
+            }).catch((e: any) => {
+              console.error(`[Init] Failed to get supported agents: ${e}`);
+            });
           }
 
           // Log user prompt now that we have the session ID (for new sessions)
@@ -1212,6 +1287,7 @@ export class ClaudeSession {
             type: "tool_summary",
             summary: summary.summary || "",
             precedingToolUseIds: summary.preceding_tool_use_ids || [],
+            parentToolUseId: summary.parent_tool_use_id || null,
             sessionId: this.sessionId || "",
             uuid: summary.uuid || undefined,
           } as any);
@@ -1225,6 +1301,85 @@ export class ClaudeSession {
               timestamp: now(),
             });
           }
+        }
+
+        // Forward rate limit events to app (#7)
+        if (message.type === "rate_limit_event") {
+          const info = (message as any).rate_limit_info || {};
+          console.log(`[SDK] Rate limit: status=${info.status} type=${info.rateLimitType} util=${info.utilization}`);
+          this.send({
+            type: "rate_limit_event",
+            status: info.status || "allowed",
+            resetsAt: info.resetsAt || undefined,
+            utilization: info.utilization || undefined,
+            rateLimitType: info.rateLimitType || undefined,
+            sessionId: this.sessionId || "",
+          } as any);
+        }
+
+        // Forward background task lifecycle events (#8, #9)
+        if (message.type === "system" && (message as any).subtype === "task_started") {
+          const ts = message as any;
+          console.log(`[SDK] Task started: id=${ts.task_id} desc=${ts.description} type=${ts.task_type}`);
+          this.send({
+            type: "task_started",
+            taskId: ts.task_id || "",
+            toolUseId: ts.tool_use_id || undefined,
+            description: ts.description || "",
+            taskType: ts.task_type || undefined,
+            prompt: ts.prompt || undefined,
+            sessionId: this.sessionId || "",
+          } as any);
+        }
+
+        if (message.type === "system" && (message as any).subtype === "task_progress") {
+          const tp = message as any;
+          console.log(`[SDK] Task progress: id=${tp.task_id} tool=${tp.last_tool_name} summary=${tp.summary?.slice(0, 60)}`);
+          this.send({
+            type: "bg_task_progress",
+            taskId: tp.task_id || "",
+            description: tp.description || "",
+            usage: tp.usage || undefined,
+            lastToolName: tp.last_tool_name || undefined,
+            summary: tp.summary || undefined,
+            sessionId: this.sessionId || "",
+          } as any);
+        }
+
+        // Forward API retry events (#10 — defensive, needs SDK v0.2.77+)
+        if (message.type === "system" && (message as any).subtype === "api_retry") {
+          const ar = message as any;
+          console.log(`[SDK] API retry: attempt=${ar.attempt}/${ar.max_retries} delay=${ar.delay_ms}ms`);
+          this.send({
+            type: "api_retry",
+            attempt: ar.attempt || 0,
+            maxRetries: ar.max_retries || 0,
+            delayMs: ar.delay_ms || 0,
+            errorStatus: ar.error_status || undefined,
+            sessionId: this.sessionId || "",
+          } as any);
+        }
+
+        // Forward local command output (#11)
+        if (message.type === "system" && (message as any).subtype === "local_command_output") {
+          const lco = message as any;
+          console.log(`[SDK] Local command output: ${lco.content?.slice(0, 80)}`);
+          this.send({
+            type: "local_command_output",
+            content: lco.content || "",
+            sessionId: this.sessionId || "",
+          } as any);
+        }
+
+        // Forward prompt suggestions (#12)
+        if (message.type === "prompt_suggestion") {
+          const ps = message as any;
+          console.log(`[SDK] Prompt suggestion: ${ps.suggestion?.slice(0, 80)}`);
+          this.send({
+            type: "prompt_suggestion",
+            suggestion: ps.suggestion || "",
+            sessionId: this.sessionId || "",
+          } as any);
         }
 
         if (message.type === "stream_event") {
@@ -1292,7 +1447,7 @@ export class ClaudeSession {
           const assistantError = (message as any).error;
           if (assistantError) {
             console.error(`[SDK] Assistant error: ${assistantError}`);
-            if (/auth/i.test(assistantError)) {
+            if (assistantError === 'authentication_failed') {
               this._authErrorSent = true;
               this._startAuthLogin().then((url) => {
                 if (url) {
@@ -1446,14 +1601,16 @@ export class ClaudeSession {
                   }
                 }
 
-                // Start watching for bash streaming output (tee'd by PreToolUse hook)
+                // Start watching the global bash log file for streaming output
+                // Start watching for bash output — file path derived from tool_use_id
+                // (matches the path the PreToolUse hook uses for tee wrapping)
                 if (block.name === "Bash") {
-                  this._startBashWatcher("/tmp/claude-bash-live.log");
+                  this._startBashWatcher(`/tmp/claude-bash-${block.id}.log`);
                 }
 
-                // Track all Task (subagent) tool calls
-                if (block.name === "Task") {
-                  const desc = (block.input as any)?.description || "Task";
+                // Track all Agent (subagent) tool calls (renamed from "Task" in SDK 0.2.76)
+                if (block.name === "Agent" || block.name === "Task") {
+                  const desc = (block.input as any)?.description || "Agent";
                   const subagentType = (block.input as any)?.subagent_type || "";
                   this._activeSubagents.set(block.id, {
                     toolUseId: block.id,
@@ -1710,6 +1867,15 @@ export class ClaudeSession {
             contextWindow,
           };
 
+          // Total usage across ALL turns (from SDK result.usage)
+          const totalUsage = result.usage ? {
+            inputTokens: result.usage.inputTokens || 0,
+            outputTokens: result.usage.outputTokens || 0,
+            cacheReadTokens: result.usage.cacheReadInputTokens || 0,
+            cacheCreateTokens: result.usage.cacheCreationInputTokens || 0,
+            costUsd: result.usage.costUSD || 0,
+          } : undefined;
+
           this.send({
             type: "result",
             content: lastResultContent,
@@ -1718,6 +1884,7 @@ export class ClaudeSession {
             durationMs: result.duration_ms,
             durationApiMs: result.duration_api_ms || undefined,
             usage: usageInfo,
+            totalUsage,
             numTurns: result.num_turns,
             stopReason: result.stop_reason || undefined,
             resultSubtype: result.subtype || undefined,

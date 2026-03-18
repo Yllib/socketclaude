@@ -417,8 +417,15 @@ function createConnectionHandler(transport: ClientTransport) {
 
         // If session is already running, inject the message inline between turns
         if (activeSession.isRunning) {
-          console.log(`[Inject] Session running, injecting user message inline`);
-          activeSession.injectMessage(msg.text);
+          const priority = (msg as any).priority || 'now';
+          const messageId = (msg as any).messageId || '';
+          console.log(`[Inject] Session running, injecting user message inline (priority=${priority}, messageId=${messageId})`);
+          activeSession.injectMessage(msg.text, priority).then(() => {
+            // Acknowledge injection so the app can promote the pending message
+            sendJson({ type: "injection_ack", messageId });
+          }).catch((e: any) => {
+            console.error(`[Inject] Failed: ${e}`);
+          });
           break;
         }
 
@@ -1083,7 +1090,7 @@ function createConnectionHandler(transport: ClientTransport) {
 
       case "upload_start": {
         const uploadId = msg.uploadId;
-        const fileName = msg.fileName;
+        const fileName = path.basename(msg.fileName || "upload"); // sanitize: strip path traversal
         const fileSize = msg.fileSize;
         const totalChunks = msg.totalChunks;
 

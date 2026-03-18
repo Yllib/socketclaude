@@ -310,7 +310,7 @@ export interface QuestionServerMessage {
 export interface QuestionItem {
   question: string;
   header?: string;
-  options: { label: string; description?: string }[];
+  options: { label: string; description?: string; preview?: string }[];
   multiSelect?: boolean;
 }
 
@@ -330,6 +330,14 @@ export interface UsageInfo {
   contextWindow: number;
 }
 
+export interface TotalUsageInfo {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheCreateTokens: number;
+  costUsd: number;
+}
+
 export interface ResultServerMessage {
   type: "result";
   content: string;
@@ -338,6 +346,7 @@ export interface ResultServerMessage {
   durationMs?: number;
   durationApiMs?: number;
   usage?: UsageInfo;
+  totalUsage?: TotalUsageInfo;
   numTurns?: number;
   stopReason?: string;
   resultSubtype?: string;
