@@ -679,6 +679,77 @@ function createConnectionHandler(transport: ClientTransport) {
         break;
       }
 
+      case "version_check": {
+        const { execSync } = require("child_process");
+        const info: any = { type: "version_info", gitAvailable: !!GIT_ROOT };
+        if (GIT_ROOT) {
+          try {
+            const localHash = execSync("git rev-parse HEAD", { cwd: GIT_ROOT, stdio: "pipe" }).toString().trim();
+            const branch = execSync("git rev-parse --abbrev-ref HEAD", { cwd: GIT_ROOT, stdio: "pipe" }).toString().trim();
+            const localMsg = execSync("git log -1 --format=%s", { cwd: GIT_ROOT, stdio: "pipe" }).toString().trim();
+            const localDate = execSync("git log -1 --format=%ci", { cwd: GIT_ROOT, stdio: "pipe" }).toString().trim();
+            info.local = { hash: localHash, branch, message: localMsg, date: localDate };
+
+            // Fetch and check remote
+            try {
+              execSync("git fetch origin", { cwd: GIT_ROOT, stdio: "pipe", timeout: 15000 });
+              const remoteHash = execSync(`git rev-parse origin/${branch}`, { cwd: GIT_ROOT, stdio: "pipe" }).toString().trim();
+              const remoteMsg = execSync(`git log origin/${branch} -1 --format=%s`, { cwd: GIT_ROOT, stdio: "pipe" }).toString().trim();
+              const remoteDate = execSync(`git log origin/${branch} -1 --format=%ci`, { cwd: GIT_ROOT, stdio: "pipe" }).toString().trim();
+              const commitsBehind = parseInt(execSync(`git rev-list --count HEAD..origin/${branch}`, { cwd: GIT_ROOT, stdio: "pipe" }).toString().trim(), 10);
+              info.remote = { hash: remoteHash, message: remoteMsg, date: remoteDate };
+              info.updateAvailable = localHash !== remoteHash;
+              info.commitsBehind = commitsBehind;
+            } catch (e: any) {
+              info.fetchError = e.message;
+            }
+          } catch (e: any) {
+            info.error = e.message;
+          }
+        }
+        sendJson(info);
+        break;
+      }
+
+      case "force_update": {
+        if (!GIT_ROOT) {
+          sendJson({ type: "update_result", success: false, error: "No git repo found" });
+          break;
+        }
+        const { execSync } = require("child_process");
+        try {
+          const branch = execSync("git rev-parse --abbrev-ref HEAD", { cwd: GIT_ROOT, stdio: "pipe" }).toString().trim();
+          const beforeHash = execSync("git rev-parse HEAD", { cwd: GIT_ROOT, stdio: "pipe" }).toString().trim();
+
+          // Pull
+          execSync(`git pull origin ${branch}`, { cwd: GIT_ROOT, stdio: "pipe", timeout: 60000 });
+          const afterHash = execSync("git rev-parse HEAD", { cwd: GIT_ROOT, stdio: "pipe" }).toString().trim();
+
+          if (beforeHash === afterHash) {
+            sendJson({ type: "update_result", success: true, message: "Already up to date", hash: afterHash });
+            break;
+          }
+
+          // Compile
+          const tscDir = fs.existsSync(path.join(GIT_ROOT, "server", "tsconfig.json"))
+            ? path.join(GIT_ROOT, "server")
+            : GIT_ROOT;
+          execSync("npx tsc", { cwd: tscDir, stdio: "pipe", timeout: 120000 });
+
+          const afterMsg = execSync("git log -1 --format=%s", { cwd: GIT_ROOT, stdio: "pipe" }).toString().trim();
+          sendJson({ type: "update_result", success: true, message: `Updated to ${afterHash.substring(0, 7)}: ${afterMsg}`, hash: afterHash, needsRestart: true });
+
+          // Auto-restart after a short delay so the response gets sent
+          setTimeout(() => {
+            console.log(`[ForceUpdate] Restarting after update ${beforeHash.substring(0, 7)} → ${afterHash.substring(0, 7)}`);
+            process.exit(1);
+          }, 1000);
+        } catch (e: any) {
+          sendJson({ type: "update_result", success: false, error: e.message });
+        }
+        break;
+      }
+
       case "clear_context": {
         const sid = msg.sessionId;
         const sessionInfo = getSession(sid);
@@ -1431,6 +1502,13 @@ cleanupPendingToolCalls();
 // Broadcasts current state to all connected clients so the app stays in sync
 // after reconnects, server restarts, or dropped messages.
 const SERVER_STARTED_AT = new Date().toISOString();
+// Cache git version at startup for status_sync
+let SERVER_GIT_HASH = "";
+try {
+  const { execSync } = require("child_process");
+  const gitRoot = findGitRoot(path.resolve(__dirname, ".."));
+  if (gitRoot) SERVER_GIT_HASH = execSync("git rev-parse --short HEAD", { cwd: gitRoot, stdio: "pipe" }).toString().trim();
+} catch {}
 const STATUS_SYNC_IDLE_INTERVAL = 10000; // 10s when idle
 const STATUS_SYNC_RUNNING_INTERVAL = 3000; // 3s when running
 
@@ -1480,6 +1558,7 @@ function buildStatusSyncMessage(): string {
     compactingSessions,
     serverStartedAt: SERVER_STARTED_AT,
     serverPid: process.pid,
+    serverVersion: SERVER_GIT_HASH || undefined,
     backgroundTaskIds,
   });
 }
