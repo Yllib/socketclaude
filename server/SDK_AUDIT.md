@@ -12,32 +12,32 @@
 ## Critical: Bugs / Incorrect Behavior
 
 ### 1. Token usage mismatch: per-turn tokens + total cost
-- **Status:** [ ] Fix
+- **Status:** [x] Done
 - **File:** `claude-session.ts:1705-1726`
 - **Issue:** `result` message sends last API turn's tokens (`lastTurnInputTokens`) alongside cumulative total cost (`result.total_cost_usd`). The SDK's `result.usage` (NonNullableUsage) has total tokens for the entire query. Should send both: totals for cost summary, per-turn for context fill bar.
 
 ### 2. `canUseTool` unreliable for plugins in bypass mode
-- **Status:** [ ] Fix
+- **Status:** [x] Done
 - **File:** `claude-session.ts:674 + 751-888`
 - **Issue:** In `bypassPermissions` mode, `canUseTool` is skipped for regular tools. Plugin `canUseToolInterceptor` runs in BOTH PreToolUse hook (line 674) AND `canUseTool` (line 756). For regular tools, only the hook fires. For AskUserQuestion, both fire (double execution). Remove plugin interceptors from `canUseTool`; keep only AskUserQuestion and ExitPlanMode there.
 
 ### 3. Assistant error check uses regex instead of enum
-- **Status:** [ ] Fix
+- **Status:** [x] Done
 - **File:** `claude-session.ts:1295`
 - **Issue:** `if (/auth/i.test(assistantError))` — SDK defines: `'authentication_failed' | 'billing_error' | 'rate_limit' | 'invalid_request' | 'server_error' | 'unknown'`. Use direct comparison.
 
 ### 4. Single global bash log file — concurrent collision
-- **Status:** [ ] Fix
+- **Status:** [x] Done
 - **File:** `claude-session.ts:698-700`
 - **Issue:** All bash commands tee to `/tmp/claude-bash-live.log`. Concurrent subagent bash commands overwrite each other.
 
 ### 5. `tool_summary` missing `parentToolUseId`
-- **Status:** [ ] Fix
+- **Status:** [x] Done
 - **File:** `claude-session.ts:1210-1217`
 - **Issue:** SDK's `SDKToolUseSummaryMessage` has `parent_tool_use_id` but it's not forwarded. Tool summaries inside subagents won't associate with correct hierarchy.
 
 ### 6. `streamInput` missing `priority` field
-- **Status:** [ ] Fix
+- **Status:** [x] Done
 - **File:** `claude-session.ts:404-408`
 - **Issue:** `SDKUserMessage` supports `priority?: 'now' | 'next' | 'later'`. Injected messages don't set it. Also `session_id` field is not part of SDKUserMessage and is ignored.
 
@@ -46,27 +46,27 @@
 ## SDK Messages NOT Handled
 
 ### 7. `rate_limit_event` — completely ignored
-- **Status:** [ ] Fix
+- **Status:** [x] Done
 - **Issue:** SDK emits `SDKRateLimitEvent` with `status`, `resetsAt`, `utilization`, `rateLimitType`. No user visibility into rate limiting.
 
 ### 8. `system/task_started` — not handled
-- **Status:** [ ] Fix
+- **Status:** [x] Done
 - **Issue:** SDK emits `SDKTaskStartedMessage` when background tasks launch (with `task_id`, `description`, `task_type`, `prompt`). Manually tracked via `_backgroundTaskToolUseIds` instead.
 
 ### 9. `system/task_progress` — not handled
-- **Status:** [ ] Fix
+- **Status:** [x] Done
 - **Issue:** SDK emits `SDKTaskProgressMessage` periodically with `usage`, `last_tool_name`, `summary`. Never forwarded to app.
 
 ### 10. `system/api_retry` — not handled (new in v0.2.77)
-- **Status:** [ ] Fix
+- **Status:** [x] Done (defensive handler, needs SDK upgrade)
 - **Issue:** SDK emits retry messages with attempt count, max retries, delay, error status on transient API errors. Could show "retrying..." banner.
 
 ### 11. `system/local_command_output` — not handled
-- **Status:** [ ] Fix
+- **Status:** [x] Done
 - **Issue:** Emitted when slash commands produce output. Silently dropped.
 
 ### 12. `prompt_suggestion` — not enabled
-- **Status:** [ ] Fix
+- **Status:** [x] Done
 - **Issue:** Set `promptSuggestions: true` in options and SDK generates suggested next prompts after each turn. Could populate suggestion chips in app.
 
 ---
@@ -82,11 +82,11 @@
 - **Issue:** No graceful degradation when primary model unavailable.
 
 ### 15. `agentProgressSummaries: true` — not enabled
-- **Status:** [ ] Fix
+- **Status:** [x] Done
 - **Issue:** Added in v0.2.72. Makes background Agent tasks generate human-readable summaries in `task_progress` events. Currently not enabled.
 
 ### 16. `toolConfig.askUserQuestion.previewFormat`
-- **Status:** [ ] Fix
+- **Status:** [x] Done
 - **Issue:** Added in v0.2.69. Setting `previewFormat: 'markdown'` adds `preview` field to question options. Could enhance QuestionCard UI.
 
 ### 17. SDK session management APIs
@@ -94,7 +94,7 @@
 - **Issue:** `listSessions()`, `getSessionMessages()`, `renameSession()`, `tagSession()` available. Could replace custom JSONL parsing.
 
 ### 18. `supportedCommands()` and `supportedAgents()`
-- **Status:** [ ] Fix
+- **Status:** [x] Done
 - **Issue:** `supportedModels()` used but not these. Could populate command palette or agent picker in app.
 
 ### 19. `accountInfo()`
@@ -138,7 +138,7 @@
 ## Unnecessary / Redundant Work
 
 ### 28. Double plugin interceptor execution (covered by #2)
-- **Status:** [ ] Fix
+- **Status:** [x] Done
 - **File:** `claude-session.ts:674 + 751`
 - **Issue:** Plugin `canUseToolInterceptor` called in both PreToolUse hook and canUseTool.
 
@@ -148,7 +148,7 @@
 - **Issue:** Bash output streams via tee file watcher AND stderr callback. Overlap.
 
 ### 30. `_backgroundTaskToolUseIds` tracking redundant (covered by #8)
-- **Status:** [ ] Fix
+- **Status:** [x] Done
 - **Issue:** Manual tracking replaceable by handling `task_started` events.
 
 ---
@@ -156,7 +156,7 @@
 ## Tracking / Data Issues
 
 ### 31. `result.usage` fields not fully forwarded (covered by #1)
-- **Status:** [ ] Fix
+- **Status:** [x] Done
 - **Issue:** `webSearchRequests`, `maxOutputTokens`, `costUSD` not forwarded. `contextWindow` extracted indirectly.
 
 ### 32. `outputTokens` tracked but invisible

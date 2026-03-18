@@ -39,7 +39,6 @@ export class ClaudeSession {
   private _disallowedTools: string[] = [];
   private _appendSystemPrompt: string = '';
   private _forkFromSessionId?: string;
-  private _backgroundTaskToolUseIds: Set<string> = new Set();  // toolUseIds of background Task calls
   private _suppressedToolResultIds: Set<string> = new Set();  // toolUseIds whose results should be hidden from client
   private _taskIdToToolUseId: Map<string, string> = new Map();  // agentId → toolUseId mapping
   private _activeSubagents: Map<string, { toolUseId: string; description: string; subagentType: string; startedAt: string }> = new Map();
@@ -1258,9 +1257,10 @@ export class ClaudeSession {
         if (message.type === "system" && (message as any).subtype === "task_notification") {
           const tn = message as any;
           const sdkTaskId = tn.task_id || "";
-          const originToolUseId = this._taskIdToToolUseId.get(sdkTaskId) || undefined;
+          // Prefer SDK's direct tool_use_id, fall back to our mapping
+          const originToolUseId = tn.tool_use_id || this._taskIdToToolUseId.get(sdkTaskId) || undefined;
           console.log(`[SDK] Task notification: id=${sdkTaskId} status=${tn.status} originToolUseId=${originToolUseId} summary=${tn.summary?.slice(0, 80)}`);
-          if (originToolUseId) this._taskIdToToolUseId.delete(sdkTaskId);
+          if (sdkTaskId) this._taskIdToToolUseId.delete(sdkTaskId);
           this.send({
             type: "task_notification",
             taskId: sdkTaskId,
@@ -1320,7 +1320,11 @@ export class ClaudeSession {
         // Forward background task lifecycle events (#8, #9)
         if (message.type === "system" && (message as any).subtype === "task_started") {
           const ts = message as any;
-          console.log(`[SDK] Task started: id=${ts.task_id} desc=${ts.description} type=${ts.task_type}`);
+          console.log(`[SDK] Task started: id=${ts.task_id} toolUseId=${ts.tool_use_id} desc=${ts.description} type=${ts.task_type}`);
+          // Build task_id ↔ tool_use_id mapping (replaces regex agentId extraction)
+          if (ts.task_id && ts.tool_use_id) {
+            this._taskIdToToolUseId.set(ts.task_id, ts.tool_use_id);
+          }
           this.send({
             type: "task_started",
             taskId: ts.task_id || "",
@@ -1620,10 +1624,9 @@ export class ClaudeSession {
                   });
                   console.log(`[SDK] Subagent started: ${desc} (toolUseId=${block.id}, type=${subagentType})`);
 
-                  // Background task notification
+                  // Background task notification (immediate UI feedback before task_started arrives)
                   if ((block.input as any)?.run_in_background) {
                     console.log(`[SDK] Background task launched: ${desc} (toolUseId=${block.id})`);
-                    this._backgroundTaskToolUseIds.add(block.id);
                     this.send({
                       type: "task_notification",
                       taskId: block.id,
@@ -1742,8 +1745,7 @@ export class ClaudeSession {
                     sessionId: this.sessionId || "",
                   } as any);
 
-                  // Track for stopTask
-                  this._taskIdToToolUseId.set(bgTaskId, toolUseId);
+                  // task_id ↔ tool_use_id mapping handled by task_started SDK message
 
                   // Don't replace card content — just send the tool_result normally
                   // but the app will handle it specially
@@ -1757,17 +1759,6 @@ export class ClaudeSession {
                   const info = this._activeSubagents.get(toolUseId)!;
                   console.log(`[SDK] Subagent completed: ${info.description} (toolUseId=${toolUseId})`);
                   this._activeSubagents.delete(toolUseId);
-                }
-
-                // Track background task agentId → toolUseId mapping
-                if (this._backgroundTaskToolUseIds.has(toolUseId)) {
-                  this._backgroundTaskToolUseIds.delete(toolUseId);
-                  const agentIdMatch = output.match(/agentId:\s*(\S+)/);
-                  if (agentIdMatch) {
-                    const agentId = agentIdMatch[1];
-                    this._taskIdToToolUseId.set(agentId, toolUseId);
-                    console.log(`[SDK] Background task mapping: agentId=${agentId} → toolUseId=${toolUseId}`);
-                  }
                 }
 
                 // Clear active tool tracking — tool has completed
