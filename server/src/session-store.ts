@@ -222,11 +222,26 @@ export function getTodos(sessionId: string): any[] {
   }
 }
 
+/** Sanitize CWD to match the SDK's project directory naming convention.
+ *  Works on both Unix (/home/user/code) and Windows (C:\Users\user\code) paths. */
+function sanitizeCwdToProjectDir(cwd: string): string {
+  let dir = cwd.replace(/[^a-zA-Z0-9]/g, "-");
+  if (dir.length > 200) {
+    let hash = 0;
+    for (let i = 0; i < cwd.length; i++) {
+      hash = (hash << 5) - hash + cwd.charCodeAt(i);
+      hash |= 0;
+    }
+    dir = dir.slice(0, 200) + "-" + Math.abs(hash).toString(36);
+  }
+  return dir;
+}
+
 /** Build the path to Claude Code's JSONL session file */
 export function getJsonlPath(sessionId: string, cwd: string): string {
   const homeDir = process.env.HOME || require("os").homedir();
-  const projectDir = cwd.replace(/^\//, "").replace(/[\/ ]/g, "-");
-  return path.join(homeDir, ".claude", "projects", `-${projectDir}`, `${sessionId}.jsonl`);
+  const projectDir = sanitizeCwdToProjectDir(cwd);
+  return path.join(homeDir, ".claude", "projects", projectDir, `${sessionId}.jsonl`);
 }
 
 /** Get the timestamp of the last entry in a session's history */
@@ -529,8 +544,8 @@ function loadPromptHistory(cwd: string): Map<string, string> {
  */
 export function listSdkSessions(cwd: string, limit = 30): SdkSessionEntry[] {
   const homeDir = process.env.HOME || require("os").homedir();
-  const projectDir = cwd.replace(/^\//, "").replace(/[\/ ]/g, "-");
-  const projectPath = path.join(homeDir, ".claude", "projects", `-${projectDir}`);
+  const projectDir = sanitizeCwdToProjectDir(cwd);
+  const projectPath = path.join(homeDir, ".claude", "projects", projectDir);
 
   if (!fs.existsSync(projectPath)) return [];
 
