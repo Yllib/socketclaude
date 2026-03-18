@@ -86,6 +86,30 @@ if (-not (Test-Path (Join-Path $SERVER_DIR "package.json"))) {
 
 try {
 
+# ── Pre-flight: check if port is available ──
+$existingTask = Get-ScheduledTask -TaskName $TASK_NAME -ErrorAction SilentlyContinue
+$portInUse = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
+if ($portInUse) {
+    # Check if it's our own task — that's fine, we'll stop it in Phase 6
+    $ourPids = @()
+    if ($existingTask -and $existingTask.State -eq "Running") {
+        $ourPids = (Get-CimInstance Win32_Process | Where-Object { $_.ParentProcessId -in
+            (Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like "*$TASK_NAME*" -or $_.CommandLine -like "*run-service*" }).ProcessId -or
+            $_.CommandLine -like "*socketclaude*dist*index.js*"
+        }).ProcessId
+    }
+    $conflictPids = $portInUse.OwningProcess | Where-Object { $_ -notin $ourPids }
+    if ($conflictPids) {
+        $procInfo = Get-Process -Id $conflictPids[0] -ErrorAction SilentlyContinue
+        $procName = if ($procInfo) { "$($procInfo.ProcessName) (PID $($conflictPids[0]))" } else { "PID $($conflictPids[0])" }
+        Write-Fail "Port $Port is already in use by $procName"
+        Write-Host ""
+        Write-Host "  Use a different port:  powershell -File install.ps1 -Port 8086" -ForegroundColor Yellow
+        Write-Host ""
+        exit 1
+    }
+}
+
 # ══════════════════════════════════════════════
 #  Phase 1: Node.js
 # ══════════════════════════════════════════════
