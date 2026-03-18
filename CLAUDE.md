@@ -200,12 +200,11 @@ The app lives as a nested git repo inside `app/` (gitignored from this repo).
 ```bash
 export PATH="/opt/flutter/bin:/home/rdp/Android/Sdk/platform-tools:$PATH"
 cd /home/rdp/claude/socketclaude-public/app && flutter build apk --release
-adb install -r /home/rdp/claude/socketclaude-public/app/build/app/outputs/flutter-apk/app-release.apk
 ```
 
 - Both `flutter` and `adb` are on PATH via `~/.profile` — use the export above if not available in current shell
 - Use `--release` for production builds, `--debug` for development
-- ADB wireless: `adb connect <phone-ip>:<port>` (check phone's wireless debugging settings for current port)
+- Check `adb devices` first — if a device is connected, use `adb install`. If no device, use the SendFile MCP tool to deliver the APK
 
 ### Android Integration
 - App name: "SocketClaude"

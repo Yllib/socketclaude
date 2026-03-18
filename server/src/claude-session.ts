@@ -785,6 +785,60 @@ export class ClaudeSession {
                 return { continue: true };
               }],
             }],
+            SessionStart: [{
+              hooks: [async (input: any) => {
+                try {
+                  const source = input.source || "unknown";
+                  const model = input.model || "";
+                  const agentType = input.agent_type || "";
+                  console.log(`[Hook] SessionStart: source=${source} model=${model} agentType=${agentType}`);
+                  this.send({
+                    type: "session_lifecycle",
+                    event: "start",
+                    source,
+                    model: model || undefined,
+                    agentType: agentType || undefined,
+                    sessionId: this.sessionId || "",
+                  } as any);
+                } catch {}
+                return { continue: true };
+              }],
+            }],
+            SessionEnd: [{
+              hooks: [async (input: any) => {
+                try {
+                  const reason = input.reason || "unknown";
+                  console.log(`[Hook] SessionEnd: reason=${reason}`);
+                  this.send({
+                    type: "session_lifecycle",
+                    event: "end",
+                    reason,
+                    sessionId: this.sessionId || "",
+                  } as any);
+                } catch {}
+                return { continue: true };
+              }],
+            }],
+            TaskCompleted: [{
+              hooks: [async (input: any) => {
+                try {
+                  const taskId = input.task_id || "";
+                  const subject = input.task_subject || "";
+                  const description = input.task_description || "";
+                  const teammateName = input.teammate_name || "";
+                  console.log(`[Hook] TaskCompleted: id=${taskId} subject=${subject} desc=${description?.slice(0, 80)}`);
+                  this.send({
+                    type: "task_completed_hook",
+                    taskId,
+                    subject,
+                    description: description || undefined,
+                    teammateName: teammateName || undefined,
+                    sessionId: this.sessionId || "",
+                  } as any);
+                } catch {}
+                return { continue: true };
+              }],
+            }],
           },
           stderr: (data: string) => {
             const trimmed = data.trimEnd();
@@ -948,6 +1002,116 @@ export class ClaudeSession {
             }
 
             return { behavior: "allow" as const, updatedInput: input };
+          },
+          onElicitation: async (request: any, { signal }: { signal: AbortSignal }) => {
+            const { serverName, message, mode, url, elicitationId, requestedSchema } = request;
+            console.log(`[Elicitation] server=${serverName} mode=${mode || 'form'} msg=${message?.slice(0, 100)}`);
+
+            if (mode === 'url' && url) {
+              // URL-mode: send a dedicated card so the app can open the URL
+              const qId = `elicit_${++this.questionCounter}`;
+              const elicitMsg: ServerMessage = {
+                type: "elicitation_url",
+                questionId: qId,
+                mcpServerName: serverName,
+                message: message || `${serverName} requires authentication`,
+                url,
+                elicitationId: elicitationId || undefined,
+                sessionId: this.sessionId || "",
+              } as any;
+              this.send(elicitMsg);
+
+              // Wait for user to complete the URL flow or cancel
+              const answers = await new Promise<Record<string, string>>((resolve) => {
+                this.pendingQuestions.set(qId, { questionId: qId, resolve, questionData: elicitMsg });
+              });
+              const action = Object.values(answers)[0] || "";
+              if (action.toLowerCase().includes("cancel") || action.toLowerCase().includes("decline")) {
+                return { action: "decline" as const };
+              }
+              return { action: "accept" as const };
+            }
+
+            // Form-mode: convert requestedSchema to QuestionItems and use question card
+            const qId = `elicit_${++this.questionCounter}`;
+            const questions: QuestionItem[] = [];
+
+            if (requestedSchema && typeof requestedSchema === 'object') {
+              const props = (requestedSchema as any).properties || {};
+              const required = (requestedSchema as any).required || [];
+              for (const [key, schema] of Object.entries(props) as [string, any][]) {
+                const desc = schema.description || key;
+                const isRequired = required.includes(key);
+                const options: { label: string; description?: string }[] = [];
+                // If the schema has enum values, create options for them
+                if (Array.isArray(schema.enum)) {
+                  for (const val of schema.enum) {
+                    options.push({ label: String(val) });
+                  }
+                }
+                questions.push({
+                  question: `${desc}${isRequired ? ' (required)' : ''}`,
+                  header: key,
+                  options,
+                  multiSelect: false,
+                });
+              }
+            }
+
+            // Fallback if no schema properties: single text input with the message
+            if (questions.length === 0) {
+              questions.push({
+                question: message || `${serverName} is requesting input`,
+                options: [],
+                multiSelect: false,
+              });
+            }
+
+            const questionMsg: ServerMessage = {
+              type: "question",
+              questionId: qId,
+              questions,
+              sessionId: this.sessionId || "",
+              mcpServerName: serverName,
+            } as any;
+            this.send(questionMsg);
+
+            if (this.sessionId) {
+              appendHistory(this.sessionId, {
+                role: "question",
+                content: "",
+                questionId: qId,
+                questions,
+                timestamp: new Date().toISOString(),
+              });
+            }
+
+            const answers = await new Promise<Record<string, string>>((resolve) => {
+              this.pendingQuestions.set(qId, { questionId: qId, resolve, questionData: questionMsg });
+            });
+
+            // Check if user cancelled
+            const firstAnswer = Object.values(answers)[0] || "";
+            if (firstAnswer.toLowerCase() === "cancel" || firstAnswer.toLowerCase() === "decline") {
+              return { action: "decline" as const };
+            }
+
+            // Map answers back to the schema structure
+            const content: Record<string, unknown> = {};
+            if (requestedSchema && (requestedSchema as any).properties) {
+              const props = (requestedSchema as any).properties;
+              for (const [key] of Object.entries(props)) {
+                if (answers[key] !== undefined) {
+                  content[key] = answers[key];
+                }
+              }
+            } else {
+              // Single-field fallback
+              const val = Object.values(answers)[0];
+              if (val) content["value"] = val;
+            }
+
+            return { action: "accept" as const, content };
           },
         },
       });
@@ -1472,6 +1636,16 @@ export class ClaudeSession {
           if (event?.type === "message_delta" && event.usage) {
             lastTurnOutputTokens = event.usage.output_tokens || 0;
             console.log(`[Usage] message_delta: output=${lastTurnOutputTokens}`);
+            // Send updated usage with output tokens so the app can display them in real-time
+            this.send({
+              type: "usage_update",
+              inputTokens: lastTurnInputTokens,
+              outputTokens: lastTurnOutputTokens,
+              cacheReadTokens: lastTurnCacheReadTokens,
+              cacheCreateTokens: lastTurnCacheCreateTokens,
+              contextWindow: this._lastContextWindow,
+              sessionId: this.sessionId || "",
+            } as any);
           }
         }
 

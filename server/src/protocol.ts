@@ -534,6 +534,97 @@ export interface ScheduledTaskNotificationServerMessage {
   sessionId: string;
 }
 
+// SDK event forwarding messages
+
+export interface RateLimitEventServerMessage {
+  type: "rate_limit_event";
+  status: string;
+  resetsAt?: string;
+  utilization?: number;
+  rateLimitType?: string;
+  sessionId: string;
+}
+
+export interface TaskStartedServerMessage {
+  type: "task_started";
+  taskId: string;
+  toolUseId?: string;
+  description: string;
+  taskType?: string;
+  prompt?: string;
+  sessionId: string;
+}
+
+export interface BgTaskProgressServerMessage {
+  type: "bg_task_progress";
+  taskId: string;
+  description?: string;
+  usage?: Record<string, unknown>;
+  lastToolName?: string;
+  summary?: string;
+  sessionId: string;
+}
+
+export interface ApiRetryServerMessage {
+  type: "api_retry";
+  attempt: number;
+  maxRetries: number;
+  delayMs: number;
+  errorStatus?: number;
+  sessionId: string;
+}
+
+export interface LocalCommandOutputServerMessage {
+  type: "local_command_output";
+  content: string;
+  sessionId: string;
+}
+
+export interface PromptSuggestionServerMessage {
+  type: "prompt_suggestion";
+  suggestion: string;
+  sessionId: string;
+}
+
+export interface SessionLifecycleServerMessage {
+  type: "session_lifecycle";
+  event: "start" | "end";
+  source?: string;
+  reason?: string;
+  model?: string;
+  agentType?: string;
+  sessionId: string;
+}
+
+export interface TaskCompletedHookServerMessage {
+  type: "task_completed_hook";
+  taskId: string;
+  subject: string;
+  description?: string;
+  teammateName?: string;
+  sessionId: string;
+}
+
+export interface ElicitationUrlServerMessage {
+  type: "elicitation_url";
+  questionId: string;
+  mcpServerName: string;
+  message: string;
+  url: string;
+  elicitationId?: string;
+  sessionId: string;
+}
+
+export interface UsageUpdateServerMessage {
+  type: "usage_update";
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheCreateTokens: number;
+  contextWindow: number;
+  sessionId: string;
+}
+
 export type ServerMessage =
   | TextServerMessage
   | ToolCallServerMessage
@@ -561,4 +652,14 @@ export type ServerMessage =
   | ActiveSubagentsServerMessage
   | ScheduledTaskListServerMessage
   | ScheduledTaskUpdateServerMessage
-  | ScheduledTaskNotificationServerMessage;
+  | ScheduledTaskNotificationServerMessage
+  | RateLimitEventServerMessage
+  | TaskStartedServerMessage
+  | BgTaskProgressServerMessage
+  | ApiRetryServerMessage
+  | LocalCommandOutputServerMessage
+  | PromptSuggestionServerMessage
+  | SessionLifecycleServerMessage
+  | TaskCompletedHookServerMessage
+  | ElicitationUrlServerMessage
+  | UsageUpdateServerMessage;
