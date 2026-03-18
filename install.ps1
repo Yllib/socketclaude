@@ -298,8 +298,8 @@ if ($existing) {
 $batFile = Join-Path $SERVER_DIR "run-service.bat"
 $batContent = @"
 @echo off
-set HOME=$env:USERPROFILE
-cd /d $SERVER_DIR
+set "HOME=$env:USERPROFILE"
+cd /d "$SERVER_DIR"
 :loop
 "$nodeExe" "$serverScript" >> "$LOG_FILE" 2>&1
 echo Server exited (%ERRORLEVEL%), restarting in 5s...
@@ -310,7 +310,8 @@ Set-Content -Path $batFile -Value $batContent -Encoding ASCII
 Write-Ok "Generated run-service.bat"
 
 $action = New-ScheduledTaskAction `
-    -Execute $batFile `
+    -Execute "cmd.exe" `
+    -Argument "/c `"$batFile`"" `
     -WorkingDirectory $SERVER_DIR
 
 # Trigger: at system startup (runs whether user is logged in or not)
@@ -341,6 +342,27 @@ Register-ScheduledTask `
     -Description "SocketClaude WebSocket server" | Out-Null
 
 Write-Ok "Registered as scheduled task '$TASK_NAME'"
+
+# Add Windows Firewall rule (requires admin — skip silently if not elevated)
+$fwRuleName = "SocketClaude Server (TCP $Port)"
+try {
+    $existingRule = Get-NetFirewallRule -DisplayName $fwRuleName -ErrorAction SilentlyContinue
+    if (-not $existingRule) {
+        New-NetFirewallRule `
+            -DisplayName $fwRuleName `
+            -Direction Inbound `
+            -Action Allow `
+            -Protocol TCP `
+            -LocalPort $Port `
+            -Profile Private,Domain `
+            -Description "Allow inbound connections to SocketClaude server" | Out-Null
+        Write-Ok "Firewall rule added for port $Port (Private/Domain networks)"
+    } else {
+        Write-Ok "Firewall rule already exists for port $Port"
+    }
+} catch {
+    Write-Warn "Could not add firewall rule (requires admin). You may need to allow port $Port manually."
+}
 
 # Start immediately
 Start-ScheduledTask -TaskName $TASK_NAME
