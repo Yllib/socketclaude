@@ -17,6 +17,29 @@ import { loadOrCreateKeyPair, toBase64 } from "./relay-crypto";
 
 const PORT = parseInt(process.env.PORT || "8085", 10);
 const DEFAULT_CWD = process.env.DEFAULT_CWD || process.cwd();
+
+// ── .env migrations (run once on startup, before reading config) ──
+(function migrateEnv() {
+  const envPath = path.join(__dirname, "..", ".env");
+  if (!fs.existsSync(envPath)) return;
+  let content = fs.readFileSync(envPath, "utf-8");
+  const migrations: [RegExp, string, string][] = [
+    [/^RELAY_URL=ws:\/\/jarofdirt\.info:9988$/m, "RELAY_URL=wss://relay.jarofdirt.info", "relay URL to wss://relay.jarofdirt.info"],
+  ];
+  let changed = false;
+  for (const [pattern, replacement, desc] of migrations) {
+    if (pattern.test(content)) {
+      content = content.replace(pattern, replacement);
+      console.log(`[Migrate] Updated .env: ${desc}`);
+      changed = true;
+    }
+  }
+  if (changed) {
+    fs.writeFileSync(envPath, content);
+    dotenv.config({ path: envPath, override: true });
+  }
+})();
+
 const RELAY_URL = process.env.RELAY_URL || "";
 
 // Auth token — read from .env or generate and persist one
