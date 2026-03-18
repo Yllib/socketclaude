@@ -293,16 +293,28 @@ if ($existing) {
     Write-Host "  Removed existing task"
 }
 
-# Build action: cmd.exe wrapper for output redirection
-# Set HOME so Node.js can find ~/.claude-assistant/ and ~/.claude/
-$cmdArgs = "/c set HOME=$env:USERPROFILE && `"$nodeExe`" `"$serverScript`" >> `"$LOG_FILE`" 2>&1"
+# Generate run-service.bat with restart loop
+# This ensures the server auto-restarts after updates (process.exit(1))
+$batFile = Join-Path $SERVER_DIR "run-service.bat"
+$batContent = @"
+@echo off
+set HOME=$env:USERPROFILE
+cd /d $SERVER_DIR
+:loop
+"$nodeExe" "$serverScript" >> "$LOG_FILE" 2>&1
+echo Server exited (%ERRORLEVEL%), restarting in 5s...
+timeout /t 5 /nobreak >nul
+goto loop
+"@
+Set-Content -Path $batFile -Value $batContent -Encoding ASCII
+Write-Ok "Generated run-service.bat"
+
 $action = New-ScheduledTaskAction `
-    -Execute "cmd.exe" `
-    -Argument $cmdArgs `
+    -Execute $batFile `
     -WorkingDirectory $SERVER_DIR
 
-# Trigger: at user logon
-$trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+# Trigger: at system startup (runs whether user is logged in or not)
+$trigger = New-ScheduledTaskTrigger -AtStartup
 
 # Settings: run indefinitely, restart on failure, allow on battery
 $settings = New-ScheduledTaskSettingsSet `
@@ -310,14 +322,14 @@ $settings = New-ScheduledTaskSettingsSet `
     -DontStopIfGoingOnBatteries `
     -DontStopOnIdleEnd `
     -ExecutionTimeLimit ([TimeSpan]::Zero) `
-    -RestartCount 3 `
+    -RestartCount 999 `
     -RestartInterval (New-TimeSpan -Minutes 1) `
     -StartWhenAvailable
 
-# Principal: current user, interactive (no password needed)
+# Principal: current user, S4U logon (runs without active desktop session)
 $principal = New-ScheduledTaskPrincipal `
     -UserId $env:USERNAME `
-    -LogonType Interactive `
+    -LogonType S4U `
     -RunLevel Limited
 
 Register-ScheduledTask `
