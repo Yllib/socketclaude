@@ -22,7 +22,7 @@ param(
 $ErrorActionPreference = "Stop"
 
 # ── Configuration ──
-$RELAY_URL = "ws://jarofdirt.info:9988"
+$RELAY_URL = "wss://relay.jarofdirt.info"
 $TASK_NAME = "SocketClaude"
 $NODE_MIN_VERSION = [version]"18.0.0"
 
