@@ -14,7 +14,7 @@ set -euo pipefail
 #
 # Re-running is safe — existing tokens and pairings are preserved.
 
-RELAY_URL="ws://jarofdirt.info:9988"
+RELAY_URL="wss://relay.jarofdirt.info"
 SERVICE_NAME="socketclaude"
 NODE_MIN_VERSION=22
 PORT=8085
