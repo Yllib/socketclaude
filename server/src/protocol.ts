@@ -252,7 +252,10 @@ export type ClientMessage =
   | DeleteScheduledTaskMessage
   | { type: "auth_code"; code: string; sessionId?: string }
   | { type: "version_check" }
-  | { type: "force_update" };
+  | { type: "force_update" }
+  | { type: "get_recent_cwds" }
+  | { type: "add_recent_cwd"; cwd: string }
+  | { type: "remove_recent_cwd"; cwd: string };
 
 // ── Server → Client messages ──
 

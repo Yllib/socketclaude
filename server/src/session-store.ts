@@ -67,6 +67,44 @@ export function remapSession(oldId: string, newId: string): void {
   }
 }
 
+// ── Recent CWDs (persisted per-server) ──
+
+const RECENT_CWDS_FILE = path.join(STORE_DIR, "recent-cwds.json");
+const MAX_RECENT_CWDS = 20;
+
+function readRecentCwds(): string[] {
+  ensureStoreDir();
+  if (!fs.existsSync(RECENT_CWDS_FILE)) return [];
+  try {
+    return JSON.parse(fs.readFileSync(RECENT_CWDS_FILE, "utf-8")) as string[];
+  } catch {
+    return [];
+  }
+}
+
+function writeRecentCwds(cwds: string[]): void {
+  ensureStoreDir();
+  fs.writeFileSync(RECENT_CWDS_FILE, JSON.stringify(cwds, null, 2), "utf-8");
+}
+
+export function getRecentCwds(): string[] {
+  return readRecentCwds();
+}
+
+export function addRecentCwd(cwd: string): string[] {
+  const cwds = readRecentCwds().filter(c => c !== cwd);
+  cwds.unshift(cwd);
+  if (cwds.length > MAX_RECENT_CWDS) cwds.length = MAX_RECENT_CWDS;
+  writeRecentCwds(cwds);
+  return cwds;
+}
+
+export function removeRecentCwd(cwd: string): string[] {
+  const cwds = readRecentCwds().filter(c => c !== cwd);
+  writeRecentCwds(cwds);
+  return cwds;
+}
+
 export function updateSessionActivity(
   id: string,
   messagePreview: string,

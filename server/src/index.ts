@@ -7,7 +7,7 @@ import * as http from "http";
 import * as path from "path";
 import { WebSocketServer, WebSocket } from "ws";
 import { ClaudeSession } from "./claude-session";
-import { listSessions, getSession, saveSession, getHistory, getHistoryPage, getHistoryPageToLastPrompt, deleteSession, clearSessionContext, cleanupPendingToolCalls, getTodos, getMissedMessages, appendHistory, getSdkEvents, markQuestionAnswered, getLastHistoryTimestamp, listSdkSessions } from "./session-store";
+import { listSessions, getSession, saveSession, getHistory, getHistoryPage, getHistoryPageToLastPrompt, deleteSession, clearSessionContext, cleanupPendingToolCalls, getTodos, getMissedMessages, appendHistory, getSdkEvents, markQuestionAnswered, getLastHistoryTimestamp, listSdkSessions, getRecentCwds, addRecentCwd, removeRecentCwd } from "./session-store";
 import { listScheduledTasks, getScheduledTask, saveScheduledTask, deleteScheduledTask, getDueTasks, getNextRunTime, getScheduledTaskSessionIds, ScheduledTask } from "./scheduled-task-store";
 import { DesktopCliWatcher } from "./desktop-cli-watcher";
 import { ClientMessage, SessionInfo } from "./protocol";
@@ -240,6 +240,7 @@ function createConnectionHandler(transport: ClientTransport) {
         activeSession.setThinking(pendingThinking);
         activeSession.setDisallowedTools(pendingDisallowedTools);
         activeSession.setAppendSystemPrompt(pendingSystemPrompt);
+        addRecentCwd(cwd);
         sendJson({
           type: "session_created",
           sessionId: "",
@@ -579,6 +580,29 @@ function createConnectionHandler(transport: ClientTransport) {
           type: "session_list",
           sessions: getEnrichedSessions(),
         });
+        break;
+      }
+
+      case "get_recent_cwds": {
+        sendJson({ type: "recent_cwds", cwds: getRecentCwds() });
+        break;
+      }
+
+      case "add_recent_cwd": {
+        const cwd = (msg as any).cwd as string;
+        if (cwd) {
+          const cwds = addRecentCwd(cwd);
+          sendJson({ type: "recent_cwds", cwds });
+        }
+        break;
+      }
+
+      case "remove_recent_cwd": {
+        const cwd = (msg as any).cwd as string;
+        if (cwd) {
+          const cwds = removeRecentCwd(cwd);
+          sendJson({ type: "recent_cwds", cwds });
+        }
         break;
       }
 
