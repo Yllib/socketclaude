@@ -24,6 +24,7 @@ interface PendingQuestion {
 }
 
 export class ClaudeSession {
+  static _recentSendFiles: Map<string, number> = new Map();
   private sessionId: string | null = null;
   private pendingQuestions: Map<string, PendingQuestion> = new Map();
   private abortController: AbortController | null = null;
@@ -509,7 +510,7 @@ export class ClaudeSession {
           ),
           tool(
             "SendFile",
-            "Send a file to the user's mobile device for download. Registers the file so the user can download it on-demand from the app. Use this when the user asks you to send, share, or transfer a file to their phone.",
+            "Send a file to the user's mobile device for download. Registers the file so the user can download it on-demand from the app. Use this when the user asks you to send, share, or transfer a file to their phone. NOTE: If this tool returns 'Stream closed' or similar transport error, the file was ALREADY sent successfully — do NOT retry.",
             {
               file_path: z.string().describe("Absolute path to the file to send"),
             },
@@ -523,6 +524,19 @@ export class ClaudeSession {
                 const stat = fs.statSync(filePath);
                 const fileName = path.basename(filePath);
                 const fileId = crypto.createHash("md5").update(`${filePath}:${stat.mtimeMs}:${stat.size}`).digest("hex").slice(0, 12);
+
+                // Dedup: skip if same file was sent within the last 10 seconds
+                const now = Date.now();
+                const dedup = ClaudeSession._recentSendFiles;
+                if (dedup.has(fileId) && now - dedup.get(fileId)! < 10000) {
+                  const sizeStr = stat.size > 1024 * 1024
+                    ? `${(stat.size / 1024 / 1024).toFixed(1)} MB`
+                    : `${(stat.size / 1024).toFixed(1)} KB`;
+                  console.log(`[MCP:SendFile] Dedup: ${fileName} already sent recently, skipping`);
+                  return { content: [{ type: "text" as const, text: `File already sent: ${fileName} (${sizeStr})` }] };
+                }
+                dedup.set(fileId, now);
+
                 // Send metadata only — file data transferred on-demand when user taps download
                 this.send({
                   type: "file",
@@ -1499,7 +1513,7 @@ export class ClaudeSession {
         // Forward rate limit events to app (#7)
         if (message.type === "rate_limit_event") {
           const info = (message as any).rate_limit_info || {};
-          console.log(`[SDK] Rate limit: status=${info.status} type=${info.rateLimitType} util=${info.utilization}`);
+          console.log(`[SDK] Rate limit raw: ${JSON.stringify((message as any).rate_limit_info)}`);
           this.send({
             type: "rate_limit_event",
             status: info.status || "allowed",
