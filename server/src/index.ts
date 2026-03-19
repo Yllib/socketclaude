@@ -744,8 +744,8 @@ function createConnectionHandler(transport: ClientTransport) {
           const branch = execSync("git rev-parse --abbrev-ref HEAD", { cwd: GIT_ROOT, stdio: "pipe" }).toString().trim();
           const beforeHash = execSync("git rev-parse HEAD", { cwd: GIT_ROOT, stdio: "pipe" }).toString().trim();
 
-          // Pull
-          execSync(`git pull origin ${branch}`, { cwd: GIT_ROOT, stdio: "pipe", timeout: 60000 });
+          // Pull (rebase to handle local commits that diverged from origin)
+          execSync(`git pull --rebase origin ${branch}`, { cwd: GIT_ROOT, stdio: "pipe", timeout: 60000 });
           const afterHash = execSync("git rev-parse HEAD", { cwd: GIT_ROOT, stdio: "pipe" }).toString().trim();
 
           if (beforeHash === afterHash) {
@@ -1933,8 +1933,8 @@ async function checkForUpdates(): Promise<void> {
 
     console.log(`[Auto-update] Updating ${local.substring(0, 7)} → ${remote.substring(0, 7)}...`);
 
-    // Pull
-    execSync(`git pull origin ${branch}`, { cwd: GIT_ROOT, stdio: "pipe", timeout: 60000 });
+    // Pull (rebase to handle local commits that diverged from origin)
+    execSync(`git pull --rebase origin ${branch}`, { cwd: GIT_ROOT, stdio: "pipe", timeout: 60000 });
 
     // Compile TypeScript — find the server dir (could be repo root or server/ subdir)
     const tscDir = fs.existsSync(path.join(GIT_ROOT, "server", "tsconfig.json"))
