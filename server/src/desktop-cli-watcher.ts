@@ -107,6 +107,8 @@ export class DesktopCliWatcher {
 
   private onQuiet(): void {
     if (this.stopped) return;
+    // Re-check: a new query may have started during the debounce window
+    if (this.opts.isOurQueryRunning()) return;
 
     console.log(`[DesktopCLI] Session ${this.opts.sessionId}: JSONL quiet, syncing messages`);
     this.syncMessages();
