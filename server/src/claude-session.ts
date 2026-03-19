@@ -1339,35 +1339,45 @@ export class ClaudeSession {
             });
 
             // Query available commands and agents (#18)
-            console.log(`[Init] Querying supportedCommands...`);
-            this.activeQuery.supportedCommands().then((commands: any) => {
-              console.log(`[Init] supportedCommands returned: ${Array.isArray(commands) ? commands.length + ' commands' : typeof commands}`);
-              if (commands && Array.isArray(commands) && commands.length > 0) {
-                this._lastSupportedCommands = {
-                  type: "supported_commands",
-                  commands,
-                  sessionId: this.sessionId || "",
-                } as any;
-                this.send(this._lastSupportedCommands!);
-              }
-            }).catch((e: any) => {
-              console.error(`[Init] Failed to get supported commands: ${e}`);
-            });
+            // Wrapped in try-catch: older SDK versions may not have these methods,
+            // and a synchronous TypeError would crash the message processing loop.
+            try {
+              console.log(`[Init] Querying supportedCommands...`);
+              this.activeQuery.supportedCommands().then((commands: any) => {
+                console.log(`[Init] supportedCommands returned: ${Array.isArray(commands) ? commands.length + ' commands' : typeof commands}`);
+                if (commands && Array.isArray(commands) && commands.length > 0) {
+                  this._lastSupportedCommands = {
+                    type: "supported_commands",
+                    commands,
+                    sessionId: this.sessionId || "",
+                  } as any;
+                  this.send(this._lastSupportedCommands!);
+                }
+              }).catch((e: any) => {
+                console.error(`[Init] Failed to get supported commands: ${e}`);
+              });
+            } catch (e) {
+              console.warn(`[Init] supportedCommands not available: ${e}`);
+            }
 
-            console.log(`[Init] Querying supportedAgents...`);
-            this.activeQuery.supportedAgents().then((agents: any) => {
-              console.log(`[Init] supportedAgents returned: ${Array.isArray(agents) ? agents.length + ' agents' : typeof agents}`);
-              if (agents && Array.isArray(agents) && agents.length > 0) {
-                this._lastSupportedAgents = {
-                  type: "supported_agents",
-                  agents,
-                  sessionId: this.sessionId || "",
-                } as any;
-                this.send(this._lastSupportedAgents!);
-              }
-            }).catch((e: any) => {
-              console.error(`[Init] Failed to get supported agents: ${e}`);
-            });
+            try {
+              console.log(`[Init] Querying supportedAgents...`);
+              this.activeQuery.supportedAgents().then((agents: any) => {
+                console.log(`[Init] supportedAgents returned: ${Array.isArray(agents) ? agents.length + ' agents' : typeof agents}`);
+                if (agents && Array.isArray(agents) && agents.length > 0) {
+                  this._lastSupportedAgents = {
+                    type: "supported_agents",
+                    agents,
+                    sessionId: this.sessionId || "",
+                  } as any;
+                  this.send(this._lastSupportedAgents!);
+                }
+              }).catch((e: any) => {
+                console.error(`[Init] Failed to get supported agents: ${e}`);
+              });
+            } catch (e) {
+              console.warn(`[Init] supportedAgents not available: ${e}`);
+            }
           }
 
           // Log user prompt now that we have the session ID (for new sessions)
