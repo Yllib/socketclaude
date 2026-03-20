@@ -989,6 +989,67 @@ function createConnectionHandler(transport: ClientTransport) {
         break;
       }
 
+      case "skills_list": {
+        let projectCwd: string | undefined;
+        if (activeSession) {
+          projectCwd = activeSession.getCwd?.();
+        }
+        if (!projectCwd) projectCwd = DEFAULT_CWD;
+        const skills = listSkills(projectCwd);
+        sendJson({ type: "skills_list", skills, projectCwd });
+        break;
+      }
+
+      case "skills_save": {
+        const data = msg as any;
+        if (!data.name || !data.format || !data.scope) {
+          sendJson({ type: "skills_save_result", ok: false, error: "Missing required fields" });
+          break;
+        }
+        try {
+          let projectCwd: string | undefined;
+          if (activeSession) projectCwd = activeSession.getCwd?.();
+          if (!projectCwd) projectCwd = DEFAULT_CWD;
+          const savedPath = saveSkill({
+            filePath: data.filePath || undefined,
+            name: data.name,
+            scope: data.scope,
+            format: data.format,
+            frontmatter: data.frontmatter || {},
+            body: data.body || "",
+            projectCwd,
+          });
+          sendJson({ type: "skills_save_result", ok: true, filePath: savedPath });
+        } catch (err: any) {
+          sendJson({ type: "skills_save_result", ok: false, error: err.message || "Save failed" });
+        }
+        break;
+      }
+
+      case "skills_delete": {
+        const data = msg as any;
+        if (!data.filePath) {
+          sendJson({ type: "skills_delete_result", ok: false, error: "Missing filePath" });
+          break;
+        }
+        const home = require("os").homedir();
+        const normalized = require("path").resolve(data.filePath);
+        const isUserScope = normalized.startsWith(require("path").join(home, ".claude"));
+        let isProjectScope = false;
+        let projectCwd: string | undefined;
+        if (activeSession) projectCwd = activeSession.getCwd?.();
+        if (projectCwd) {
+          isProjectScope = normalized.startsWith(require("path").join(projectCwd, ".claude"));
+        }
+        if (!isUserScope && !isProjectScope) {
+          sendJson({ type: "skills_delete_result", ok: false, error: "Cannot delete files outside .claude directories" });
+          break;
+        }
+        const ok = deleteSkill(normalized);
+        sendJson({ type: "skills_delete_result", ok });
+        break;
+      }
+
       case "mcp_status": {
         if (activeSession) {
           activeSession.mcpServerStatus().then(status => {

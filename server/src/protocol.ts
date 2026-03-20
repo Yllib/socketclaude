@@ -270,7 +270,10 @@ export type ClientMessage =
   | { type: "force_update" }
   | { type: "get_recent_cwds" }
   | { type: "add_recent_cwd"; cwd: string }
-  | { type: "remove_recent_cwd"; cwd: string };
+  | { type: "remove_recent_cwd"; cwd: string }
+  | { type: "skills_list" }
+  | { type: "skills_save"; name: string; scope: string; format: string; frontmatter: Record<string, string>; body: string; filePath?: string }
+  | { type: "skills_delete"; filePath: string };
 
 // ── Server → Client messages ──
 
