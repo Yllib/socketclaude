@@ -371,14 +371,16 @@ function createConnectionHandler(transport: ClientTransport) {
         // Always send status so the app resets its processing state on resume
         const resumeRunning = !!(existing && existing.isRunning);
         const resumeCompacting = !!(existing && existing.isCompacting);
+        const resumePermMode = existing?.permissionMode || null;
         const activeToolInfo = existing?.getActiveToolCall?.() || null;
-        console.log(`[Resume] sessionId=${msg.sessionId} existing=${!!existing} isRunning=${existing?.isRunning} compacting=${resumeCompacting} → sending running=${resumeRunning} activeToolUseId=${activeToolInfo?.toolUseId || 'none'}`);
+        console.log(`[Resume] sessionId=${msg.sessionId} existing=${!!existing} isRunning=${existing?.isRunning} compacting=${resumeCompacting} permMode=${resumePermMode} → sending running=${resumeRunning} activeToolUseId=${activeToolInfo?.toolUseId || 'none'}`);
         sendJson({
           type: "status",
           sessionId: msg.sessionId,
           running: resumeRunning,
           compacting: resumeCompacting,
           ...(activeToolInfo ? { activeToolUseId: activeToolInfo.toolUseId } : {}),
+          ...(resumePermMode ? { permissionMode: resumePermMode } : {}),
         });
 
         // Re-send accumulated bash output so the reconnecting client sees live output

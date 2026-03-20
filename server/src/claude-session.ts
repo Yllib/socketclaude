@@ -48,6 +48,7 @@ export class ClaudeSession {
   private _activeToolName: string | null = null;
   private _readToolPaths: Map<string, string> = new Map();  // toolUseId → file_path for Read tool calls
   private _isCompacting = false;  // whether context compaction is in progress
+  private _permissionMode: string | null = null;  // current permission mode (e.g., "plan")
   private _authErrorSent = false;  // suppress duplicate exit-code error after auth failure
   private _authState: string | null = null;  // OAuth state param from the auth URL
   private _lastContextWindow = 0;  // last known context window size from modelUsage
@@ -207,6 +208,10 @@ export class ClaudeSession {
 
   get isCompacting(): boolean {
     return this._isCompacting;
+  }
+
+  get permissionMode(): string | null {
+    return this._permissionMode;
   }
 
   /** Active background task IDs (agentId → toolUseId) */
@@ -1443,6 +1448,7 @@ export class ClaudeSession {
           } as any);
           // Forward permission mode changes (e.g., entering/exiting plan mode)
           if (permMode) {
+            this._permissionMode = permMode;
             this.send({
               type: "permission_mode_changed",
               permissionMode: permMode,
