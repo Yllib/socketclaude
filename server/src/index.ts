@@ -776,6 +776,15 @@ function createConnectionHandler(transport: ClientTransport) {
           const afterHash = execSync("git rev-parse HEAD", { cwd: GIT_ROOT, stdio: "pipe" }).toString().trim();
 
           if (beforeHash === afterHash) {
+            // If force flag is set, restart anyway (compiled code may differ from running)
+            if ((msg as any).forceRestart) {
+              sendJson({ type: "update_result", success: true, message: "Restarting (already up to date)", hash: afterHash, needsRestart: true });
+              setTimeout(() => {
+                console.log(`[ForceUpdate] Force restart requested (already up to date)`);
+                process.exit(1);
+              }, 1000);
+              break;
+            }
             sendJson({ type: "update_result", success: true, message: "Already up to date", hash: afterHash });
             break;
           }
