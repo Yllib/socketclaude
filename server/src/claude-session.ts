@@ -1,4 +1,4 @@
-import { query, createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
+import { query, createSdkMcpServer, tool, forkSession as sdkForkSession } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import * as crypto from "crypto";
 import { execFile } from "child_process";
@@ -131,6 +131,14 @@ export class ClaudeSession {
   setForkSource(sessionId: string): void {
     this._forkFromSessionId = sessionId;
     console.log(`Fork source set to ${sessionId}`);
+  }
+
+  private _resumeSessionAt?: string;
+
+  /** Set a message UUID to resume the conversation at (truncates conversation after this point) */
+  setResumeSessionAt(uuid: string): void {
+    this._resumeSessionAt = uuid;
+    console.log(`Resume-at set to ${uuid}`);
   }
 
   private _stoppedTasks: Set<string> = new Set();  // prevent duplicate stop notifications
@@ -664,7 +672,7 @@ export class ClaudeSession {
         }
       }
 
-      const toolContext = `You are a general-purpose personal assistant. You can schedule reminders for the user using the ScheduleReminder tool — use ISO 8601 datetime for the scheduledTime parameter. You can also schedule deferred tasks using the ScheduleTask tool — these create a new Claude session that runs automatically at the specified time. Supports recurring schedules (daily, weekly, monthly, or custom interval) and optionally reusing the same session across recurrences.${ttsInstruction}${pluginContext}`;
+      const toolContext = `You can schedule reminders for the user using the ScheduleReminder tool — use ISO 8601 datetime for the scheduledTime parameter. You can also schedule deferred tasks using the ScheduleTask tool — these create a new Claude session that runs automatically at the specified time. Supports recurring schedules (daily, weekly, monthly, or custom interval) and optionally reusing the same session across recurrences.${ttsInstruction}${pluginContext}`;
 
       // Handle fork: use fork source as resume target + set forkSession flag
       const shouldFork = !!this._forkFromSessionId;
@@ -675,7 +683,11 @@ export class ClaudeSession {
         ? forkSourceId
         : (resumeSessionId || this.sessionId || undefined);
 
-      console.log(`Starting query: resume=${resumeTarget || 'none'}${shouldFork ? ' (FORK)' : ''}, effort=${this._effort}, thinking=${JSON.stringify(this._thinking)}, prompt=${prompt.slice(0, 80)}..., cwd=${this.cwd}`);
+      // Consume resumeSessionAt (conversation rewind point)
+      const resumeAt = this._resumeSessionAt;
+      this._resumeSessionAt = undefined;
+
+      console.log(`Starting query: resume=${resumeTarget || 'none'}${shouldFork ? ' (FORK)' : ''}${resumeAt ? ` resumeAt=${resumeAt}` : ''}, effort=${this._effort}, thinking=${JSON.stringify(this._thinking)}, prompt=${prompt.slice(0, 80)}..., cwd=${this.cwd}`);
 
       const q = this.activeQuery = query({
         prompt: prompt,
@@ -686,6 +698,7 @@ export class ClaudeSession {
           includePartialMessages: true,
           resume: resumeTarget,
           forkSession: shouldFork || undefined,
+          resumeSessionAt: resumeAt,
           abortController: this.abortController,
           effort: this._effort as any,
           thinking: this._thinking as any,

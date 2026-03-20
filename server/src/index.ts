@@ -7,13 +7,14 @@ import * as http from "http";
 import * as path from "path";
 import { WebSocketServer, WebSocket } from "ws";
 import { ClaudeSession } from "./claude-session";
-import { listSessions, getSession, saveSession, getHistory, getHistoryPage, getHistoryPageToLastPrompt, deleteSession, clearSessionContext, cleanupPendingToolCalls, getTodos, getMissedMessages, appendHistory, getSdkEvents, markQuestionAnswered, getLastHistoryTimestamp, listSdkSessions, getRecentCwds, addRecentCwd, removeRecentCwd } from "./session-store";
+import { listSessions, getSession, saveSession, getHistory, getHistoryPage, getHistoryPageToLastPrompt, deleteSession, clearSessionContext, cleanupPendingToolCalls, getTodos, getMissedMessages, appendHistory, getSdkEvents, markQuestionAnswered, getLastHistoryTimestamp, listSdkSessions, getRecentCwds, addRecentCwd, removeRecentCwd, truncateHistoryAtMessage } from "./session-store";
 import { listScheduledTasks, getScheduledTask, saveScheduledTask, deleteScheduledTask, getDueTasks, getNextRunTime, getScheduledTaskSessionIds, ScheduledTask } from "./scheduled-task-store";
 import { DesktopCliWatcher } from "./desktop-cli-watcher";
 import { ClientMessage, SessionInfo } from "./protocol";
 import { SocketClaudePlugin, PluginContext } from "./plugin-api";
 import { RelayClient, RelayStatus } from "./relay-client";
 import { loadOrCreateKeyPair, toBase64 } from "./relay-crypto";
+import { listSkills, getSkill, saveSkill, deleteSkill } from "./skills-manager";
 
 const PORT = parseInt(process.env.PORT || "8085", 10);
 const DEFAULT_CWD = process.env.DEFAULT_CWD || process.cwd();
@@ -1032,7 +1033,7 @@ function createConnectionHandler(transport: ClientTransport) {
         } else if (!uuid) {
           sendJson({ type: "rewind_result", uuid, dryRun, success: false, error: "No message UUID" });
         } else if (!activeSession.isRunning) {
-          sendJson({ type: "rewind_result", uuid, dryRun, success: false, error: "No active query — rewind requires a running conversation. Send a message first, then rewind." });
+          sendJson({ type: "rewind_result", uuid, dryRun, success: false, error: "No active query — file-only rewind requires a running conversation. Use rewind_conversation to rewind when idle." });
         } else {
           activeSession.rewindFiles(uuid, dryRun).then(result => {
             if (!result) {
@@ -1043,6 +1044,202 @@ function createConnectionHandler(transport: ClientTransport) {
           }).catch(e => {
             sendJson({ type: "rewind_result", uuid, dryRun, success: false, error: e.message || String(e) });
           });
+        }
+        break;
+      }
+
+      case "rewind_conversation": {
+        const uuid = (msg as any).userMessageUuid as string;
+        const dryRun = (msg as any).dryRun === true;
+        const shouldRewindFiles = (msg as any).rewindFiles !== false; // default true
+        const sessionId = activeSession?.getSessionId();
+
+        if (!sessionId) {
+          sendJson({ type: "rewind_conversation_result", sessionId: "", success: false, userMessageUuid: uuid, error: "No active session" });
+          break;
+        }
+        if (!uuid) {
+          sendJson({ type: "rewind_conversation_result", sessionId, success: false, userMessageUuid: uuid, error: "No message UUID" });
+          break;
+        }
+
+        // Dry run: preview what would be removed without actually doing it
+        if (dryRun) {
+          const all = getHistory(sessionId);
+          const idx = all.findIndex((e) => e.uuid === uuid);
+          if (idx === -1) {
+            sendJson({ type: "rewind_conversation_result", sessionId, success: false, userMessageUuid: uuid, dryRun: true, error: "Message UUID not found in history" });
+          } else {
+            const messagesRemoved = all.length - (idx + 1);
+            // Also do a file rewind dry run if requested and query is active
+            let fileInfo: any = {};
+            if (shouldRewindFiles && activeSession?.isRunning) {
+              try {
+                const fileResult = await activeSession.rewindFiles(uuid, true);
+                if (fileResult) {
+                  fileInfo = { filesReverted: fileResult.filesChanged, insertions: fileResult.insertions, deletions: fileResult.deletions };
+                }
+              } catch {}
+            }
+            sendJson({ type: "rewind_conversation_result", sessionId, success: true, userMessageUuid: uuid, dryRun: true, messagesRemoved, ...fileInfo });
+          }
+          break;
+        }
+
+        // Actual rewind: abort active query, rewind files, truncate history, prepare for resume-at
+        try {
+          // Step 1: Rewind files (if requested) and abort active query
+          if (activeSession && activeSession.isRunning) {
+            if (shouldRewindFiles) {
+              try {
+                await activeSession.rewindFiles(uuid, false);
+              } catch (e: any) {
+                console.log(`[RewindConversation] File rewind failed (non-fatal): ${e.message || e}`);
+              }
+            }
+            // Abort the current query
+            activeSession.abort();
+            activeSessions.delete(sessionId);
+          }
+
+          // Step 2: Truncate our local history
+          const { removed } = truncateHistoryAtMessage(sessionId, uuid);
+
+          // Step 3: Create a new session primed to resume-at this point
+          const sessionInfo = getSession(sessionId);
+          const cwd = sessionInfo?.cwd || activeSession?.getCwd() || process.env.DEFAULT_CWD || process.env.HOME || "/";
+          activeSession = new ClaudeSession(transport as any, cwd, plugins);
+          activeSession.setTtsEnabled(pendingTtsEnabled);
+          activeSession.setTtsEngine(pendingTtsEngine);
+          activeSession.setKokoroVoice(pendingKokoroVoice);
+          activeSession.setKokoroSpeed(pendingKokoroSpeed);
+          activeSession.setEffort(pendingEffort);
+          activeSession.setThinking(pendingThinking);
+          activeSession.setDisallowedTools(pendingDisallowedTools);
+          activeSession.setAppendSystemPrompt(pendingSystemPrompt);
+          activeSession.setResumeSessionAt(uuid);
+          // Store the session ID so the next prompt resumes this session at the rewind point
+          (activeSession as any)._resumeSessionId = sessionId;
+
+          sendJson({
+            type: "rewind_conversation_result",
+            sessionId,
+            success: true,
+            userMessageUuid: uuid,
+            messagesRemoved: removed >= 0 ? removed : 0,
+          });
+
+          // Send truncated history so app can update its UI
+          const page = getHistoryPageToLastPrompt(sessionId);
+          sendJson({
+            type: "session_history",
+            sessionId,
+            messages: page.entries,
+            total: page.total,
+            offset: page.offset,
+          });
+
+          broadcastSessionList();
+        } catch (e: any) {
+          sendJson({ type: "rewind_conversation_result", sessionId, success: false, userMessageUuid: uuid, error: e.message || String(e) });
+        }
+        break;
+      }
+
+      case "branch_from_message": {
+        const sourceId = (msg as any).sessionId as string;
+        const branchUuid = (msg as any).userMessageUuid as string;
+        if (!sourceId) {
+          sendJson({ type: "branch_result", success: false, originalSessionId: "", branchPointUuid: branchUuid, error: "No session ID" });
+          break;
+        }
+        if (!branchUuid) {
+          sendJson({ type: "branch_result", success: false, originalSessionId: sourceId, branchPointUuid: "", error: "No branch point UUID" });
+          break;
+        }
+        const sessionInfo = getSession(sourceId);
+        if (!sessionInfo) {
+          sendJson({ type: "branch_result", success: false, originalSessionId: sourceId, branchPointUuid: branchUuid, error: "Session not found" });
+          break;
+        }
+
+        try {
+          // Use SDK's forkSession with upToMessageId to create a branch at the specific message
+          const { forkSession: sdkFork } = require("@anthropic-ai/claude-agent-sdk");
+          const result = await sdkFork(sourceId, {
+            upToMessageId: branchUuid,
+            dir: sessionInfo.cwd,
+          });
+
+          const newSessionId = result.sessionId;
+
+          // Copy truncated history for the new branch
+          const allHistory = getHistory(sourceId);
+          const branchIdx = allHistory.findIndex((e) => e.uuid === branchUuid);
+          if (branchIdx !== -1) {
+            const branchHistory = allHistory.slice(0, branchIdx + 1);
+            for (const entry of branchHistory) {
+              appendHistory(newSessionId, entry);
+            }
+          }
+
+          // Save the new session in our store
+          saveSession({
+            id: newSessionId,
+            title: `${sessionInfo.title || "Untitled"} (branch)`,
+            cwd: sessionInfo.cwd,
+            createdAt: new Date().toISOString(),
+            lastActive: new Date().toISOString(),
+            messagePreview: `Branched from ${sourceId.substring(0, 8)}...`,
+          });
+
+          // Detach current session if running
+          if (activeSession && activeSession.isRunning) {
+            activeSession.detachWebSocket();
+          }
+
+          // Set up new session ready to resume the fork
+          activeSession = new ClaudeSession(transport as any, sessionInfo.cwd, plugins);
+          activeSession.setTtsEnabled(pendingTtsEnabled);
+          activeSession.setTtsEngine(pendingTtsEngine);
+          activeSession.setKokoroVoice(pendingKokoroVoice);
+          activeSession.setKokoroSpeed(pendingKokoroSpeed);
+          activeSession.setEffort(pendingEffort);
+          activeSession.setThinking(pendingThinking);
+          activeSession.setDisallowedTools(pendingDisallowedTools);
+          activeSession.setAppendSystemPrompt(pendingSystemPrompt);
+          (activeSession as any)._resumeSessionId = newSessionId;
+
+          sendJson({
+            type: "branch_result",
+            success: true,
+            originalSessionId: sourceId,
+            newSessionId,
+            branchPointUuid: branchUuid,
+            cwd: sessionInfo.cwd,
+          });
+
+          // Send the new session creation and history
+          sendJson({
+            type: "session_created",
+            sessionId: newSessionId,
+            cwd: sessionInfo.cwd,
+          });
+
+          const branchPage = getHistoryPage(newSessionId, 50);
+          sendJson({
+            type: "session_history",
+            sessionId: newSessionId,
+            messages: branchPage.entries,
+            total: branchPage.total,
+            offset: branchPage.offset,
+          });
+
+          broadcastSessionList();
+          console.log(`Branched session ${sourceId} at message ${branchUuid} → new session ${newSessionId}`);
+        } catch (e: any) {
+          console.error(`[Branch] Failed: ${e.message || e}`);
+          sendJson({ type: "branch_result", success: false, originalSessionId: sourceId, branchPointUuid: branchUuid, error: e.message || String(e) });
         }
         break;
       }
@@ -1474,6 +1671,120 @@ const httpServer = http.createServer((req, res) => {
     readStream.on("error", (err) => {
       console.error(`[HTTP Download] Error streaming ${fileName}:`, err);
       res.end();
+    });
+    return;
+  }
+
+  // GET /skills — list all skills/commands across user, project, and plugin scopes
+  if (req.method === "GET" && req.url?.startsWith("/skills")) {
+    const url = new URL(req.url, `http://localhost:${PORT}`);
+    const token = url.searchParams.get("token");
+    if (token !== AUTH_TOKEN) {
+      res.writeHead(401);
+      res.end("Unauthorized");
+      return;
+    }
+    // Use the CWD of the first active session for project-level scanning
+    let projectCwd: string | undefined;
+    for (const [, session] of activeSessions) {
+      const cwd = session.getCwd?.();
+      if (cwd) { projectCwd = cwd; break; }
+    }
+    if (!projectCwd) projectCwd = DEFAULT_CWD;
+    const skills = listSkills(projectCwd);
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ skills, projectCwd }));
+    return;
+  }
+
+  // PUT /skills — create or update a skill/command
+  if (req.method === "PUT" && req.url?.startsWith("/skills")) {
+    const url = new URL(req.url, `http://localhost:${PORT}`);
+    const token = url.searchParams.get("token");
+    if (token !== AUTH_TOKEN) {
+      res.writeHead(401);
+      res.end("Unauthorized");
+      return;
+    }
+    let body = "";
+    req.on("data", (chunk: Buffer) => { body += chunk.toString(); });
+    req.on("end", () => {
+      try {
+        const data = JSON.parse(body);
+        if (!data.name || !data.format || !data.scope) {
+          res.writeHead(400);
+          res.end("Missing required fields: name, format, scope");
+          return;
+        }
+        let projectCwd: string | undefined;
+        for (const [, session] of activeSessions) {
+          const cwd = session.getCwd?.();
+          if (cwd) { projectCwd = cwd; break; }
+        }
+        if (!projectCwd) projectCwd = DEFAULT_CWD;
+        const savedPath = saveSkill({
+          filePath: data.filePath || undefined,
+          name: data.name,
+          scope: data.scope,
+          format: data.format,
+          frontmatter: data.frontmatter || {},
+          body: data.body || "",
+          projectCwd,
+        });
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, filePath: savedPath }));
+      } catch (err: any) {
+        res.writeHead(500);
+        res.end(err.message || "Server error");
+      }
+    });
+    return;
+  }
+
+  // DELETE /skills — delete a skill/command by file path
+  if (req.method === "DELETE" && req.url?.startsWith("/skills")) {
+    const url = new URL(req.url, `http://localhost:${PORT}`);
+    const token = url.searchParams.get("token");
+    if (token !== AUTH_TOKEN) {
+      res.writeHead(401);
+      res.end("Unauthorized");
+      return;
+    }
+    let body = "";
+    req.on("data", (chunk: Buffer) => { body += chunk.toString(); });
+    req.on("end", () => {
+      try {
+        const data = JSON.parse(body);
+        if (!data.filePath) {
+          res.writeHead(400);
+          res.end("Missing filePath");
+          return;
+        }
+        // Safety: only allow deleting files under ~/.claude/ or project .claude/
+        const home = require("os").homedir();
+        const normalized = require("path").resolve(data.filePath);
+        const isUserScope = normalized.startsWith(require("path").join(home, ".claude"));
+        let isProjectScope = false;
+        let projectCwd: string | undefined;
+        for (const [, session] of activeSessions) {
+          const cwd = session.getCwd?.();
+          if (cwd) { projectCwd = cwd; break; }
+        }
+        if (projectCwd) {
+          isProjectScope = normalized.startsWith(require("path").join(projectCwd, ".claude"));
+        }
+        if (!isUserScope && !isProjectScope) {
+          res.writeHead(403);
+          res.end("Cannot delete files outside .claude directories");
+          return;
+        }
+        const ok = deleteSkill(normalized);
+        res.writeHead(ok ? 200 : 404, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok }));
+      } catch (err: any) {
+        res.writeHead(500);
+        res.end(err.message || "Server error");
+      }
     });
     return;
   }

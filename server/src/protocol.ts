@@ -166,6 +166,19 @@ export interface RewindMessage {
   dryRun?: boolean;
 }
 
+export interface RewindConversationMessage {
+  type: "rewind_conversation";
+  userMessageUuid: string;
+  dryRun?: boolean;
+  rewindFiles?: boolean; // default true — set false to rewind conversation only, leaving files as-is
+}
+
+export interface BranchFromMessage {
+  type: "branch_from_message";
+  sessionId: string;
+  userMessageUuid: string;
+}
+
 export interface SyncDesktopMessage {
   type: "sync_desktop";
   sessionId: string;
@@ -237,6 +250,8 @@ export type ClientMessage =
   | McpReconnectMessage
   | McpToggleMessage
   | RewindMessage
+  | RewindConversationMessage
+  | BranchFromMessage
   | SyncDesktopMessage
   | ListSdkSessionsMessage
   | RequestFileMessage
@@ -496,6 +511,29 @@ export interface SessionForkedServerMessage {
   cwd: string;
 }
 
+export interface RewindConversationResultServerMessage {
+  type: "rewind_conversation_result";
+  sessionId: string;
+  success: boolean;
+  userMessageUuid: string;
+  dryRun?: boolean;
+  filesReverted?: string[];
+  insertions?: number;
+  deletions?: number;
+  messagesRemoved?: number;
+  error?: string;
+}
+
+export interface BranchResultServerMessage {
+  type: "branch_result";
+  success: boolean;
+  originalSessionId: string;
+  newSessionId?: string;
+  branchPointUuid: string;
+  cwd?: string;
+  error?: string;
+}
+
 export interface TtsAudioServerMessage {
   type: "tts_audio";
   audioData: string;
@@ -650,6 +688,8 @@ export type ServerMessage =
   | TaskNotificationServerMessage
   | ToolSummaryServerMessage
   | SessionForkedServerMessage
+  | RewindConversationResultServerMessage
+  | BranchResultServerMessage
   | TtsAudioServerMessage
   | ThinkingServerMessage
   | ToolImageServerMessage

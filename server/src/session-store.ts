@@ -228,6 +228,37 @@ export function getHistoryPageToLastPrompt(
   return { entries: all.slice(start), total, offset: start };
 }
 
+/**
+ * Truncate history at a specific user message UUID.
+ * Keeps all entries up to and including the entry with the given UUID.
+ * Returns the number of entries removed, or -1 if UUID not found.
+ */
+export function truncateHistoryAtMessage(
+  sessionId: string,
+  userMessageUuid: string
+): { removed: number; kept: number } {
+  const all = getHistory(sessionId);
+  // Find the index of the user message with this UUID
+  const idx = all.findIndex(
+    (e) => e.uuid === userMessageUuid && e.role === "user"
+  );
+  if (idx === -1) {
+    // Try matching any role with this UUID (user_uuid entries store UUID differently)
+    const altIdx = all.findIndex((e) => e.uuid === userMessageUuid);
+    if (altIdx === -1) return { removed: -1, kept: all.length };
+    const kept = all.slice(0, altIdx + 1);
+    const removed = all.length - kept.length;
+    const file = historyFile(sessionId);
+    fs.writeFileSync(file, JSON.stringify(kept, null, 2), "utf-8");
+    return { removed, kept: kept.length };
+  }
+  const kept = all.slice(0, idx + 1);
+  const removed = all.length - kept.length;
+  const file = historyFile(sessionId);
+  fs.writeFileSync(file, JSON.stringify(kept, null, 2), "utf-8");
+  return { removed, kept: kept.length };
+}
+
 // ── Per-session todo list ──
 
 const TODOS_DIR = path.join(STORE_DIR, "todos");
