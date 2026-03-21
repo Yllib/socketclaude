@@ -230,6 +230,8 @@ export interface MarketplacePlugin {
   source: string;
   /** Whether this plugin is currently enabled */
   enabled: boolean;
+  /** README.md content (if present) */
+  readme: string;
 }
 
 const ENABLED_PLUGINS_PATH = path.join(os.homedir(), ".claude-assistant", "enabled-plugins.json");
@@ -305,6 +307,13 @@ export function listMarketplacePlugins(): MarketplacePlugin[] {
             }
           }
 
+          // Read README.md content
+          let readme = "";
+          const readmePath2 = path.join(pluginPath, "README.md");
+          if (fs.existsSync(readmePath2)) {
+            try { readme = fs.readFileSync(readmePath2, "utf-8"); } catch {}
+          }
+
           results.push({
             id,
             name,
@@ -315,6 +324,7 @@ export function listMarketplacePlugins(): MarketplacePlugin[] {
             marketplace,
             source,
             enabled: id in enabled,
+            readme,
           });
         }
       }
