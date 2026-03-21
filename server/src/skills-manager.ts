@@ -273,6 +273,17 @@ export function listMarketplacePlugins(): MarketplacePlugin[] {
           const pluginPath = path.join(sourceDir, pluginDir);
           if (!fs.statSync(pluginPath).isDirectory()) continue;
 
+          // Skip category directories — real plugins have plugin.json, README, skills, commands, hooks, agents, or .mcp.json
+          const hasPluginJson = fs.existsSync(path.join(pluginPath, ".claude-plugin", "plugin.json"));
+          const hasReadme = fs.existsSync(path.join(pluginPath, "README.md"));
+          const hasContent = hasPluginJson || hasReadme
+            || fs.existsSync(path.join(pluginPath, "skills"))
+            || fs.existsSync(path.join(pluginPath, "commands"))
+            || fs.existsSync(path.join(pluginPath, "hooks"))
+            || fs.existsSync(path.join(pluginPath, "agents"))
+            || fs.existsSync(path.join(pluginPath, ".mcp.json"));
+          if (!hasContent) continue;
+
           const id = `${pluginDir}@${marketplace}`;
 
           // Read plugin.json metadata
