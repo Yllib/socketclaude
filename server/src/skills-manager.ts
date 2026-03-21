@@ -339,13 +339,62 @@ export function listMarketplacePlugins(): MarketplacePlugin[] {
   return results.sort((a, b) => a.name.localeCompare(b.name));
 }
 
+/** Cached claude binary path */
+let _claudeBinary: string | null = null;
+
+/** Resolve the claude CLI binary path, caching the result */
+function resolveClaudeBinary(): string {
+  if (_claudeBinary) return _claudeBinary;
+
+  const { execSync } = require("child_process") as typeof import("child_process");
+  const isWindows = process.platform === "win32";
+
+  // Try which/where first
+  try {
+    const cmd = isWindows ? "where claude" : "which claude";
+    const result = execSync(cmd, { timeout: 5000, encoding: "utf-8" }).trim().split("\n")[0];
+    if (result) {
+      _claudeBinary = result;
+      console.log(`[Plugin] Resolved claude binary via ${isWindows ? 'where' : 'which'}: ${result}`);
+      return result;
+    }
+  } catch {}
+
+  // Fall back to common locations
+  const home = os.homedir();
+  const candidates = isWindows
+    ? [
+        path.join(home, "AppData", "Roaming", "npm", "claude.cmd"),
+        path.join(home, "AppData", "Local", "Programs", "claude", "claude.exe"),
+      ]
+    : [
+        path.join(home, ".local", "bin", "claude"),
+        path.join(home, ".claude", "local", "claude"),
+        "/usr/local/bin/claude",
+      ];
+
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) {
+      _claudeBinary = candidate;
+      console.log(`[Plugin] Resolved claude binary via fallback: ${candidate}`);
+      return candidate;
+    }
+  }
+
+  // Last resort — hope it's in PATH
+  _claudeBinary = "claude";
+  console.warn(`[Plugin] Could not resolve claude binary, using bare 'claude'`);
+  return "claude";
+}
+
 /** Run a claude CLI plugin command. Returns stdout on success, throws on failure. */
 export async function runPluginCommand(action: "install" | "uninstall" | "enable" | "disable", pluginId: string): Promise<string> {
   const { exec } = require("child_process") as typeof import("child_process");
-  const cmd = `claude plugin ${action} ${pluginId} --scope user`;
+  const claudeBin = resolveClaudeBinary();
+  const cmd = `"${claudeBin}" plugin ${action} ${pluginId} --scope user`;
   console.log(`[Plugin] Running: ${cmd}`);
   return new Promise((resolve, reject) => {
-    exec(cmd, { timeout: 60000 }, (err: any, stdout: string, stderr: string) => {
+    exec(cmd, { timeout: 60000, env: { ...process.env, HOME: os.homedir() } }, (err: any, stdout: string, stderr: string) => {
       const output = (stdout || "") + (stderr || "");
       if (err) {
         console.error(`[Plugin] ${action} failed: ${output}`);
