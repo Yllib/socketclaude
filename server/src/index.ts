@@ -1006,13 +1006,16 @@ function createConnectionHandler(transport: ClientTransport) {
       }
 
       case "skills_list": {
+        console.log(`[skills_list] Handler entered`);
         try {
           let projectCwd: string | undefined;
           if (activeSession) {
             projectCwd = activeSession.getCwd?.();
           }
           if (!projectCwd) projectCwd = DEFAULT_CWD;
+          console.log(`[skills_list] Scanning skills in ${projectCwd}...`);
           const skills = listSkills(projectCwd);
+          console.log(`[skills_list] Found ${skills.length} skills, sending response`);
           sendJson({ type: "skills_list", skills, projectCwd });
         } catch (e: any) {
           console.error(`[skills_list] Error: ${e.message || e}`);
