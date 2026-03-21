@@ -214,24 +214,28 @@ export function saveSkill(opts: {
 export interface MarketplacePlugin {
   /** Unique ID: pluginName@marketplace */
   id: string;
-  /** Human-readable name from plugin.json */
+  /** Human-readable name */
   name: string;
-  /** Description from plugin.json */
+  /** Description */
   description: string;
-  /** Author name from plugin.json */
+  /** Author name */
   author: string;
-  /** Version from plugin.json */
+  /** Version */
   version: string;
-  /** Absolute path to the plugin directory */
+  /** Absolute path to the plugin directory (if installed locally) */
   pluginPath: string;
   /** Which marketplace this comes from */
   marketplace: string;
-  /** "plugins" or "external_plugins" */
-  source: string;
+  /** Category from marketplace.json */
+  category: string;
   /** Whether this plugin is currently enabled */
   enabled: boolean;
-  /** README.md content (if present) */
+  /** Whether this plugin is installed locally on disk */
+  installed: boolean;
+  /** README.md content (if present and installed) */
   readme: string;
+  /** Homepage URL */
+  homepage: string;
 }
 
 const ENABLED_PLUGINS_PATH = path.join(os.homedir(), ".claude-assistant", "enabled-plugins.json");
@@ -251,7 +255,19 @@ function writeEnabledPlugins(data: Record<string, string>): void {
   fs.writeFileSync(ENABLED_PLUGINS_PATH, JSON.stringify(data, null, 2));
 }
 
-/** Scan all marketplace plugins and return them with enabled/disabled state */
+/** Resolve the local path for a plugin from its marketplace.json source entry */
+function resolvePluginPath(mpDir: string, source: any): string | null {
+  if (typeof source === "string" && source.startsWith("./")) {
+    // Relative path within the marketplace repo
+    const resolved = path.resolve(mpDir, source);
+    return fs.existsSync(resolved) ? resolved : null;
+  }
+  // For external sources (github, url, npm, git-subdir), check the cache
+  // The SDK installs these into ~/.claude/plugins/cache/{marketplace}/{pluginName}/{version}/
+  return null;
+}
+
+/** List all marketplace plugins by reading marketplace.json registries */
 export function listMarketplacePlugins(): MarketplacePlugin[] {
   const home = os.homedir();
   const pluginsBase = path.join(home, ".claude", "plugins", "marketplaces");
@@ -265,93 +281,57 @@ export function listMarketplacePlugins(): MarketplacePlugin[] {
       const mpDir = path.join(pluginsBase, marketplace);
       if (!fs.statSync(mpDir).isDirectory()) continue;
 
-      for (const source of ["plugins", "external_plugins"]) {
-        const sourceDir = path.join(mpDir, source);
-        if (!fs.existsSync(sourceDir)) continue;
+      // Read marketplace.json — the source of truth for available plugins
+      const marketplaceJsonPath = path.join(mpDir, ".claude-plugin", "marketplace.json");
+      if (!fs.existsSync(marketplaceJsonPath)) continue;
 
-        for (const pluginDir of fs.readdirSync(sourceDir)) {
-          const pluginPath = path.join(sourceDir, pluginDir);
-          if (!fs.statSync(pluginPath).isDirectory()) continue;
+      let registry: any;
+      try {
+        registry = JSON.parse(fs.readFileSync(marketplaceJsonPath, "utf-8"));
+      } catch { continue; }
 
-          // Skip category directories — real plugins have plugin.json, README, skills, commands, hooks, agents, or .mcp.json
-          const hasPluginJson = fs.existsSync(path.join(pluginPath, ".claude-plugin", "plugin.json"));
-          const hasReadme = fs.existsSync(path.join(pluginPath, "README.md"));
-          const hasContent = hasPluginJson || hasReadme
-            || fs.existsSync(path.join(pluginPath, "skills"))
-            || fs.existsSync(path.join(pluginPath, "commands"))
-            || fs.existsSync(path.join(pluginPath, "hooks"))
-            || fs.existsSync(path.join(pluginPath, "agents"))
-            || fs.existsSync(path.join(pluginPath, ".mcp.json"));
-          if (!hasContent) continue;
+      const plugins = registry.plugins || [];
+      for (const entry of plugins) {
+        const name = entry.name || "";
+        if (!name) continue;
 
-          const id = `${pluginDir}@${marketplace}`;
+        const id = `${name}@${marketplace}`;
+        const description = entry.description || "";
+        const author = entry.author?.name || registry.owner?.name || "";
+        const version = entry.version || "";
+        const category = entry.category || "";
+        const homepage = entry.homepage || "";
 
-          // Read plugin.json metadata
-          let name = pluginDir;
-          let description = "";
-          let author = "";
-          let version = "";
-          const metaPath = path.join(pluginPath, ".claude-plugin", "plugin.json");
-          if (fs.existsSync(metaPath)) {
-            try {
-              const meta = JSON.parse(fs.readFileSync(metaPath, "utf-8"));
-              name = meta.name || pluginDir;
-              description = meta.description || "";
-              author = meta.author?.name || "";
-              version = meta.version || "";
-            } catch {}
+        // Check if installed locally
+        const localPath = resolvePluginPath(mpDir, entry.source);
+        const installed = localPath !== null;
+
+        // Read README from local install if available
+        let readme = "";
+        if (localPath) {
+          const readmePath = path.join(localPath, "README.md");
+          if (fs.existsSync(readmePath)) {
+            try { readme = fs.readFileSync(readmePath, "utf-8"); } catch {}
           }
-
-          // Fall back to README.md first paragraph if no description
-          if (!description) {
-            const readmePath = path.join(pluginPath, "README.md");
-            if (fs.existsSync(readmePath)) {
-              try {
-                const lines = fs.readFileSync(readmePath, "utf-8").split("\n");
-                for (const line of lines) {
-                  const trimmed = line.trim();
-                  if (!trimmed || trimmed.startsWith("#")) continue;
-                  description = trimmed;
-                  break;
-                }
-              } catch {}
-            }
-          }
-
-          // Read README.md content
-          let readme = "";
-          const readmePath2 = path.join(pluginPath, "README.md");
-          if (fs.existsSync(readmePath2)) {
-            try { readme = fs.readFileSync(readmePath2, "utf-8"); } catch {}
-          }
-
-          results.push({
-            id,
-            name,
-            description,
-            author,
-            version,
-            pluginPath,
-            marketplace,
-            source,
-            enabled: id in enabled,
-            readme,
-          });
         }
+
+        results.push({
+          id,
+          name,
+          description,
+          author,
+          version,
+          pluginPath: localPath || "",
+          marketplace,
+          category,
+          enabled: id in enabled,
+          installed,
+          readme,
+          homepage,
+        });
       }
     }
   } catch {}
-
-  // Clean up stale entries from enabled config
-  let cleaned = false;
-  for (const id of Object.keys(enabled)) {
-    const found = results.find(p => p.id === id);
-    if (!found || !fs.existsSync(enabled[id])) {
-      delete enabled[id];
-      cleaned = true;
-    }
-  }
-  if (cleaned) writeEnabledPlugins(enabled);
 
   return results.sort((a, b) => a.name.localeCompare(b.name));
 }
@@ -361,11 +341,10 @@ export function togglePlugin(pluginId: string, enable: boolean): MarketplacePlug
   const enabled = readEnabledPlugins();
 
   if (enable) {
-    // Find the plugin's path from a fresh scan
     const all = listMarketplacePlugins();
     const plugin = all.find(p => p.id === pluginId);
     if (!plugin) throw new Error(`Plugin not found: ${pluginId}`);
-    if (!fs.existsSync(plugin.pluginPath)) throw new Error(`Plugin path missing: ${plugin.pluginPath}`);
+    if (!plugin.installed || !plugin.pluginPath) throw new Error(`Plugin not installed locally: ${pluginId}`);
     enabled[pluginId] = plugin.pluginPath;
   } else {
     delete enabled[pluginId];
