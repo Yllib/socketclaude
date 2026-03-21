@@ -731,7 +731,7 @@ function createConnectionHandler(transport: ClientTransport) {
 
       case "version_check": {
         const { execSync, exec: execCb } = require("child_process");
-        const info: any = { type: "version_info", gitAvailable: !!GIT_ROOT };
+        const info: any = { type: "version_info", gitAvailable: !!GIT_ROOT, autoUpdateError: lastAutoUpdateError };
         if (GIT_ROOT) {
           try {
             const localHash = execSync("git rev-parse HEAD", { cwd: GIT_ROOT, stdio: "pipe" }).toString().trim();
@@ -2319,6 +2319,7 @@ function findGitRoot(startDir: string): string | null {
 }
 
 const GIT_ROOT = findGitRoot(SERVER_DIR);
+let lastAutoUpdateError: string | null = null;
 
 async function checkForUpdates(): Promise<void> {
   if (!GIT_ROOT) return;
@@ -2368,6 +2369,8 @@ async function checkForUpdates(): Promise<void> {
       : GIT_ROOT;
     await execAsync("npx tsc", { cwd: tscDir, timeout: 120000 });
 
+    lastAutoUpdateError = null;
+
     // Mark this remote version as applied BEFORE restarting
     fs.writeFileSync(lastAppliedFile, remote);
 
@@ -2377,6 +2380,7 @@ async function checkForUpdates(): Promise<void> {
     // exit(0) is clean and won't restart. Windows batch loops check for any exit.
     process.exit(1);
   } catch (e: any) {
+    lastAutoUpdateError = e.message;
     console.error(`[Auto-update] Error: ${e.message}`);
   }
 }
