@@ -289,6 +289,22 @@ export function listMarketplacePlugins(): MarketplacePlugin[] {
             } catch {}
           }
 
+          // Fall back to README.md first paragraph if no description
+          if (!description) {
+            const readmePath = path.join(pluginPath, "README.md");
+            if (fs.existsSync(readmePath)) {
+              try {
+                const lines = fs.readFileSync(readmePath, "utf-8").split("\n");
+                for (const line of lines) {
+                  const trimmed = line.trim();
+                  if (!trimmed || trimmed.startsWith("#")) continue;
+                  description = trimmed;
+                  break;
+                }
+              } catch {}
+            }
+          }
+
           results.push({
             id,
             name,
