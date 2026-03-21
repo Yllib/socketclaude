@@ -730,7 +730,7 @@ function createConnectionHandler(transport: ClientTransport) {
       }
 
       case "version_check": {
-        const { execSync } = require("child_process");
+        const { execSync, exec: execCb } = require("child_process");
         const info: any = { type: "version_info", gitAvailable: !!GIT_ROOT };
         if (GIT_ROOT) {
           try {
@@ -740,24 +740,32 @@ function createConnectionHandler(transport: ClientTransport) {
             const localDate = execSync("git log -1 --format=%ci", { cwd: GIT_ROOT, stdio: "pipe" }).toString().trim();
             info.local = { hash: localHash, branch, message: localMsg, date: localDate };
 
-            // Fetch and check remote
-            try {
-              execSync("git fetch origin", { cwd: GIT_ROOT, stdio: "pipe", timeout: 15000 });
-              const remoteHash = execSync(`git rev-parse origin/${branch}`, { cwd: GIT_ROOT, stdio: "pipe" }).toString().trim();
-              const remoteMsg = execSync(`git log origin/${branch} -1 --format=%s`, { cwd: GIT_ROOT, stdio: "pipe" }).toString().trim();
-              const remoteDate = execSync(`git log origin/${branch} -1 --format=%ci`, { cwd: GIT_ROOT, stdio: "pipe" }).toString().trim();
-              const commitsBehind = parseInt(execSync(`git rev-list --count HEAD..origin/${branch}`, { cwd: GIT_ROOT, stdio: "pipe" }).toString().trim(), 10);
-              info.remote = { hash: remoteHash, message: remoteMsg, date: remoteDate };
-              info.updateAvailable = localHash !== remoteHash;
-              info.commitsBehind = commitsBehind;
-            } catch (e: any) {
-              info.fetchError = e.message;
-            }
+            // Fetch remote async to avoid blocking event loop (relay ping/pong)
+            execCb("git fetch origin", { cwd: GIT_ROOT, timeout: 15000 }, (err: any) => {
+              try {
+                if (!err) {
+                  const remoteHash = execSync(`git rev-parse origin/${branch}`, { cwd: GIT_ROOT, stdio: "pipe" }).toString().trim();
+                  const remoteMsg = execSync(`git log origin/${branch} -1 --format=%s`, { cwd: GIT_ROOT, stdio: "pipe" }).toString().trim();
+                  const remoteDate = execSync(`git log origin/${branch} -1 --format=%ci`, { cwd: GIT_ROOT, stdio: "pipe" }).toString().trim();
+                  const commitsBehind = parseInt(execSync(`git rev-list --count HEAD..origin/${branch}`, { cwd: GIT_ROOT, stdio: "pipe" }).toString().trim(), 10);
+                  info.remote = { hash: remoteHash, message: remoteMsg, date: remoteDate };
+                  info.updateAvailable = localHash !== remoteHash;
+                  info.commitsBehind = commitsBehind;
+                } else {
+                  info.fetchError = err.message;
+                }
+              } catch (e: any) {
+                info.fetchError = e.message;
+              }
+              sendJson(info);
+            });
           } catch (e: any) {
             info.error = e.message;
+            sendJson(info);
           }
+        } else {
+          sendJson(info);
         }
-        sendJson(info);
         break;
       }
 
