@@ -2343,10 +2343,19 @@ async function checkForUpdates(): Promise<void> {
       }
     }
 
-    console.log(`[Auto-update] Updating ${local.substring(0, 7)} → ${remote.substring(0, 7)}...`);
+    console.log(`[Auto-update] Pulling ${local.substring(0, 7)} → ${remote.substring(0, 7)}...`);
 
     // Pull (rebase to handle local commits that diverged from origin)
+    const beforeHash = execSync("git rev-parse HEAD", { cwd: GIT_ROOT, stdio: "pipe" }).toString().trim();
     execSync(`git pull --rebase origin ${branch}`, { cwd: GIT_ROOT, stdio: "pipe", timeout: 60000 });
+    const afterHash = execSync("git rev-parse HEAD", { cwd: GIT_ROOT, stdio: "pipe" }).toString().trim();
+
+    // If nothing actually changed (e.g. local commits rebased but no new code),
+    // don't restart — prevents infinite restart loop when local commits exist
+    if (beforeHash === afterHash) {
+      console.log(`[Auto-update] Pull was no-op (local commits diverge from origin), skipping restart`);
+      return;
+    }
 
     // Compile TypeScript — find the server dir (could be repo root or server/ subdir)
     const tscDir = fs.existsSync(path.join(GIT_ROOT, "server", "tsconfig.json"))
@@ -2354,7 +2363,7 @@ async function checkForUpdates(): Promise<void> {
       : GIT_ROOT;
     execSync("npx tsc", { cwd: tscDir, stdio: "pipe", timeout: 120000 });
 
-    console.log(`[Auto-update] Compiled successfully, restarting...`);
+    console.log(`[Auto-update] Compiled successfully (${beforeHash.substring(0, 7)} → ${afterHash.substring(0, 7)}), restarting...`);
 
     // Exit with non-zero so systemd Restart=on-failure triggers a restart.
     // exit(0) is clean and won't restart. Windows batch loops check for any exit.
