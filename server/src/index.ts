@@ -783,25 +783,24 @@ function createConnectionHandler(transport: ClientTransport) {
           execSync(`git pull --rebase origin ${branch}`, { cwd: GIT_ROOT, stdio: "pipe", timeout: 60000 });
           const afterHash = execSync("git rev-parse HEAD", { cwd: GIT_ROOT, stdio: "pipe" }).toString().trim();
 
-          if (beforeHash === afterHash) {
-            // If force flag is set, restart anyway (compiled code may differ from running)
-            if ((msg as any).forceRestart) {
-              sendJson({ type: "update_result", success: true, message: "Restarting (already up to date)", hash: afterHash, needsRestart: true });
-              setTimeout(() => {
-                console.log(`[ForceUpdate] Force restart requested (already up to date)`);
-                process.exit(1);
-              }, 1000);
-              break;
-            }
-            sendJson({ type: "update_result", success: true, message: "Already up to date", hash: afterHash });
-            break;
-          }
-
-          // Compile
+          // Always compile — source may have changed without a git pull
           const tscDir = fs.existsSync(path.join(GIT_ROOT, "server", "tsconfig.json"))
             ? path.join(GIT_ROOT, "server")
             : GIT_ROOT;
           execSync("npx tsc", { cwd: tscDir, stdio: "pipe", timeout: 120000 });
+
+          if (beforeHash === afterHash) {
+            if ((msg as any).forceRestart) {
+              sendJson({ type: "update_result", success: true, message: "Recompiled and restarting", hash: afterHash, needsRestart: true });
+              setTimeout(() => {
+                console.log(`[ForceUpdate] Force restart after recompile`);
+                process.exit(1);
+              }, 1000);
+              break;
+            }
+            sendJson({ type: "update_result", success: true, message: "Already up to date (recompiled)", hash: afterHash });
+            break;
+          }
 
           const afterMsg = execSync("git log -1 --format=%s", { cwd: GIT_ROOT, stdio: "pipe" }).toString().trim();
           sendJson({ type: "update_result", success: true, message: `Updated to ${afterHash.substring(0, 7)}: ${afterMsg}`, hash: afterHash, needsRestart: true });
