@@ -783,10 +783,11 @@ function createConnectionHandler(transport: ClientTransport) {
           execSync(`git pull --rebase origin ${branch}`, { cwd: GIT_ROOT, stdio: "pipe", timeout: 60000 });
           const afterHash = execSync("git rev-parse HEAD", { cwd: GIT_ROOT, stdio: "pipe" }).toString().trim();
 
-          // Always compile — source may have changed without a git pull
+          // Always install deps + compile — source/deps may have changed
           const tscDir = fs.existsSync(path.join(GIT_ROOT, "server", "tsconfig.json"))
             ? path.join(GIT_ROOT, "server")
             : GIT_ROOT;
+          execSync("npm install --production=false", { cwd: tscDir, stdio: "pipe", timeout: 120000 });
           execSync("npx tsc", { cwd: tscDir, stdio: "pipe", timeout: 120000 });
 
           if (beforeHash === afterHash) {
@@ -2364,12 +2365,14 @@ async function checkForUpdates(): Promise<void> {
 
     console.log(`[Auto-update] Pulling to ${remote.substring(0, 7)}...`);
 
-    // Pull and compile — these block but only run when there's an actual update
+    // Pull, install deps, and compile — only run when there's an actual update
     await execAsync(`git pull --rebase origin ${branch}`, { cwd: GIT_ROOT, timeout: 60000 });
 
     const tscDir = fs.existsSync(path.join(GIT_ROOT, "server", "tsconfig.json"))
       ? path.join(GIT_ROOT, "server")
       : GIT_ROOT;
+    // Install/update deps so SDK and other package changes are picked up
+    await execAsync("npm install --production=false", { cwd: tscDir, timeout: 120000 });
     await execAsync("npx tsc", { cwd: tscDir, timeout: 120000 });
 
     lastAutoUpdateError = null;
