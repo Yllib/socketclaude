@@ -999,13 +999,18 @@ function createConnectionHandler(transport: ClientTransport) {
       }
 
       case "skills_list": {
-        let projectCwd: string | undefined;
-        if (activeSession) {
-          projectCwd = activeSession.getCwd?.();
+        try {
+          let projectCwd: string | undefined;
+          if (activeSession) {
+            projectCwd = activeSession.getCwd?.();
+          }
+          if (!projectCwd) projectCwd = DEFAULT_CWD;
+          const skills = listSkills(projectCwd);
+          sendJson({ type: "skills_list", skills, projectCwd });
+        } catch (e: any) {
+          console.error(`[skills_list] Error: ${e.message || e}`);
+          sendJson({ type: "skills_list", skills: [], projectCwd: "", error: e.message || String(e) });
         }
-        if (!projectCwd) projectCwd = DEFAULT_CWD;
-        const skills = listSkills(projectCwd);
-        sendJson({ type: "skills_list", skills, projectCwd });
         break;
       }
 
