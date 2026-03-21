@@ -83,6 +83,13 @@ export class ClaudeSession {
     return this._ttsEnabled;
   }
 
+  private _sdkPlugins: { type: "local"; path: string }[] = [];
+
+  setSdkPlugins(paths: string[]): void {
+    this._sdkPlugins = paths.map(p => ({ type: "local" as const, path: p }));
+    console.log(`SDK plugins set: [${paths.join(', ')}] for session ${this.sessionId || '(pending)'}`);
+  }
+
   setTtsEngine(engine: "system" | "kokoro_server" | "kokoro_device"): void {
     this._ttsEngine = engine;
     console.log(`TTS engine set to ${engine} for session ${this.sessionId || '(pending)'}`);
@@ -705,6 +712,7 @@ export class ClaudeSession {
           systemPrompt: { type: "preset", preset: "claude_code", append: this._appendSystemPrompt ? toolContext + '\n\n' + this._appendSystemPrompt : toolContext } as any,
           tools: { type: "preset", preset: "claude_code" },
           ...(this._disallowedTools.length ? { disallowedTools: this._disallowedTools } : {}),
+          ...(this._sdkPlugins.length ? { plugins: this._sdkPlugins } : {}),
           enableFileCheckpointing: true,
           promptSuggestions: true,
           agentProgressSummaries: true,

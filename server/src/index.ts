@@ -14,7 +14,7 @@ import { ClientMessage, SessionInfo } from "./protocol";
 import { SocketClaudePlugin, PluginContext } from "./plugin-api";
 import { RelayClient, RelayStatus } from "./relay-client";
 import { loadOrCreateKeyPair, toBase64 } from "./relay-crypto";
-import { listSkills, getSkill, saveSkill, deleteSkill } from "./skills-manager";
+import { listSkills, getSkill, saveSkill, deleteSkill, listMarketplacePlugins, togglePlugin, getEnabledPluginPaths } from "./skills-manager";
 
 const PORT = parseInt(process.env.PORT || "8085", 10);
 const DEFAULT_CWD = process.env.DEFAULT_CWD || process.cwd();
@@ -241,6 +241,7 @@ function createConnectionHandler(transport: ClientTransport) {
         activeSession.setThinking(pendingThinking);
         activeSession.setDisallowedTools(pendingDisallowedTools);
         activeSession.setAppendSystemPrompt(pendingSystemPrompt);
+        activeSession.setSdkPlugins(getEnabledPluginPaths());
         addRecentCwd(cwd);
         sendJson({
           type: "session_created",
@@ -298,6 +299,7 @@ function createConnectionHandler(transport: ClientTransport) {
         activeSession.setThinking(pendingThinking);
         activeSession.setDisallowedTools(pendingDisallowedTools);
         activeSession.setAppendSystemPrompt(pendingSystemPrompt);
+        activeSession.setSdkPlugins(getEnabledPluginPaths());
 
         // Register this client so /continue can find the real WebSocket
         sessionClients.set(msg.sessionId, {
@@ -440,6 +442,7 @@ function createConnectionHandler(transport: ClientTransport) {
           activeSession.setTtsEnabled(pendingTtsEnabled);
           activeSession.setEffort(pendingEffort);
           activeSession.setThinking(pendingThinking);
+          activeSession.setSdkPlugins(getEnabledPluginPaths());
         }
 
         // If session is already running, inject the message inline between turns
@@ -1075,6 +1078,33 @@ function createConnectionHandler(transport: ClientTransport) {
         break;
       }
 
+      case "plugins_list": {
+        try {
+          const mpPlugins = listMarketplacePlugins();
+          sendJson({ type: "plugins_list", plugins: mpPlugins });
+        } catch (e: any) {
+          sendJson({ type: "plugins_list", plugins: [], error: e.message || String(e) });
+        }
+        break;
+      }
+
+      case "plugins_toggle": {
+        const data = msg as any;
+        const pluginId = data.pluginId as string;
+        const enabled = data.enabled as boolean;
+        if (!pluginId) {
+          sendJson({ type: "plugins_toggle_result", ok: false, error: "Missing pluginId" });
+          break;
+        }
+        try {
+          const mpPlugins = togglePlugin(pluginId, enabled);
+          sendJson({ type: "plugins_toggle_result", pluginId, enabled, ok: true, plugins: mpPlugins });
+        } catch (e: any) {
+          sendJson({ type: "plugins_toggle_result", ok: false, error: e.message || String(e) });
+        }
+        break;
+      }
+
       case "mcp_status": {
         if (activeSession) {
           activeSession.mcpServerStatus().then(status => {
@@ -1203,6 +1233,7 @@ function createConnectionHandler(transport: ClientTransport) {
           activeSession.setThinking(pendingThinking);
           activeSession.setDisallowedTools(pendingDisallowedTools);
           activeSession.setAppendSystemPrompt(pendingSystemPrompt);
+          activeSession.setSdkPlugins(getEnabledPluginPaths());
           activeSession.setResumeSessionAt(uuid);
           // Store the session ID so the next prompt resumes this session at the rewind point
           (activeSession as any)._resumeSessionId = sessionId;
@@ -1294,6 +1325,7 @@ function createConnectionHandler(transport: ClientTransport) {
           activeSession.setThinking(pendingThinking);
           activeSession.setDisallowedTools(pendingDisallowedTools);
           activeSession.setAppendSystemPrompt(pendingSystemPrompt);
+          activeSession.setSdkPlugins(getEnabledPluginPaths());
           (activeSession as any)._resumeSessionId = newSessionId;
 
           sendJson({
@@ -1353,6 +1385,7 @@ function createConnectionHandler(transport: ClientTransport) {
         activeSession.setThinking(pendingThinking);
         activeSession.setDisallowedTools(pendingDisallowedTools);
         activeSession.setAppendSystemPrompt(pendingSystemPrompt);
+        activeSession.setSdkPlugins(getEnabledPluginPaths());
         activeSession.setForkSource(sourceId);
         sendJson({
           type: "session_created",
@@ -1590,6 +1623,7 @@ const httpServer = http.createServer((req, res) => {
           ? existingClient.ws
           : { readyState: WebSocket.CLOSED, send: () => {} } as any;
         const session = new ClaudeSession(ws, sessionInfo.cwd, plugins);
+        session.setSdkPlugins(getEnabledPluginPaths());
         (session as any)._resumeSessionId = sessionId;
         session.onActivity = () => scheduleBroadcast();
 
@@ -2066,6 +2100,7 @@ async function checkScheduledTasks(): Promise<void> {
       // Create headless session (same pattern as /continue endpoint)
       const ws = { readyState: WebSocket.CLOSED, send: () => {} } as any;
       const session = new ClaudeSession(ws, task.cwd, plugins);
+      session.setSdkPlugins(getEnabledPluginPaths());
       session.onActivity = () => scheduleBroadcast();
 
       // If reusing session, set the resume ID so SDK continues that session

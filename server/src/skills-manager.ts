@@ -209,6 +209,141 @@ export function saveSkill(opts: {
   return targetPath;
 }
 
+// ── Marketplace plugin management ──
+
+export interface MarketplacePlugin {
+  /** Unique ID: pluginName@marketplace */
+  id: string;
+  /** Human-readable name from plugin.json */
+  name: string;
+  /** Description from plugin.json */
+  description: string;
+  /** Author name from plugin.json */
+  author: string;
+  /** Version from plugin.json */
+  version: string;
+  /** Absolute path to the plugin directory */
+  pluginPath: string;
+  /** Which marketplace this comes from */
+  marketplace: string;
+  /** "plugins" or "external_plugins" */
+  source: string;
+  /** Whether this plugin is currently enabled */
+  enabled: boolean;
+}
+
+const ENABLED_PLUGINS_PATH = path.join(os.homedir(), ".claude-assistant", "enabled-plugins.json");
+
+function readEnabledPlugins(): Record<string, string> {
+  try {
+    if (fs.existsSync(ENABLED_PLUGINS_PATH)) {
+      return JSON.parse(fs.readFileSync(ENABLED_PLUGINS_PATH, "utf-8"));
+    }
+  } catch {}
+  return {};
+}
+
+function writeEnabledPlugins(data: Record<string, string>): void {
+  const dir = path.dirname(ENABLED_PLUGINS_PATH);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(ENABLED_PLUGINS_PATH, JSON.stringify(data, null, 2));
+}
+
+/** Scan all marketplace plugins and return them with enabled/disabled state */
+export function listMarketplacePlugins(): MarketplacePlugin[] {
+  const home = os.homedir();
+  const pluginsBase = path.join(home, ".claude", "plugins", "marketplaces");
+  if (!fs.existsSync(pluginsBase)) return [];
+
+  const enabled = readEnabledPlugins();
+  const results: MarketplacePlugin[] = [];
+
+  try {
+    for (const marketplace of fs.readdirSync(pluginsBase)) {
+      const mpDir = path.join(pluginsBase, marketplace);
+      if (!fs.statSync(mpDir).isDirectory()) continue;
+
+      for (const source of ["plugins", "external_plugins"]) {
+        const sourceDir = path.join(mpDir, source);
+        if (!fs.existsSync(sourceDir)) continue;
+
+        for (const pluginDir of fs.readdirSync(sourceDir)) {
+          const pluginPath = path.join(sourceDir, pluginDir);
+          if (!fs.statSync(pluginPath).isDirectory()) continue;
+
+          const id = `${pluginDir}@${marketplace}`;
+
+          // Read plugin.json metadata
+          let name = pluginDir;
+          let description = "";
+          let author = "";
+          let version = "";
+          const metaPath = path.join(pluginPath, ".claude-plugin", "plugin.json");
+          if (fs.existsSync(metaPath)) {
+            try {
+              const meta = JSON.parse(fs.readFileSync(metaPath, "utf-8"));
+              name = meta.name || pluginDir;
+              description = meta.description || "";
+              author = meta.author?.name || "";
+              version = meta.version || "";
+            } catch {}
+          }
+
+          results.push({
+            id,
+            name,
+            description,
+            author,
+            version,
+            pluginPath,
+            marketplace,
+            source,
+            enabled: id in enabled,
+          });
+        }
+      }
+    }
+  } catch {}
+
+  // Clean up stale entries from enabled config
+  let cleaned = false;
+  for (const id of Object.keys(enabled)) {
+    const found = results.find(p => p.id === id);
+    if (!found || !fs.existsSync(enabled[id])) {
+      delete enabled[id];
+      cleaned = true;
+    }
+  }
+  if (cleaned) writeEnabledPlugins(enabled);
+
+  return results.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/** Toggle a marketplace plugin on/off. Returns updated plugin list. */
+export function togglePlugin(pluginId: string, enable: boolean): MarketplacePlugin[] {
+  const enabled = readEnabledPlugins();
+
+  if (enable) {
+    // Find the plugin's path from a fresh scan
+    const all = listMarketplacePlugins();
+    const plugin = all.find(p => p.id === pluginId);
+    if (!plugin) throw new Error(`Plugin not found: ${pluginId}`);
+    if (!fs.existsSync(plugin.pluginPath)) throw new Error(`Plugin path missing: ${plugin.pluginPath}`);
+    enabled[pluginId] = plugin.pluginPath;
+  } else {
+    delete enabled[pluginId];
+  }
+
+  writeEnabledPlugins(enabled);
+  return listMarketplacePlugins();
+}
+
+/** Get filesystem paths of all enabled plugins (for passing to SDK query options) */
+export function getEnabledPluginPaths(): string[] {
+  const enabled = readEnabledPlugins();
+  return Object.values(enabled).filter(p => fs.existsSync(p));
+}
+
 /** Delete a skill/command file. For skills, also removes the parent directory if empty. */
 export function deleteSkill(filePath: string): boolean {
   if (!fs.existsSync(filePath)) return false;

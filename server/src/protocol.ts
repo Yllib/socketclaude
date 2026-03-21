@@ -273,7 +273,9 @@ export type ClientMessage =
   | { type: "remove_recent_cwd"; cwd: string }
   | { type: "skills_list" }
   | { type: "skills_save"; name: string; scope: string; format: string; frontmatter: Record<string, string>; body: string; filePath?: string }
-  | { type: "skills_delete"; filePath: string };
+  | { type: "skills_delete"; filePath: string }
+  | { type: "plugins_list" }
+  | { type: "plugins_toggle"; pluginId: string; enabled: boolean };
 
 // ── Server → Client messages ──
 
