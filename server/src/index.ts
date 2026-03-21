@@ -2324,8 +2324,7 @@ async function checkForUpdates(): Promise<void> {
     // Get current branch name
     const branch = execSync("git rev-parse --abbrev-ref HEAD", { cwd: GIT_ROOT, stdio: "pipe" }).toString().trim();
 
-    // Compare local vs remote
-    const local = execSync("git rev-parse HEAD", { cwd: GIT_ROOT, stdio: "pipe" }).toString().trim();
+    // Check what origin has
     let remote: string;
     try {
       remote = execSync(`git rev-parse origin/${branch}`, { cwd: GIT_ROOT, stdio: "pipe" }).toString().trim();
@@ -2333,29 +2332,26 @@ async function checkForUpdates(): Promise<void> {
       return; // No remote tracking branch
     }
 
-    if (local === remote) return; // Already up to date
+    // Track the last remote hash we successfully applied to prevent restart loops
+    // when servers have local commits (local HEAD != origin HEAD permanently)
+    const lastAppliedFile = path.join(GIT_ROOT, ".last-auto-update-hash");
+    let lastApplied = "";
+    try { lastApplied = fs.readFileSync(lastAppliedFile, "utf-8").trim(); } catch {}
+
+    if (remote === lastApplied) return; // Already applied this remote version
 
     // Check if any sessions are actively running
     for (const [, session] of activeSessions) {
       if (session.isRunning) {
-        console.log(`[Auto-update] Update available (${local.substring(0, 7)} → ${remote.substring(0, 7)}) but sessions are running, deferring...`);
+        console.log(`[Auto-update] Update available (${remote.substring(0, 7)}) but sessions are running, deferring...`);
         return;
       }
     }
 
-    console.log(`[Auto-update] Pulling ${local.substring(0, 7)} → ${remote.substring(0, 7)}...`);
+    console.log(`[Auto-update] Pulling to ${remote.substring(0, 7)}...`);
 
     // Pull (rebase to handle local commits that diverged from origin)
-    const beforeHash = execSync("git rev-parse HEAD", { cwd: GIT_ROOT, stdio: "pipe" }).toString().trim();
     execSync(`git pull --rebase origin ${branch}`, { cwd: GIT_ROOT, stdio: "pipe", timeout: 60000 });
-    const afterHash = execSync("git rev-parse HEAD", { cwd: GIT_ROOT, stdio: "pipe" }).toString().trim();
-
-    // If nothing actually changed (e.g. local commits rebased but no new code),
-    // don't restart — prevents infinite restart loop when local commits exist
-    if (beforeHash === afterHash) {
-      console.log(`[Auto-update] Pull was no-op (local commits diverge from origin), skipping restart`);
-      return;
-    }
 
     // Compile TypeScript — find the server dir (could be repo root or server/ subdir)
     const tscDir = fs.existsSync(path.join(GIT_ROOT, "server", "tsconfig.json"))
@@ -2363,7 +2359,10 @@ async function checkForUpdates(): Promise<void> {
       : GIT_ROOT;
     execSync("npx tsc", { cwd: tscDir, stdio: "pipe", timeout: 120000 });
 
-    console.log(`[Auto-update] Compiled successfully (${beforeHash.substring(0, 7)} → ${afterHash.substring(0, 7)}), restarting...`);
+    // Mark this remote version as applied BEFORE restarting
+    fs.writeFileSync(lastAppliedFile, remote);
+
+    console.log(`[Auto-update] Compiled successfully, restarting for ${remote.substring(0, 7)}...`);
 
     // Exit with non-zero so systemd Restart=on-failure triggers a restart.
     // exit(0) is clean and won't restart. Windows batch loops check for any exit.
