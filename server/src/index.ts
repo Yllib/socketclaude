@@ -782,8 +782,9 @@ function createConnectionHandler(transport: ClientTransport) {
           const branch = execSync("git rev-parse --abbrev-ref HEAD", { cwd: GIT_ROOT, stdio: "pipe" }).toString().trim();
           const beforeHash = execSync("git rev-parse HEAD", { cwd: GIT_ROOT, stdio: "pipe" }).toString().trim();
 
-          // Pull (rebase to handle local commits that diverged from origin)
-          execSync(`git pull --rebase origin ${branch}`, { cwd: GIT_ROOT, stdio: "pipe", timeout: 60000 });
+          // Hard reset to origin — remote servers are deployment mirrors, not dev environments
+          execSync("git fetch origin", { cwd: GIT_ROOT, stdio: "pipe", timeout: 30000 });
+          execSync(`git reset --hard origin/${branch}`, { cwd: GIT_ROOT, stdio: "pipe" });
           const afterHash = execSync("git rev-parse HEAD", { cwd: GIT_ROOT, stdio: "pipe" }).toString().trim();
 
           // Always install deps + compile — source/deps may have changed
@@ -2402,8 +2403,8 @@ async function checkForUpdates(): Promise<void> {
 
     console.log(`[Auto-update] Pulling to ${remote.substring(0, 7)}...`);
 
-    // Pull, install deps, and compile — only run when there's an actual update
-    await execAsync(`git pull --rebase origin ${branch}`, { cwd: GIT_ROOT, timeout: 60000 });
+    // Hard reset to origin — remote servers are deployment mirrors, not dev environments
+    await execAsync(`git reset --hard origin/${branch}`, { cwd: GIT_ROOT, timeout: 30000 });
 
     const tscDir = fs.existsSync(path.join(GIT_ROOT, "server", "tsconfig.json"))
       ? path.join(GIT_ROOT, "server")
