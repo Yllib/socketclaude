@@ -791,7 +791,7 @@ function createConnectionHandler(transport: ClientTransport) {
           const tscDir = fs.existsSync(path.join(GIT_ROOT, "server", "tsconfig.json"))
             ? path.join(GIT_ROOT, "server")
             : GIT_ROOT;
-          execSync("npm install --production=false", { cwd: tscDir, stdio: "pipe", timeout: 120000 });
+          execSync("npm ci", { cwd: tscDir, stdio: "pipe", timeout: 120000 });
           execSync("npx tsc", { cwd: tscDir, stdio: "pipe", timeout: 120000 });
 
           if (beforeHash === afterHash) {
@@ -2410,7 +2410,7 @@ async function checkForUpdates(): Promise<void> {
       ? path.join(GIT_ROOT, "server")
       : GIT_ROOT;
     // Install/update deps so SDK and other package changes are picked up
-    await execAsync("npm install --production=false", { cwd: tscDir, timeout: 120000 });
+    await execAsync("npm ci", { cwd: tscDir, timeout: 120000 });
     await execAsync("npx tsc", { cwd: tscDir, timeout: 120000 });
 
     lastAutoUpdateError = null;
