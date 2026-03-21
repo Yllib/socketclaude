@@ -228,42 +228,49 @@ export interface MarketplacePlugin {
   marketplace: string;
   /** Category from marketplace.json */
   category: string;
-  /** Whether this plugin is currently enabled */
-  enabled: boolean;
-  /** Whether this plugin is installed locally on disk */
+  /** Whether this plugin is installed (present in enabledPlugins settings) */
   installed: boolean;
+  /** Whether this plugin is enabled (installed + not false in enabledPlugins) */
+  enabled: boolean;
   /** README.md content (if present and installed) */
   readme: string;
   /** Homepage URL */
   homepage: string;
 }
 
-const ENABLED_PLUGINS_PATH = path.join(os.homedir(), ".claude-assistant", "enabled-plugins.json");
-
-function readEnabledPlugins(): Record<string, string> {
+/** Read enabledPlugins from ~/.claude/settings.json — the SDK's native plugin state */
+function readEnabledPluginsSetting(): Record<string, any> {
+  const settingsPath = path.join(os.homedir(), ".claude", "settings.json");
   try {
-    if (fs.existsSync(ENABLED_PLUGINS_PATH)) {
-      return JSON.parse(fs.readFileSync(ENABLED_PLUGINS_PATH, "utf-8"));
+    if (fs.existsSync(settingsPath)) {
+      const settings = JSON.parse(fs.readFileSync(settingsPath, "utf-8"));
+      return settings.enabledPlugins || {};
     }
   } catch {}
   return {};
 }
 
-function writeEnabledPlugins(data: Record<string, string>): void {
-  const dir = path.dirname(ENABLED_PLUGINS_PATH);
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(ENABLED_PLUGINS_PATH, JSON.stringify(data, null, 2));
-}
-
-/** Resolve the local path for a plugin from its marketplace.json source entry */
-function resolvePluginPath(mpDir: string, source: any): string | null {
+/** Resolve the local path for a plugin — check relative source paths and the SDK cache */
+function resolvePluginPath(mpDir: string, pluginName: string, marketplace: string, source: any): string | null {
+  // Relative path within the marketplace repo (internal plugins)
   if (typeof source === "string" && source.startsWith("./")) {
-    // Relative path within the marketplace repo
     const resolved = path.resolve(mpDir, source);
-    return fs.existsSync(resolved) ? resolved : null;
+    if (fs.existsSync(resolved)) return resolved;
   }
-  // For external sources (github, url, npm, git-subdir), check the cache
-  // The SDK installs these into ~/.claude/plugins/cache/{marketplace}/{pluginName}/{version}/
+  // SDK cache for installed external plugins: ~/.claude/plugins/cache/{marketplace}/{pluginName}/{version}/
+  const cacheBase = path.join(os.homedir(), ".claude", "plugins", "cache", marketplace, pluginName);
+  if (fs.existsSync(cacheBase)) {
+    try {
+      // Find the latest version directory
+      const versions = fs.readdirSync(cacheBase).filter(f => {
+        try { return fs.statSync(path.join(cacheBase, f)).isDirectory(); } catch { return false; }
+      });
+      if (versions.length > 0) {
+        // Use the last one (highest version or most recent)
+        return path.join(cacheBase, versions[versions.length - 1]);
+      }
+    } catch {}
+  }
   return null;
 }
 
@@ -273,7 +280,7 @@ export function listMarketplacePlugins(): MarketplacePlugin[] {
   const pluginsBase = path.join(home, ".claude", "plugins", "marketplaces");
   if (!fs.existsSync(pluginsBase)) return [];
 
-  const enabled = readEnabledPlugins();
+  const enabledSettings = readEnabledPluginsSetting();
   const results: MarketplacePlugin[] = [];
 
   try {
@@ -302,9 +309,13 @@ export function listMarketplacePlugins(): MarketplacePlugin[] {
         const category = entry.category || "";
         const homepage = entry.homepage || "";
 
-        // Check if installed locally
-        const localPath = resolvePluginPath(mpDir, entry.source);
-        const installed = localPath !== null;
+        // Check install/enable state from settings.json enabledPlugins
+        const settingValue = enabledSettings[id];
+        const installed = settingValue !== undefined;
+        const enabled = installed && settingValue !== false;
+
+        // Resolve local path (from marketplace repo or SDK cache)
+        const localPath = resolvePluginPath(mpDir, name, marketplace, entry.source);
 
         // Read README from local install if available
         let readme = "";
@@ -316,18 +327,10 @@ export function listMarketplacePlugins(): MarketplacePlugin[] {
         }
 
         results.push({
-          id,
-          name,
-          description,
-          author,
-          version,
+          id, name, description, author, version,
           pluginPath: localPath || "",
-          marketplace,
-          category,
-          enabled: id in enabled,
-          installed,
-          readme,
-          homepage,
+          marketplace, category, installed, enabled,
+          readme, homepage,
         });
       }
     }
@@ -336,28 +339,23 @@ export function listMarketplacePlugins(): MarketplacePlugin[] {
   return results.sort((a, b) => a.name.localeCompare(b.name));
 }
 
-/** Toggle a marketplace plugin on/off. Returns updated plugin list. */
-export function togglePlugin(pluginId: string, enable: boolean): MarketplacePlugin[] {
-  const enabled = readEnabledPlugins();
-
-  if (enable) {
-    const all = listMarketplacePlugins();
-    const plugin = all.find(p => p.id === pluginId);
-    if (!plugin) throw new Error(`Plugin not found: ${pluginId}`);
-    if (!plugin.installed || !plugin.pluginPath) throw new Error(`Plugin not installed locally: ${pluginId}`);
-    enabled[pluginId] = plugin.pluginPath;
-  } else {
-    delete enabled[pluginId];
-  }
-
-  writeEnabledPlugins(enabled);
-  return listMarketplacePlugins();
-}
-
-/** Get filesystem paths of all enabled plugins (for passing to SDK query options) */
-export function getEnabledPluginPaths(): string[] {
-  const enabled = readEnabledPlugins();
-  return Object.values(enabled).filter(p => fs.existsSync(p));
+/** Run a claude CLI plugin command. Returns stdout on success, throws on failure. */
+export async function runPluginCommand(action: "install" | "uninstall" | "enable" | "disable", pluginId: string): Promise<string> {
+  const { exec } = require("child_process") as typeof import("child_process");
+  const cmd = `claude plugin ${action} ${pluginId} --scope user`;
+  console.log(`[Plugin] Running: ${cmd}`);
+  return new Promise((resolve, reject) => {
+    exec(cmd, { timeout: 60000 }, (err: any, stdout: string, stderr: string) => {
+      const output = (stdout || "") + (stderr || "");
+      if (err) {
+        console.error(`[Plugin] ${action} failed: ${output}`);
+        reject(new Error(output || err.message || `${action} failed`));
+      } else {
+        console.log(`[Plugin] ${action} ok: ${output.slice(0, 200)}`);
+        resolve(output);
+      }
+    });
+  });
 }
 
 /** Delete a skill/command file. For skills, also removes the parent directory if empty. */

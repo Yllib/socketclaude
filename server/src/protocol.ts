@@ -275,7 +275,10 @@ export type ClientMessage =
   | { type: "skills_save"; name: string; scope: string; format: string; frontmatter: Record<string, string>; body: string; filePath?: string }
   | { type: "skills_delete"; filePath: string }
   | { type: "plugins_list" }
-  | { type: "plugins_toggle"; pluginId: string; enabled: boolean };
+  | { type: "plugins_install"; pluginId: string }
+  | { type: "plugins_uninstall"; pluginId: string }
+  | { type: "plugins_enable"; pluginId: string }
+  | { type: "plugins_disable"; pluginId: string };
 
 // ── Server → Client messages ──
 
