@@ -2316,15 +2316,18 @@ const GIT_ROOT = findGitRoot(SERVER_DIR);
 async function checkForUpdates(): Promise<void> {
   if (!GIT_ROOT) return;
   try {
-    const { execSync } = require("child_process");
+    const { execSync, exec } = require("child_process");
+    const execAsync = (cmd: string, opts: any): Promise<string> =>
+      new Promise((resolve, reject) => {
+        exec(cmd, opts, (err: any, stdout: any) => err ? reject(err) : resolve(String(stdout).trim()));
+      });
 
-    // Fetch latest from origin
-    execSync("git fetch origin", { cwd: GIT_ROOT, stdio: "pipe", timeout: 30000 });
+    // Fetch latest from origin (async to avoid blocking event loop / relay pings)
+    await execAsync("git fetch origin", { cwd: GIT_ROOT, timeout: 30000 });
 
-    // Get current branch name
+    // These are fast local git operations — safe to use execSync
     const branch = execSync("git rev-parse --abbrev-ref HEAD", { cwd: GIT_ROOT, stdio: "pipe" }).toString().trim();
 
-    // Check what origin has
     let remote: string;
     try {
       remote = execSync(`git rev-parse origin/${branch}`, { cwd: GIT_ROOT, stdio: "pipe" }).toString().trim();
@@ -2350,14 +2353,13 @@ async function checkForUpdates(): Promise<void> {
 
     console.log(`[Auto-update] Pulling to ${remote.substring(0, 7)}...`);
 
-    // Pull (rebase to handle local commits that diverged from origin)
-    execSync(`git pull --rebase origin ${branch}`, { cwd: GIT_ROOT, stdio: "pipe", timeout: 60000 });
+    // Pull and compile — these block but only run when there's an actual update
+    await execAsync(`git pull --rebase origin ${branch}`, { cwd: GIT_ROOT, timeout: 60000 });
 
-    // Compile TypeScript — find the server dir (could be repo root or server/ subdir)
     const tscDir = fs.existsSync(path.join(GIT_ROOT, "server", "tsconfig.json"))
       ? path.join(GIT_ROOT, "server")
       : GIT_ROOT;
-    execSync("npx tsc", { cwd: tscDir, stdio: "pipe", timeout: 120000 });
+    await execAsync("npx tsc", { cwd: tscDir, timeout: 120000 });
 
     // Mark this remote version as applied BEFORE restarting
     fs.writeFileSync(lastAppliedFile, remote);
