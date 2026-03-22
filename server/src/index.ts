@@ -14,7 +14,7 @@ import { ClientMessage, SessionInfo } from "./protocol";
 import { SocketClaudePlugin, PluginContext } from "./plugin-api";
 import { RelayClient, RelayStatus } from "./relay-client";
 import { loadOrCreateKeyPair, toBase64 } from "./relay-crypto";
-import { listSkills, getSkill, saveSkill, deleteSkill, listMarketplacePlugins, runPluginCommand } from "./skills-manager";
+import { listSkills, getSkill, saveSkill, deleteSkill, listMarketplacePlugins, runPluginCommand, listMarketplaces, addMarketplace, updateMarketplace, removeMarketplace } from "./skills-manager";
 
 const PORT = parseInt(process.env.PORT || "8085", 10);
 const DEFAULT_CWD = process.env.DEFAULT_CWD || process.cwd();
@@ -1106,6 +1106,58 @@ function createConnectionHandler(transport: ClientTransport) {
         }).catch((e: any) => {
           sendJson({ type: `plugins_${action}_result`, pluginId, ok: false, error: e.message || String(e) });
         });
+        break;
+      }
+
+      case "marketplaces_list": {
+        try {
+          sendJson({ type: "marketplaces_list", marketplaces: listMarketplaces() });
+        } catch (e: any) {
+          sendJson({ type: "marketplaces_list", marketplaces: [], error: e.message || String(e) });
+        }
+        break;
+      }
+
+      case "marketplaces_add": {
+        const url = (msg as any).url as string;
+        if (!url) {
+          sendJson({ type: "marketplaces_add_result", ok: false, error: "Missing url" });
+          break;
+        }
+        addMarketplace(url).then((info) => {
+          sendJson({ type: "marketplaces_add_result", ok: true, marketplace: info, marketplaces: listMarketplaces() });
+        }).catch((e: any) => {
+          sendJson({ type: "marketplaces_add_result", ok: false, error: e.message || String(e) });
+        });
+        break;
+      }
+
+      case "marketplaces_update": {
+        const mpName = (msg as any).name as string;
+        if (!mpName) {
+          sendJson({ type: "marketplaces_update_result", ok: false, error: "Missing name" });
+          break;
+        }
+        updateMarketplace(mpName).then((info) => {
+          sendJson({ type: "marketplaces_update_result", ok: true, marketplace: info, marketplaces: listMarketplaces() });
+        }).catch((e: any) => {
+          sendJson({ type: "marketplaces_update_result", ok: false, error: e.message || String(e) });
+        });
+        break;
+      }
+
+      case "marketplaces_remove": {
+        const rmName = (msg as any).name as string;
+        if (!rmName) {
+          sendJson({ type: "marketplaces_remove_result", ok: false, error: "Missing name" });
+          break;
+        }
+        try {
+          removeMarketplace(rmName);
+          sendJson({ type: "marketplaces_remove_result", ok: true, name: rmName, marketplaces: listMarketplaces() });
+        } catch (e: any) {
+          sendJson({ type: "marketplaces_remove_result", ok: false, error: e.message || String(e) });
+        }
         break;
       }
 

@@ -278,7 +278,11 @@ export type ClientMessage =
   | { type: "plugins_install"; pluginId: string }
   | { type: "plugins_uninstall"; pluginId: string }
   | { type: "plugins_enable"; pluginId: string }
-  | { type: "plugins_disable"; pluginId: string };
+  | { type: "plugins_disable"; pluginId: string }
+  | { type: "marketplaces_list" }
+  | { type: "marketplaces_add"; url: string }
+  | { type: "marketplaces_update"; name: string }
+  | { type: "marketplaces_remove"; name: string };
 
 // ── Server → Client messages ──
 

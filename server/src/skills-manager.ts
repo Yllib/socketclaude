@@ -339,6 +339,119 @@ export function listMarketplacePlugins(): MarketplacePlugin[] {
   return results.sort((a, b) => a.name.localeCompare(b.name));
 }
 
+// ── Marketplace CRUD ──
+
+export interface MarketplaceInfo {
+  /** Directory name (used as identifier) */
+  name: string;
+  /** Remote git URL (if available) */
+  url: string;
+  /** Number of plugins in this marketplace */
+  pluginCount: number;
+  /** Owner/author from marketplace.json */
+  owner: string;
+  /** Description from marketplace.json */
+  description: string;
+}
+
+function getMarketplacesDir(): string {
+  return path.join(os.homedir(), ".claude", "plugins", "marketplaces");
+}
+
+/** List all installed marketplaces with metadata */
+export function listMarketplaces(): MarketplaceInfo[] {
+  const base = getMarketplacesDir();
+  if (!fs.existsSync(base)) return [];
+
+  const { execSync } = require("child_process") as typeof import("child_process");
+  const results: MarketplaceInfo[] = [];
+
+  for (const name of fs.readdirSync(base)) {
+    const mpDir = path.join(base, name);
+    try { if (!fs.statSync(mpDir).isDirectory()) continue; } catch { continue; }
+
+    let url = "";
+    try {
+      url = execSync("git remote get-url origin", { cwd: mpDir, stdio: "pipe", timeout: 5000 }).toString().trim();
+    } catch {}
+
+    let pluginCount = 0;
+    let owner = "";
+    let description = "";
+    const jsonPath = path.join(mpDir, ".claude-plugin", "marketplace.json");
+    try {
+      if (fs.existsSync(jsonPath)) {
+        const registry = JSON.parse(fs.readFileSync(jsonPath, "utf-8"));
+        pluginCount = (registry.plugins || []).length;
+        owner = registry.owner?.name || "";
+        description = registry.description || "";
+      }
+    } catch {}
+
+    results.push({ name, url, pluginCount, owner, description });
+  }
+
+  return results.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/** Add a marketplace by cloning a git repo */
+export async function addMarketplace(url: string): Promise<MarketplaceInfo> {
+  const { exec } = require("child_process") as typeof import("child_process");
+  const base = getMarketplacesDir();
+  fs.mkdirSync(base, { recursive: true });
+
+  // Derive directory name from URL (e.g. "https://github.com/user/my-plugins.git" → "my-plugins")
+  const urlName = url.replace(/\.git$/, "").split("/").pop() || "marketplace";
+
+  // Ensure unique name
+  let dirName = urlName;
+  let i = 2;
+  while (fs.existsSync(path.join(base, dirName))) {
+    dirName = `${urlName}-${i++}`;
+  }
+
+  const target = path.join(base, dirName);
+
+  return new Promise((resolve, reject) => {
+    exec(`git clone "${url}" "${target}"`, { timeout: 120000 }, (err, stdout, stderr) => {
+      if (err) {
+        reject(new Error(stderr || stdout || err.message || "git clone failed"));
+        return;
+      }
+      // Read back the marketplace info
+      const all = listMarketplaces();
+      const info = all.find(m => m.name === dirName);
+      resolve(info || { name: dirName, url, pluginCount: 0, owner: "", description: "" });
+    });
+  });
+}
+
+/** Update a marketplace by pulling latest from git */
+export async function updateMarketplace(name: string): Promise<MarketplaceInfo> {
+  const { exec } = require("child_process") as typeof import("child_process");
+  const mpDir = path.join(getMarketplacesDir(), name);
+  if (!fs.existsSync(mpDir)) throw new Error(`Marketplace "${name}" not found`);
+
+  return new Promise((resolve, reject) => {
+    exec("git pull", { cwd: mpDir, timeout: 60000 }, (err, stdout, stderr) => {
+      if (err) {
+        reject(new Error(stderr || stdout || err.message || "git pull failed"));
+        return;
+      }
+      const all = listMarketplaces();
+      const info = all.find(m => m.name === name);
+      resolve(info || { name, url: "", pluginCount: 0, owner: "", description: "" });
+    });
+  });
+}
+
+/** Remove a marketplace directory */
+export function removeMarketplace(name: string): void {
+  const mpDir = path.join(getMarketplacesDir(), name);
+  if (!fs.existsSync(mpDir)) throw new Error(`Marketplace "${name}" not found`);
+  fs.rmSync(mpDir, { recursive: true, force: true });
+}
+
 /** Cached claude binary path */
 let _claudeBinary: string | null = null;
 

@@ -26,9 +26,11 @@ Flutter App (Android) ←—WebSocket (JSON)—→ Node.js Server ←—Agent SD
 
 Compile: `cd /home/rdp/claude/socketclaude-public/server && npx tsc`
 
-Runs as **systemd user service** (`socketclaude.service`). Auto-restarts on crash, auto-updates from git every 60s (pulls with `--rebase`, compiles, restarts when no sessions active).
+Runs as **systemd user service** (`socketclaude.service`). Auto-restarts on crash, auto-updates from git every 60s (resets to origin, installs deps with `npm ci`, compiles, restarts when no sessions active).
 
-**IMPORTANT: When running from the app, always use the restart script** instead of raw `systemctl restart`:
+**CRITICAL: Do NOT restart the server manually unless absolutely necessary.** To deploy server changes, just commit and push — the auto-update will pick it up within 60s. This applies to all servers (local and remote).
+
+**If a manual restart is truly needed (e.g. server is crashed/stuck), use the restart script** instead of raw `systemctl restart`:
 ```bash
 /home/rdp/claude/socketclaude-public/server/scripts/restart-server.sh
 # Or skip compilation if already compiled:
@@ -51,7 +53,7 @@ All message types (client→server and server→client) are defined in `src/prot
 
 ### Build & Deploy
 
-**IMPORTANT: Always use the build script** instead of running `flutter build` directly.
+**CRITICAL: NEVER run `flutter build` directly. ALWAYS use the build script below.** Running `flutter build` directly will bypass signing, version management, and output path conventions. This is a hard rule with no exceptions.
 
 ```bash
 # Build only (for testing / sending to user):
