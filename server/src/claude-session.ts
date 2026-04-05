@@ -12,7 +12,7 @@ import {
   QuestionItem,
   SessionInfo,
 } from "./protocol";
-import { saveSession, updateSessionActivity, appendHistory, saveTodos, getTodos, remapSession, markQuestionAnswered, appendSdkEvent } from "./session-store";
+import { saveSession, updateSessionActivity, appendHistory, saveTodos, getTodos, remapSession, markQuestionAnswered, appendSdkEvent, assignUserUuid } from "./session-store";
 import { saveScheduledTask, ScheduledTask, RecurrenceConfig } from "./scheduled-task-store";
 import { SocketClaudePlugin, SessionContext } from "./plugin-api";
 import { generateKokoroAudio, isKokoroAvailable } from "./kokoro-tts";
@@ -367,6 +367,15 @@ export class ClaudeSession {
     if (this.activeQuery) {
       await this.activeQuery.setModel(model);
       console.log(`[Model] Set to ${model || 'default'} for session ${this.sessionId || '(pending)'}`);
+    }
+  }
+
+  /** Switch permission mode mid-session (e.g., 'plan', 'default', 'acceptEdits'). */
+  async setPermissionMode(mode: string): Promise<void> {
+    if (this.activeQuery) {
+      await this.activeQuery.setPermissionMode(mode as any);
+      this._permissionMode = mode;
+      console.log(`[PermissionMode] Set to ${mode} for session ${this.sessionId || '(pending)'}`);
     }
   }
 
@@ -1053,6 +1062,18 @@ export class ClaudeSession {
               } as any;
               this.send(elicitMsg);
 
+              // Persist to history so it survives session resume
+              if (this.sessionId) {
+                appendHistory(this.sessionId, {
+                  role: "elicitation_url",
+                  content: message || `${serverName} requires authentication`,
+                  questionId: qId,
+                  mcpServerName: serverName,
+                  url,
+                  timestamp: new Date().toISOString(),
+                });
+              }
+
               // Wait for user to complete the URL flow or cancel
               const answers = await new Promise<Record<string, string>>((resolve) => {
                 this.pendingQuestions.set(qId, { questionId: qId, resolve, questionData: elicitMsg });
@@ -1600,6 +1621,48 @@ export class ClaudeSession {
           } as any);
         }
 
+        // Forward hook lifecycle messages
+        if (message.type === "system" && (message as any).subtype === "hook_started") {
+          const hs = message as any;
+          console.log(`[SDK] Hook started: ${hs.hook_name} (${hs.hook_event})`);
+          this.send({
+            type: "hook_started",
+            hookId: hs.hook_id || "",
+            hookName: hs.hook_name || "",
+            hookEvent: hs.hook_event || "",
+            sessionId: this.sessionId || "",
+          } as any);
+        }
+
+        if (message.type === "system" && (message as any).subtype === "hook_progress") {
+          const hp = message as any;
+          this.send({
+            type: "hook_progress",
+            hookId: hp.hook_id || "",
+            hookName: hp.hook_name || "",
+            hookEvent: hp.hook_event || "",
+            stdout: hp.stdout || "",
+            stderr: hp.stderr || "",
+            sessionId: this.sessionId || "",
+          } as any);
+        }
+
+        if (message.type === "system" && (message as any).subtype === "hook_response") {
+          const hr = message as any;
+          console.log(`[SDK] Hook response: ${hr.hook_name} (${hr.hook_event}) outcome=${hr.outcome}`);
+          this.send({
+            type: "hook_response",
+            hookId: hr.hook_id || "",
+            hookName: hr.hook_name || "",
+            hookEvent: hr.hook_event || "",
+            stdout: hr.stdout || "",
+            stderr: hr.stderr || "",
+            exitCode: hr.exit_code,
+            outcome: hr.outcome || "success",
+            sessionId: this.sessionId || "",
+          } as any);
+        }
+
         // Forward local command output (#11)
         if (message.type === "system" && (message as any).subtype === "local_command_output") {
           const lco = message as any;
@@ -1614,12 +1677,21 @@ export class ClaudeSession {
         // Forward prompt suggestions (#12)
         if (message.type === "prompt_suggestion") {
           const ps = message as any;
-          console.log(`[SDK] Prompt suggestion: ${ps.suggestion?.slice(0, 80)}`);
+          const suggestion = ps.suggestion || "";
+          console.log(`[SDK] Prompt suggestion: ${suggestion.slice(0, 80)}`);
           this.send({
             type: "prompt_suggestion",
-            suggestion: ps.suggestion || "",
+            suggestion,
             sessionId: this.sessionId || "",
           } as any);
+          // Persist in session history so it can be restored on resume
+          if (this.sessionId && suggestion) {
+            appendHistory(this.sessionId, {
+              role: "prompt_suggestion",
+              content: suggestion,
+              timestamp: new Date().toISOString(),
+            });
+          }
         }
 
         if (message.type === "stream_event") {
@@ -1903,20 +1975,18 @@ export class ClaudeSession {
 
         if (message.type === "user") {
           // Forward user message UUID to app for rewind support
+          // Only for real user prompts, not synthetic tool result messages
           const userMsgUuid = (message as any).uuid || undefined;
-          if (userMsgUuid) {
+          const isSynthetic = (message as any).isSynthetic || (message as any).tool_use_result != null;
+          if (userMsgUuid && !isSynthetic) {
             this.send({
               type: "user_message_uuid",
               uuid: userMsgUuid,
               sessionId: this.sessionId || "",
             } as any);
-            // Persist UUID linkage so history loader can restore it
+            // Store UUID directly on the user history entry (not as a separate entry)
             if (this.sessionId) {
-              appendHistory(this.sessionId, {
-                role: "user_uuid",
-                content: userMsgUuid,
-                timestamp: now(),
-              });
+              assignUserUuid(this.sessionId, userMsgUuid);
             }
           }
           const apiMessage = (message as any).message;

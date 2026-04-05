@@ -145,6 +145,24 @@ export function appendHistory(sessionId: string, entry: HistoryEntry): void {
   fs.writeFileSync(file, JSON.stringify(entries, null, 2), "utf-8");
 }
 
+/** Assign UUID to the most recent user history entry (for rewind support) */
+export function assignUserUuid(sessionId: string, uuid: string): void {
+  ensureHistoryDir();
+  const file = historyFile(sessionId);
+  if (!fs.existsSync(file)) return;
+  try {
+    const entries: HistoryEntry[] = JSON.parse(fs.readFileSync(file, "utf-8"));
+    // Walk backwards to find the most recent user entry without a uuid
+    for (let i = entries.length - 1; i >= 0; i--) {
+      if (entries[i].role === "user" && !entries[i].uuid) {
+        entries[i].uuid = uuid;
+        fs.writeFileSync(file, JSON.stringify(entries, null, 2), "utf-8");
+        return;
+      }
+    }
+  } catch {}
+}
+
 /** Mark a question entry as answered in the history file */
 export function markQuestionAnswered(sessionId: string, questionId: string): void {
   ensureHistoryDir();
@@ -171,6 +189,20 @@ export function getHistory(sessionId: string): HistoryEntry[] {
     return [];
   }
   return JSON.parse(fs.readFileSync(file, "utf-8"));
+}
+
+/**
+ * Get the last prompt suggestion stored in session history.
+ * Returns the suggestion string, or undefined if none exists.
+ */
+export function getLastPromptSuggestion(sessionId: string): string | undefined {
+  const all = getHistory(sessionId);
+  for (let i = all.length - 1; i >= 0; i--) {
+    if (all[i].role === "prompt_suggestion") {
+      return all[i].content;
+    }
+  }
+  return undefined;
 }
 
 /**

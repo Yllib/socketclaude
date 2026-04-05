@@ -145,6 +145,11 @@ export interface SetModelMessage {
   model?: string;
 }
 
+export interface SetPermissionModeMessage {
+  type: "set_permission_mode";
+  mode: string;
+}
+
 export interface McpStatusRequestMessage {
   type: "mcp_status";
 }
@@ -246,6 +251,7 @@ export type ClientMessage =
   | StopTaskMessage
   | ForkSessionMessage
   | SetModelMessage
+  | SetPermissionModeMessage
   | McpStatusRequestMessage
   | McpReconnectMessage
   | McpToggleMessage
@@ -415,7 +421,7 @@ export interface SessionCreatedServerMessage {
 }
 
 export interface HistoryEntry {
-  role: "user" | "assistant" | "tool_call" | "tool_result" | "tool_image" | "question" | "todos_update" | "user_uuid";
+  role: "user" | "assistant" | "tool_call" | "tool_result" | "tool_image" | "question" | "todos_update" | "user_uuid" | "elicitation_url" | "prompt_suggestion";
   content: string;
   toolName?: string;
   toolInput?: Record<string, unknown>;
@@ -438,6 +444,9 @@ export interface HistoryEntry {
   // Tool image fields (role === "tool_image")
   filePath?: string;
   mimeType?: string;
+  // Elicitation URL fields (role === "elicitation_url")
+  mcpServerName?: string;
+  url?: string;
 }
 
 export interface SessionHistoryServerMessage {
@@ -670,6 +679,36 @@ export interface ElicitationUrlServerMessage {
   sessionId: string;
 }
 
+export interface HookStartedServerMessage {
+  type: "hook_started";
+  hookId: string;
+  hookName: string;
+  hookEvent: string;
+  sessionId: string;
+}
+
+export interface HookProgressServerMessage {
+  type: "hook_progress";
+  hookId: string;
+  hookName: string;
+  hookEvent: string;
+  stdout: string;
+  stderr: string;
+  sessionId: string;
+}
+
+export interface HookResponseServerMessage {
+  type: "hook_response";
+  hookId: string;
+  hookName: string;
+  hookEvent: string;
+  stdout: string;
+  stderr: string;
+  exitCode?: number;
+  outcome: string;
+  sessionId: string;
+}
+
 export interface UsageUpdateServerMessage {
   type: "usage_update";
   inputTokens: number;
@@ -719,4 +758,7 @@ export type ServerMessage =
   | SessionLifecycleServerMessage
   | TaskCompletedHookServerMessage
   | ElicitationUrlServerMessage
-  | UsageUpdateServerMessage;
+  | UsageUpdateServerMessage
+  | HookStartedServerMessage
+  | HookProgressServerMessage
+  | HookResponseServerMessage;

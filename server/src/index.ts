@@ -7,7 +7,7 @@ import * as http from "http";
 import * as path from "path";
 import { WebSocketServer, WebSocket } from "ws";
 import { ClaudeSession } from "./claude-session";
-import { listSessions, getSession, saveSession, getHistory, getHistoryPage, getHistoryPageToLastPrompt, deleteSession, clearSessionContext, cleanupPendingToolCalls, getTodos, getMissedMessages, appendHistory, getSdkEvents, markQuestionAnswered, getLastHistoryTimestamp, listSdkSessions, getRecentCwds, addRecentCwd, removeRecentCwd, truncateHistoryAtMessage } from "./session-store";
+import { listSessions, getSession, saveSession, getHistory, getHistoryPage, getHistoryPageToLastPrompt, deleteSession, clearSessionContext, cleanupPendingToolCalls, getTodos, getMissedMessages, appendHistory, getSdkEvents, markQuestionAnswered, getLastHistoryTimestamp, listSdkSessions, getRecentCwds, addRecentCwd, removeRecentCwd, truncateHistoryAtMessage, getLastPromptSuggestion } from "./session-store";
 import { listScheduledTasks, getScheduledTask, saveScheduledTask, deleteScheduledTask, getDueTasks, getNextRunTime, getScheduledTaskSessionIds, ScheduledTask } from "./scheduled-task-store";
 import { DesktopCliWatcher } from "./desktop-cli-watcher";
 import { ClientMessage, SessionInfo } from "./protocol";
@@ -320,6 +320,7 @@ function createConnectionHandler(transport: ClientTransport) {
           ? getHistoryPageToLastPrompt(msg.sessionId, 50)
           : getHistoryPage(msg.sessionId, 50);
         const todos = getTodos(msg.sessionId);
+        const lastSuggestion = getLastPromptSuggestion(msg.sessionId);
         sendJson({
           type: "session_history",
           sessionId: msg.sessionId,
@@ -327,6 +328,7 @@ function createConnectionHandler(transport: ClientTransport) {
           total: page.total,
           offset: page.offset,
           ...(todos.length > 0 ? { todos } : {}),
+          ...(lastSuggestion ? { promptSuggestion: lastSuggestion } : {}),
         });
 
         // Check for missed messages from Claude Code's session file
@@ -1005,6 +1007,17 @@ function createConnectionHandler(transport: ClientTransport) {
           activeSession.setModel(model).catch(e => {
             console.error(`[set_model] error: ${e}`);
             sendJson({ type: "error", message: `Failed to set model: ${e.message || e}` });
+          });
+        }
+        break;
+      }
+
+      case "set_permission_mode": {
+        const mode = (msg as any).mode as string;
+        if (activeSession && mode) {
+          activeSession.setPermissionMode(mode).catch(e => {
+            console.error(`[set_permission_mode] error: ${e}`);
+            sendJson({ type: "error", message: `Failed to set permission mode: ${(e as any).message || e}` });
           });
         }
         break;
