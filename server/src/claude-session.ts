@@ -52,6 +52,7 @@ export class ClaudeSession {
   private _authErrorSent = false;  // suppress duplicate exit-code error after auth failure
   private _authState: string | null = null;  // OAuth state param from the auth URL
   private _lastContextWindow = 0;  // last known context window size from modelUsage
+  private _sessionModel: string | null = null;  // model reported by SessionStart hook
   private _streamingText = "";  // accumulated text for the current streaming response
   private _streamingThinking = "";  // accumulated thinking for the current thinking block
   private _lastPreview: string = "";
@@ -220,6 +221,10 @@ export class ClaudeSession {
 
   get permissionMode(): string | null {
     return this._permissionMode;
+  }
+
+  get sessionModel(): string | null {
+    return this._sessionModel;
   }
 
   /** Active background task IDs (agentId → toolUseId) */
@@ -833,6 +838,7 @@ export class ClaudeSession {
                   const model = input.model || "";
                   const agentType = input.agent_type || "";
                   console.log(`[Hook] SessionStart: source=${source} model=${model} agentType=${agentType}`);
+                  if (model) this._sessionModel = model;
                   this.send({
                     type: "session_lifecycle",
                     event: "start",
@@ -841,6 +847,14 @@ export class ClaudeSession {
                     agentType: agentType || undefined,
                     sessionId: this.sessionId || "",
                   } as any);
+                  // Persist in history for restore on session resume
+                  if (this.sessionId) {
+                    appendHistory(this.sessionId, {
+                      role: "assistant",
+                      content: `[session_lifecycle:start:${source}${model ? ':' + model : ''}]`,
+                      timestamp: new Date().toISOString(),
+                    });
+                  }
                 } catch {}
                 return { continue: true };
               }],
@@ -856,6 +870,14 @@ export class ClaudeSession {
                     reason,
                     sessionId: this.sessionId || "",
                   } as any);
+                  // Persist in history for restore on session resume
+                  if (this.sessionId) {
+                    appendHistory(this.sessionId, {
+                      role: "assistant",
+                      content: `[session_lifecycle:end:${reason}]`,
+                      timestamp: new Date().toISOString(),
+                    });
+                  }
                 } catch {}
                 return { continue: true };
               }],

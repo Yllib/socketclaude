@@ -23,6 +23,11 @@ export class DesktopCliWatcher {
   private jsonlPath: string;
   private lastMtime = 0;
   private stopped = false;
+  private _isActive = false;
+  private activityClearTimer: NodeJS.Timeout | null = null;
+
+  /** Whether the desktop CLI is actively writing to this session's JSONL. */
+  get isActive(): boolean { return this._isActive; }
 
   constructor(private opts: DesktopCliWatcherOptions) {
     this.jsonlPath = getJsonlPath(opts.sessionId, opts.cwd);
@@ -65,6 +70,7 @@ export class DesktopCliWatcher {
 
   stop(): void {
     this.stopped = true;
+    this._isActive = false;
     if (this.watcher) {
       this.watcher.close();
       this.watcher = null;
@@ -81,6 +87,10 @@ export class DesktopCliWatcher {
       clearTimeout(this.quietTimer);
       this.quietTimer = null;
     }
+    if (this.activityClearTimer) {
+      clearTimeout(this.activityClearTimer);
+      this.activityClearTimer = null;
+    }
   }
 
   /** Manual sync trigger */
@@ -93,6 +103,12 @@ export class DesktopCliWatcher {
 
     // Ignore changes caused by our own SDK query
     if (this.opts.isOurQueryRunning()) return;
+
+    // Mark desktop CLI as active (JSONL is being written to externally)
+    this._isActive = true;
+    if (this.activityClearTimer) clearTimeout(this.activityClearTimer);
+    // Clear activity flag after 10s of no changes
+    this.activityClearTimer = setTimeout(() => { this._isActive = false; }, 10000);
 
     // Debounce rapid writes (CLI doing multiple tool calls)
     if (this.debounceTimer) clearTimeout(this.debounceTimer);

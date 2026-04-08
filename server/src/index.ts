@@ -2088,6 +2088,8 @@ function buildStatusSyncMessage(): string {
   const runningSessions: string[] = [];
   const compactingSessions: string[] = [];
   const backgroundTaskIds: string[] = [];
+  const desktopCliSessions: string[] = [];
+  const sessionModels: Record<string, string> = {};
   for (const [sid, session] of activeSessions) {
     if (session.isRunning) {
       anyRunning = true;
@@ -2099,6 +2101,15 @@ function buildStatusSyncMessage(): string {
     for (const [taskId] of session.activeBackgroundTasks) {
       backgroundTaskIds.push(taskId);
     }
+    if (session.sessionModel) {
+      sessionModels[sid] = session.sessionModel;
+    }
+  }
+  // Check which sessions have active desktop CLI usage
+  for (const [sid, watcher] of desktopWatchers) {
+    if (watcher.isActive) {
+      desktopCliSessions.push(sid);
+    }
   }
   return JSON.stringify({
     type: "status_sync",
@@ -2109,6 +2120,8 @@ function buildStatusSyncMessage(): string {
     serverPid: process.pid,
     serverVersion: SERVER_GIT_HASH || undefined,
     backgroundTaskIds,
+    ...(desktopCliSessions.length > 0 ? { desktopCliSessions } : {}),
+    ...(Object.keys(sessionModels).length > 0 ? { sessionModels } : {}),
   });
 }
 
