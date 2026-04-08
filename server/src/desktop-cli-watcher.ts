@@ -25,9 +25,20 @@ export class DesktopCliWatcher {
   private stopped = false;
   private _isActive = false;
   private activityClearTimer: NodeJS.Timeout | null = null;
+  private _queryEndedAt = 0;  // timestamp when our query last ended
 
   /** Whether the desktop CLI is actively writing to this session's JSONL. */
   get isActive(): boolean { return this._isActive; }
+
+  /** Call when our own SDK query finishes to prevent false desktop CLI detection. */
+  markQueryEnded(): void {
+    this._queryEndedAt = Date.now();
+    this._isActive = false;
+    // Refresh mtime so we don't pick up our own final writes
+    try {
+      this.lastMtime = fs.statSync(this.jsonlPath).mtimeMs;
+    } catch {}
+  }
 
   constructor(private opts: DesktopCliWatcherOptions) {
     this.jsonlPath = getJsonlPath(opts.sessionId, opts.cwd);
@@ -103,6 +114,9 @@ export class DesktopCliWatcher {
 
     // Ignore changes caused by our own SDK query
     if (this.opts.isOurQueryRunning()) return;
+
+    // Grace period after our query ends — JSONL writes may still be flushing
+    if (Date.now() - this._queryEndedAt < 5000) return;
 
     // Mark desktop CLI as active (JSONL is being written to externally)
     this._isActive = true;

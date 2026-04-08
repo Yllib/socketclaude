@@ -489,6 +489,8 @@ function createConnectionHandler(transport: ClientTransport) {
               activeSessions.delete(sid);
               console.log(`Session ${sid} completed, removed from active pool`);
             }
+            // Notify desktop CLI watcher our query ended (prevent false active detection)
+            desktopWatchers.get(sid)?.markQueryEnded();
           }
           broadcastSessionList();
         }).catch((err) => {
@@ -572,6 +574,7 @@ function createConnectionHandler(transport: ClientTransport) {
                 const s = activeSession?.getSessionId();
                 if (s && activeSessions.get(s) === activeSession) {
                   activeSessions.delete(s);
+                  desktopWatchers.get(s)?.markQueryEnded();
                 }
                 broadcastSessionList();
               }).catch((err) => {
@@ -1711,10 +1714,12 @@ const httpServer = http.createServer((req, res) => {
           const sid = session.getSessionId() || sessionId;
           if (activeSessions.get(sid) === session) {
             activeSessions.delete(sid);
+            desktopWatchers.get(sid)?.markQueryEnded();
           }
           broadcastSessionList();
         }).catch((err) => {
           console.error(`[Continue] Query error: ${err.message}`);
+          desktopWatchers.get(sessionId)?.markQueryEnded();
           activeSessions.delete(sessionId);
         });
 
