@@ -388,6 +388,8 @@ export interface ResultServerMessage {
   numTurns?: number;
   stopReason?: string;
   resultSubtype?: string;
+  terminalReason?: string;
+  fastModeState?: string;
   errors?: string[];
   permissionDenials?: { tool_name: string; tool_use_id: string; tool_input: Record<string, unknown> }[];
 }

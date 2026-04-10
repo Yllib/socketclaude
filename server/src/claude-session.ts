@@ -12,7 +12,7 @@ import {
   QuestionItem,
   SessionInfo,
 } from "./protocol";
-import { saveSession, updateSessionActivity, appendHistory, saveTodos, getTodos, remapSession, markQuestionAnswered, appendSdkEvent, assignUserUuid } from "./session-store";
+import { saveSession, getSession, updateSessionActivity, appendHistory, saveTodos, getTodos, remapSession, markQuestionAnswered, appendSdkEvent, assignUserUuid } from "./session-store";
 import { saveScheduledTask, ScheduledTask, RecurrenceConfig } from "./scheduled-task-store";
 import { SocketClaudePlugin, SessionContext } from "./plugin-api";
 import { generateKokoroAudio, isKokoroAvailable } from "./kokoro-tts";
@@ -487,6 +487,8 @@ export class ClaudeSession {
       cleanEnv["CLAUDE_CODE_ENABLE_FINE_GRAINED_TOOL_STREAMING"] = "1";
       // Enable bash_progress events in tool_progress (SDK only emits in remote/container mode)
       cleanEnv["CLAUDE_CODE_CONTAINER_ID"] = "socketclaude";
+      // Enable session state change events (idle/running/requires_action)
+      cleanEnv["CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS"] = "1";
 
       // Merge plugin environment variables
       for (const plugin of this.plugins) {
@@ -882,6 +884,26 @@ export class ClaudeSession {
                 return { continue: true };
               }],
             }],
+            TaskCreated: [{
+              hooks: [async (input: any) => {
+                try {
+                  const taskId = input.task_id || "";
+                  const subject = input.task_subject || "";
+                  const description = input.task_description || "";
+                  const teammateName = input.teammate_name || "";
+                  console.log(`[Hook] TaskCreated: id=${taskId} subject=${subject}`);
+                  this.send({
+                    type: "task_created_hook",
+                    taskId,
+                    subject,
+                    description: description || undefined,
+                    teammateName: teammateName || undefined,
+                    sessionId: this.sessionId || "",
+                  } as any);
+                } catch {}
+                return { continue: true };
+              }],
+            }],
             TaskCompleted: [{
               hooks: [async (input: any) => {
                 try {
@@ -1172,7 +1194,7 @@ export class ClaudeSession {
             }
 
             // Map answers back to the schema structure
-            const content: Record<string, unknown> = {};
+            const content: Record<string, string | number | boolean | string[]> = {};
             if (requestedSchema && (requestedSchema as any).properties) {
               const props = (requestedSchema as any).properties;
               for (const [key] of Object.entries(props)) {
@@ -1685,6 +1707,49 @@ export class ClaudeSession {
           } as any);
         }
 
+        // Forward session state changes (idle/running/requires_action)
+        if (message.type === "system" && (message as any).subtype === "session_state_changed") {
+          const sc = message as any;
+          const state = sc.state || "idle";
+          console.log(`[SDK] Session state: ${state}`);
+          this.send({
+            type: "session_state_changed",
+            state,
+            sessionId: this.sessionId || "",
+          } as any);
+        }
+
+        // Forward CWD changes to app
+        if (message.type === "system" && (message as any).subtype === "cwd_changed") {
+          const cc = message as any;
+          const oldCwd = cc.old_cwd || "";
+          const newCwd = cc.new_cwd || cc.cwd || "";
+          if (newCwd) {
+            console.log(`[SDK] CWD changed: ${oldCwd} → ${newCwd}`);
+            this.cwd = newCwd;
+            this.send({
+              type: "cwd_changed",
+              oldCwd,
+              newCwd,
+              sessionId: this.sessionId || "",
+            } as any);
+            // Persist to history for restore on resume
+            if (this.sessionId) {
+              appendHistory(this.sessionId, {
+                role: "assistant",
+                content: `[cwd_changed:${newCwd}]`,
+                timestamp: new Date().toISOString(),
+              });
+            }
+            // Update session store
+            const sessionInfo = this.sessionId ? getSession(this.sessionId) : undefined;
+            if (sessionInfo) {
+              sessionInfo.cwd = newCwd;
+              saveSession(sessionInfo);
+            }
+          }
+        }
+
         // Forward local command output (#11)
         if (message.type === "system" && (message as any).subtype === "local_command_output") {
           const lco = message as any;
@@ -2166,6 +2231,7 @@ export class ClaudeSession {
               numTurns: result.num_turns,
               stopReason: result.stop_reason || undefined,
               subtype: result.subtype || undefined,
+              terminalReason: result.terminal_reason || undefined,
               sessionId: this.sessionId || "",
             } as any);
             continue;
@@ -2237,6 +2303,8 @@ export class ClaudeSession {
             numTurns: result.num_turns,
             stopReason: result.stop_reason || undefined,
             resultSubtype: result.subtype || undefined,
+            terminalReason: result.terminal_reason || undefined,
+            fastModeState: result.fast_mode_state || undefined,
             errors: result.errors?.length ? result.errors : undefined,
             permissionDenials: result.permission_denials?.length ? result.permission_denials : undefined,
           });
