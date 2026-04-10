@@ -244,8 +244,15 @@ export class ClaudeSession {
           const newContent = buf.toString("utf8");
           const lines = newContent.split("\n").filter(l => l.length > 0);
           if (lines.length > 0) {
+            // Send to app immediately for live display in task pane
+            this.send({
+              type: "monitor_output",
+              taskId,
+              content: lines.join("\n"),
+              sessionId: this.sessionId || "",
+            } as any);
+            // Accumulate for Claude injection (5s debounce)
             state.outputBuffer.push(...lines);
-            // Reset 5s debounce timer
             if (state.debounceTimer) clearTimeout(state.debounceTimer);
             state.debounceTimer = setTimeout(() => {
               this._flushMonitorBuffer(taskId);
@@ -280,15 +287,7 @@ export class ClaudeSession {
     const text = `[Monitor: "${state.description}" (${taskId})]\n${content}`;
     console.log(`[Monitor] Flushing ${content.length} chars for ${taskId}`);
 
-    // Send to app for display
-    this.send({
-      type: "monitor_output",
-      taskId,
-      content,
-      sessionId: this.sessionId || "",
-    } as any);
-
-    // Inject to Claude or start new query
+    // Inject to Claude or start new query (app already gets live output from reader)
     if (this._isRunning && this.activeQuery) {
       this.injectMessage(text, 'next').catch(e => {
         console.error(`[Monitor] Inject error: ${e}`);
