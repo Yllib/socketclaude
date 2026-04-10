@@ -388,6 +388,15 @@ function createConnectionHandler(transport: ClientTransport) {
           ...(resumePermMode ? { permissionMode: resumePermMode } : {}),
         });
 
+        // Send detailed context usage on resume (if session has an active query)
+        if (existing) {
+          (existing as any).activeQuery?.getContextUsage().then((ctx: any) => {
+            if (ctx) {
+              sendJson({ type: "context_usage", sessionId: msg.sessionId, ...ctx });
+            }
+          }).catch(() => {});
+        }
+
         // Re-send accumulated bash output so the reconnecting client sees live output
         if (resumeRunning && existing) {
           const bashOutput = existing.getAccumulatedBashOutput();

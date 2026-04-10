@@ -1461,6 +1461,17 @@ export class ClaudeSession {
             } catch (e) {
               console.warn(`[Init] supportedAgents not available: ${e}`);
             }
+
+            // Fetch initial context usage
+            this.activeQuery.getContextUsage().then((ctx: any) => {
+              if (ctx) {
+                this.send({
+                  type: "context_usage",
+                  sessionId: this.sessionId || "",
+                  ...ctx,
+                } as any);
+              }
+            }).catch(() => {});
           }
 
           // Log user prompt now that we have the session ID (for new sessions)

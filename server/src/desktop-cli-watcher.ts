@@ -25,7 +25,7 @@ export class DesktopCliWatcher {
   private stopped = false;
   private _isActive = false;
   private activityClearTimer: NodeJS.Timeout | null = null;
-  private _queryEndedAt = 0;  // timestamp when our query last ended
+  private _queryEndedAt = Date.now();  // grace period on creation to ignore pre-existing changes
 
   /** Whether the desktop CLI is actively writing to this session's JSONL. */
   get isActive(): boolean { return this._isActive; }
