@@ -2317,6 +2317,20 @@ export class ClaudeSession {
               : undefined;
             updateSessionActivity(this.sessionId, lastResultContent, usageWithCost);
           }
+
+          // Fetch detailed context usage breakdown from SDK (async, non-blocking)
+          if (this.activeQuery) {
+            this.activeQuery.getContextUsage().then((ctx: any) => {
+              if (ctx) {
+                this.send({
+                  type: "context_usage",
+                  sessionId: this.sessionId || "",
+                  ...ctx,
+                } as any);
+              }
+            }).catch(() => {});
+          }
+
           this.onActivity?.();
           currentText = "";
         }

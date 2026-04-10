@@ -1188,6 +1188,21 @@ function createConnectionHandler(transport: ClientTransport) {
         break;
       }
 
+      case "get_context_usage": {
+        if (activeSession && activeSession.isRunning) {
+          (activeSession as any).activeQuery?.getContextUsage().then((ctx: any) => {
+            if (ctx) {
+              sendJson({
+                type: "context_usage",
+                sessionId: activeSessionId || "",
+                ...ctx,
+              });
+            }
+          }).catch(() => {});
+        }
+        break;
+      }
+
       case "mcp_reconnect": {
         const serverName = (msg as any).serverName as string;
         if (activeSession && serverName) {

@@ -48,6 +48,11 @@ export class DesktopCliWatcher {
   start(): void {
     this.stopped = false;
 
+    // Seed lastMtime from current file so the first poll doesn't false-positive
+    try {
+      this.lastMtime = fs.statSync(this.jsonlPath).mtimeMs;
+    } catch {}
+
     // Try fs.watch first (inotify on Linux — efficient)
     try {
       if (fs.existsSync(this.jsonlPath)) {

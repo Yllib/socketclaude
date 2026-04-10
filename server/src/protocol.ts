@@ -154,6 +154,10 @@ export interface McpStatusRequestMessage {
   type: "mcp_status";
 }
 
+export interface GetContextUsageMessage {
+  type: "get_context_usage";
+}
+
 export interface McpReconnectMessage {
   type: "mcp_reconnect";
   serverName: string;
@@ -253,6 +257,7 @@ export type ClientMessage =
   | SetModelMessage
   | SetPermissionModeMessage
   | McpStatusRequestMessage
+  | GetContextUsageMessage
   | McpReconnectMessage
   | McpToggleMessage
   | RewindMessage
