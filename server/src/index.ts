@@ -488,6 +488,29 @@ function createConnectionHandler(transport: ClientTransport) {
 
         activeSession.onActivity = () => scheduleBroadcast();
 
+        // Set up monitor output callback — starts a new query when session is idle
+        activeSession.onMonitorOutput = (text: string) => {
+          if (!activeSession) return;
+          if (activeSession.isRunning) {
+            // Race: session started running between debounce and callback
+            activeSession.injectMessage(text, 'next').catch(e => console.error(`[Monitor] Inject race: ${e}`));
+            return;
+          }
+          const monitorSid = activeSession.getSessionId() || undefined;
+          console.log(`[Monitor] Starting query for idle session ${monitorSid}`);
+          activeSession.onActivity = () => scheduleBroadcast();
+          activeSession.runQuery(text, monitorSid).then(() => {
+            const s = activeSession?.getSessionId();
+            if (s && activeSessions.get(s) === activeSession) {
+              activeSessions.delete(s);
+              desktopWatchers.get(s)?.markQueryEnded();
+            }
+            broadcastSessionList();
+          }).catch((err) => {
+            console.error(`[Monitor] Query error: ${err.message || err}`);
+          });
+        };
+
         activeSession.runQuery(msg.text, resumeId).then(() => {
           const sid = activeSession?.getSessionId();
           if (sid && activeSessions.get(sid) === activeSession) {
@@ -1009,6 +1032,15 @@ function createConnectionHandler(transport: ClientTransport) {
         console.log(`[stop_task] received: taskId=${taskId} activeSession=${!!activeSession}`);
         if (activeSession && taskId) {
           activeSession.stopTask(taskId).catch(e => console.error(`[stop_task] error: ${e}`));
+        }
+        break;
+      }
+
+      case "stop_monitor": {
+        const monitorTaskId = (msg as any).taskId as string;
+        console.log(`[stop_monitor] received: taskId=${monitorTaskId} activeSession=${!!activeSession}`);
+        if (activeSession && monitorTaskId) {
+          activeSession.stopMonitoring(monitorTaskId);
         }
         break;
       }

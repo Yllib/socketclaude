@@ -1,7 +1,7 @@
 import { query, createSdkMcpServer, tool, forkSession as sdkForkSession } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import * as crypto from "crypto";
-import { execFile } from "child_process";
+import { execFile, spawn } from "child_process";
 import * as pty from "node-pty";
 import * as fs from "fs";
 import * as path from "path";
@@ -23,6 +23,19 @@ interface PendingQuestion {
   questionData?: ServerMessage; // stored so we can re-send on reconnect
 }
 
+interface MonitorState {
+  monitoring: boolean;
+  description: string;
+  outputFile: string;
+  lastSize: number;
+  readerInterval: NodeJS.Timeout | null;
+  debounceTimer: NodeJS.Timeout | null;
+  outputBuffer: string[];
+  timeoutTimer: NodeJS.Timeout | null;
+  timeoutSeconds: number | null;
+  process?: import("child_process").ChildProcess;
+}
+
 export class ClaudeSession {
   static _recentSendFiles: Map<string, number> = new Map();
   private sessionId: string | null = null;
@@ -42,6 +55,8 @@ export class ClaudeSession {
   private _forkFromSessionId?: string;
   private _suppressedToolResultIds: Set<string> = new Set();  // toolUseIds whose results should be hidden from client
   private _taskIdToToolUseId: Map<string, string> = new Map();  // agentId → toolUseId mapping
+  private _monitoredTasks: Map<string, MonitorState> = new Map();
+  private _taskOutputFiles: Map<string, string> = new Map();  // taskId → outputFile path
   private _activeSubagents: Map<string, { toolUseId: string; description: string; subagentType: string; startedAt: string }> = new Map();
   private _activeBashStream: { interval: NodeJS.Timeout; filePath: string; lastSize: number } | null = null;
   private _activeToolUseId: string | null = null;  // currently-executing tool call
@@ -61,6 +76,7 @@ export class ClaudeSession {
   private _lastSupportedCommands: ServerMessage | null = null;
   private _lastSupportedAgents: ServerMessage | null = null;
   public onActivity?: () => void;
+  public onMonitorOutput?: (text: string) => void;
   // When set, this fresh session replaces an old cleared session — remap the ID in the store
   public replacesSessionId?: string;
   // Queue for injecting user messages mid-conversation
@@ -205,6 +221,132 @@ export class ClaudeSession {
       clearInterval(this._activeBashStream.interval);
       this._activeBashStream = null;
     }
+  }
+
+  // ── Monitor output tailing ──
+
+  private _startMonitorReader(taskId: string): void {
+    const state = this._monitoredTasks.get(taskId);
+    if (!state) return;
+    this._stopMonitorReader(taskId);  // clean up any previous reader
+
+    console.log(`[Monitor] Starting reader for ${taskId} on ${state.outputFile}`);
+    state.readerInterval = setInterval(() => {
+      try {
+        if (!fs.existsSync(state.outputFile)) return;
+        const stat = fs.statSync(state.outputFile);
+        if (stat.size > state.lastSize) {
+          const fd = fs.openSync(state.outputFile, "r");
+          const buf = Buffer.alloc(stat.size - state.lastSize);
+          fs.readSync(fd, buf, 0, buf.length, state.lastSize);
+          fs.closeSync(fd);
+          state.lastSize = stat.size;
+          const newContent = buf.toString("utf8");
+          const lines = newContent.split("\n").filter(l => l.length > 0);
+          if (lines.length > 0) {
+            state.outputBuffer.push(...lines);
+            // Reset 5s debounce timer
+            if (state.debounceTimer) clearTimeout(state.debounceTimer);
+            state.debounceTimer = setTimeout(() => {
+              this._flushMonitorBuffer(taskId);
+            }, 5000);
+          }
+        }
+      } catch {}
+    }, 500);
+  }
+
+  private _stopMonitorReader(taskId: string): void {
+    const state = this._monitoredTasks.get(taskId);
+    if (!state) return;
+    if (state.readerInterval) {
+      clearInterval(state.readerInterval);
+      state.readerInterval = null;
+    }
+    if (state.debounceTimer) {
+      clearTimeout(state.debounceTimer);
+      state.debounceTimer = null;
+    }
+  }
+
+  private _flushMonitorBuffer(taskId: string): void {
+    const state = this._monitoredTasks.get(taskId);
+    if (!state || state.outputBuffer.length === 0) return;
+
+    const content = state.outputBuffer.join("\n");
+    state.outputBuffer = [];
+    state.debounceTimer = null;
+
+    const text = `[Monitor: "${state.description}" (${taskId})]\n${content}`;
+    console.log(`[Monitor] Flushing ${content.length} chars for ${taskId}`);
+
+    // Send to app for display
+    this.send({
+      type: "monitor_output",
+      taskId,
+      content,
+      sessionId: this.sessionId || "",
+    } as any);
+
+    // Inject to Claude or start new query
+    if (this._isRunning && this.activeQuery) {
+      this.injectMessage(text, 'next').catch(e => {
+        console.error(`[Monitor] Inject error: ${e}`);
+      });
+    } else if (this.onMonitorOutput) {
+      this.onMonitorOutput(text);
+    }
+  }
+
+  private _cleanupMonitor(taskId: string, flush = false): void {
+    const state = this._monitoredTasks.get(taskId);
+    if (!state) return;
+
+    console.log(`[Monitor] Cleaning up ${taskId} (flush=${flush})`);
+    this._stopMonitorReader(taskId);
+
+    if (flush && state.outputBuffer.length > 0) {
+      this._flushMonitorBuffer(taskId);
+    }
+
+    if (state.timeoutTimer) {
+      clearTimeout(state.timeoutTimer);
+      state.timeoutTimer = null;
+    }
+
+    // Kill Monitor-spawned processes
+    if (state.process) {
+      try {
+        if (state.process.pid) {
+          process.kill(-state.process.pid, "SIGTERM");
+          // Force kill after 5s if still alive
+          setTimeout(() => {
+            try { if (state.process?.pid) process.kill(-state.process.pid, "SIGKILL"); } catch {}
+          }, 5000);
+        }
+      } catch {}
+    }
+
+    this._monitoredTasks.delete(taskId);
+
+    // Notify app
+    this.send({
+      type: "monitor_started",
+      taskId,
+      description: state.description,
+      monitoring: false,
+      sessionId: this.sessionId || "",
+    } as any);
+  }
+
+  private _cleanupAllMonitors(): void {
+    for (const taskId of Array.from(this._monitoredTasks.keys())) {
+      this._cleanupMonitor(taskId, false);
+    }
+  }
+
+  public stopMonitoring(taskId: string): void {
+    this._cleanupMonitor(taskId, true);
   }
 
   getSessionId(): string | null {
@@ -358,6 +500,8 @@ export class ClaudeSession {
       try { this.activeQuery.close(); } catch {}
       this.activeQuery = null;
     }
+    // Kill all monitored processes and clean up readers
+    this._cleanupAllMonitors();
   }
 
   /** Gracefully stop the current query between turns — session stays alive and can continue */
@@ -671,6 +815,214 @@ export class ClaudeSession {
               return { content: [{ type: "text" as const, text: `Task scheduled for ${when}${recurrenceLabel} in ${args.cwd}:\n"${args.prompt.slice(0, 300)}"` }] };
             }
           ),
+          tool(
+            "Monitor",
+            "Monitor background process output. Two modes:\n1. Start a NEW background process with monitoring: provide command + description.\n2. Toggle monitoring on/off for an EXISTING background task: provide taskId.\nWhen monitoring is on, process output is debounced (5s batching) and delivered to you automatically so you can react. Timeout stops monitoring only — the process keeps running. To stop the process itself, use the existing task stop mechanism.",
+            {
+              command: z.string().optional().describe("Shell command to run in background with monitoring enabled (spawn mode)"),
+              description: z.string().optional().describe("Human-readable description of what this process does"),
+              timeoutSeconds: z.number().optional().describe("Auto-stop monitoring after N seconds (process keeps running)"),
+              taskId: z.string().optional().describe("Existing background task ID to toggle monitoring for (toggle mode)"),
+              enabled: z.boolean().optional().describe("Enable (true) or disable (false) monitoring. Default: true"),
+            },
+            async (args) => {
+              try {
+                const isSpawn = !!args.command;
+                const isToggle = !!args.taskId && !args.command;
+
+                if (!isSpawn && !isToggle) {
+                  return { content: [{ type: "text" as const, text: "Monitor requires either 'command' (spawn mode) or 'taskId' (toggle mode)." }], isError: true };
+                }
+
+                if (isToggle) {
+                  // ── Toggle mode: enable/disable monitoring on an existing background task ──
+                  const taskId = args.taskId!;
+                  const enabled = args.enabled !== false;
+
+                  if (!enabled) {
+                    if (this._monitoredTasks.has(taskId)) {
+                      this._cleanupMonitor(taskId, true);
+                      return { content: [{ type: "text" as const, text: `Monitoring disabled for task ${taskId}. Process continues running.` }] };
+                    }
+                    return { content: [{ type: "text" as const, text: `Task ${taskId} is not being monitored.` }] };
+                  }
+
+                  if (this._monitoredTasks.has(taskId)) {
+                    return { content: [{ type: "text" as const, text: `Already monitoring task ${taskId}.` }] };
+                  }
+
+                  // Look up the output file for this task
+                  const outputFile = this._taskOutputFiles.get(taskId);
+                  if (!outputFile) {
+                    // Also check by toolUseId (app sends toolUseId, SDK uses taskId)
+                    let foundTaskId: string | undefined;
+                    for (const [tid, tuid] of this._taskIdToToolUseId.entries()) {
+                      if (tuid === taskId) { foundTaskId = tid; break; }
+                    }
+                    if (foundTaskId && this._taskOutputFiles.has(foundTaskId)) {
+                      // Re-call with the correct SDK taskId
+                      const realOutputFile = this._taskOutputFiles.get(foundTaskId)!;
+                      const desc = args.description || `Task ${foundTaskId}`;
+                      const monitorState: MonitorState = {
+                        monitoring: true,
+                        description: desc,
+                        outputFile: realOutputFile,
+                        lastSize: 0,
+                        readerInterval: null,
+                        debounceTimer: null,
+                        outputBuffer: [],
+                        timeoutTimer: null,
+                        timeoutSeconds: args.timeoutSeconds || null,
+                      };
+                      this._monitoredTasks.set(foundTaskId, monitorState);
+                      this._startMonitorReader(foundTaskId);
+                      if (args.timeoutSeconds) {
+                        monitorState.timeoutTimer = setTimeout(() => {
+                          console.log(`[Monitor] Timeout reached for ${foundTaskId}`);
+                          this._cleanupMonitor(foundTaskId!, true);
+                        }, args.timeoutSeconds * 1000);
+                      }
+                      this.send({ type: "monitor_started", taskId: foundTaskId, description: desc, monitoring: true, sessionId: this.sessionId || "" } as any);
+                      return { content: [{ type: "text" as const, text: `Monitoring enabled for task ${foundTaskId}.${args.timeoutSeconds ? ` Timeout: ${args.timeoutSeconds}s.` : ""}` }] };
+                    }
+                    return { content: [{ type: "text" as const, text: `No output file found for task ${taskId}. The task may not be a backgrounded bash command, or it may have already completed.` }], isError: true };
+                  }
+
+                  const desc = args.description || `Task ${taskId}`;
+                  const monitorState: MonitorState = {
+                    monitoring: true,
+                    description: desc,
+                    outputFile,
+                    lastSize: 0,
+                    readerInterval: null,
+                    debounceTimer: null,
+                    outputBuffer: [],
+                    timeoutTimer: null,
+                    timeoutSeconds: args.timeoutSeconds || null,
+                  };
+                  this._monitoredTasks.set(taskId, monitorState);
+                  this._startMonitorReader(taskId);
+                  if (args.timeoutSeconds) {
+                    monitorState.timeoutTimer = setTimeout(() => {
+                      console.log(`[Monitor] Timeout reached for ${taskId}`);
+                      this._cleanupMonitor(taskId, true);
+                    }, args.timeoutSeconds * 1000);
+                  }
+                  this.send({ type: "monitor_started", taskId, description: desc, monitoring: true, sessionId: this.sessionId || "" } as any);
+                  return { content: [{ type: "text" as const, text: `Monitoring enabled for task ${taskId}.${args.timeoutSeconds ? ` Timeout: ${args.timeoutSeconds}s.` : ""}` }] };
+                }
+
+                // ── Spawn mode: start a new background process with monitoring ──
+                const command = args.command!;
+                const description = args.description || command.slice(0, 60);
+                const taskId = `monitor-${crypto.randomUUID().slice(0, 8)}`;
+                const outputFile = `/tmp/claude-monitor-${taskId}.log`;
+                const syntheticToolUseId = `monitor-${taskId}`;
+
+                console.log(`[Monitor] Spawning: ${command} → ${outputFile}`);
+
+                // Create output file and spawn process
+                const fd = fs.openSync(outputFile, "w");
+                const child = spawn(command, [], {
+                  shell: true,
+                  detached: true,
+                  stdio: ["ignore", fd, fd],
+                  cwd: this.cwd,
+                });
+                child.unref();
+                fs.closeSync(fd);
+
+                // Register in task tracking so it appears in the task pane
+                this._taskIdToToolUseId.set(taskId, syntheticToolUseId);
+                this._taskOutputFiles.set(taskId, outputFile);
+
+                // Create monitor state
+                const monitorState: MonitorState = {
+                  monitoring: true,
+                  description,
+                  outputFile,
+                  lastSize: 0,
+                  readerInterval: null,
+                  debounceTimer: null,
+                  outputBuffer: [],
+                  timeoutTimer: null,
+                  timeoutSeconds: args.timeoutSeconds || null,
+                  process: child,
+                };
+                this._monitoredTasks.set(taskId, monitorState);
+                this._startMonitorReader(taskId);
+
+                // Set timeout if specified
+                if (args.timeoutSeconds) {
+                  monitorState.timeoutTimer = setTimeout(() => {
+                    console.log(`[Monitor] Timeout reached for ${taskId}`);
+                    this._cleanupMonitor(taskId, true);
+                  }, args.timeoutSeconds * 1000);
+                }
+
+                // Notify app about the new task + monitoring state
+                this.send({ type: "task_started", taskId, toolUseId: syntheticToolUseId, description, taskType: "monitor", sessionId: this.sessionId || "" } as any);
+                this.send({ type: "monitor_started", taskId, description, monitoring: true, command, sessionId: this.sessionId || "" } as any);
+
+                // Listen for process exit
+                child.on("exit", (code, signal) => {
+                  console.log(`[Monitor] Process ${taskId} exited: code=${code} signal=${signal}`);
+                  const state = this._monitoredTasks.get(taskId);
+                  if (state) {
+                    // Stop reader and flush remaining output
+                    this._stopMonitorReader(taskId);
+                    // Read any remaining output from file
+                    try {
+                      if (fs.existsSync(outputFile)) {
+                        const stat = fs.statSync(outputFile);
+                        if (stat.size > state.lastSize) {
+                          const fd2 = fs.openSync(outputFile, "r");
+                          const buf = Buffer.alloc(stat.size - state.lastSize);
+                          fs.readSync(fd2, buf, 0, buf.length, state.lastSize);
+                          fs.closeSync(fd2);
+                          const remaining = buf.toString("utf8").split("\n").filter(l => l.length > 0);
+                          if (remaining.length > 0) state.outputBuffer.push(...remaining);
+                        }
+                      }
+                    } catch {}
+
+                    // Flush buffer + send final exit message
+                    if (state.outputBuffer.length > 0) {
+                      this._flushMonitorBuffer(taskId);
+                    }
+
+                    const exitMsg = `[Monitor: "${description}" (${taskId})] Process exited with code ${code ?? "unknown"} (signal: ${signal || "none"})`;
+                    if (this._isRunning && this.activeQuery) {
+                      this.injectMessage(exitMsg, 'next').catch(() => {});
+                    } else if (this.onMonitorOutput) {
+                      this.onMonitorOutput(exitMsg);
+                    }
+
+                    // Clean up (don't flush again)
+                    this._cleanupMonitor(taskId, false);
+                  }
+
+                  // Clean up task tracking
+                  this._taskIdToToolUseId.delete(taskId);
+                  this._taskOutputFiles.delete(taskId);
+
+                  // Notify app task completed
+                  this.send({
+                    type: "task_notification",
+                    taskId,
+                    status: code === 0 ? "completed" : "failed",
+                    summary: `Process exited with code ${code ?? "unknown"}`,
+                    sessionId: this.sessionId || "",
+                  } as any);
+                });
+
+                return { content: [{ type: "text" as const, text: `Process started and monitoring enabled. Task ID: ${taskId}. PID: ${child.pid || "unknown"}.${args.timeoutSeconds ? ` Monitoring timeout: ${args.timeoutSeconds}s.` : ""}` }] };
+              } catch (e: any) {
+                console.error(`[Monitor] Error: ${e.message}`, e.stack);
+                return { content: [{ type: "text" as const, text: `Monitor error: ${e.message}` }], isError: true };
+              }
+            }
+          ),
         ],
       });
 
@@ -688,7 +1040,7 @@ export class ClaudeSession {
         }
       }
 
-      const toolContext = `You can schedule reminders for the user using the ScheduleReminder tool — use ISO 8601 datetime for the scheduledTime parameter. You can also schedule deferred tasks using the ScheduleTask tool — these create a new Claude session that runs automatically at the specified time. Supports recurring schedules (daily, weekly, monthly, or custom interval) and optionally reusing the same session across recurrences.${ttsInstruction}${pluginContext}`;
+      const toolContext = `You can schedule reminders for the user using the ScheduleReminder tool — use ISO 8601 datetime for the scheduledTime parameter. You can also schedule deferred tasks using the ScheduleTask tool — these create a new Claude session that runs automatically at the specified time. Supports recurring schedules (daily, weekly, monthly, or custom interval) and optionally reusing the same session across recurrences.\n\nYou can monitor background processes using the Monitor tool. To start a new monitored process: Monitor(command="...", description="..."). To monitor an existing background task: Monitor(taskId="..."). To stop monitoring (process keeps running): Monitor(taskId="...", enabled=false). Monitored output is batched over 5 seconds and delivered to you automatically. Use timeoutSeconds to auto-stop monitoring after a duration.${ttsInstruction}${pluginContext}`;
 
       // Handle fork: use fork source as resume target + set forkSession flag
       const shouldFork = !!this._forkFromSessionId;
@@ -1572,7 +1924,38 @@ export class ClaudeSession {
           // Prefer SDK's direct tool_use_id, fall back to our mapping
           const originToolUseId = tn.tool_use_id || this._taskIdToToolUseId.get(sdkTaskId) || undefined;
           console.log(`[SDK] Task notification: id=${sdkTaskId} status=${tn.status} originToolUseId=${originToolUseId} summary=${tn.summary?.slice(0, 80)}`);
+          // If this task was being monitored, flush output and send final notification
+          if (sdkTaskId && this._monitoredTasks.has(sdkTaskId)) {
+            const mState = this._monitoredTasks.get(sdkTaskId)!;
+            this._stopMonitorReader(sdkTaskId);
+            // Read any remaining output
+            try {
+              if (fs.existsSync(mState.outputFile)) {
+                const fStat = fs.statSync(mState.outputFile);
+                if (fStat.size > mState.lastSize) {
+                  const mFd = fs.openSync(mState.outputFile, "r");
+                  const mBuf = Buffer.alloc(fStat.size - mState.lastSize);
+                  fs.readSync(mFd, mBuf, 0, mBuf.length, mState.lastSize);
+                  fs.closeSync(mFd);
+                  const remaining = mBuf.toString("utf8").split("\n").filter(l => l.length > 0);
+                  if (remaining.length > 0) mState.outputBuffer.push(...remaining);
+                }
+              }
+            } catch {}
+            if (mState.outputBuffer.length > 0) {
+              this._flushMonitorBuffer(sdkTaskId);
+            }
+            const exitMsg = `[Monitor: "${mState.description}" (${sdkTaskId})] Process ${tn.status || "completed"}. ${tn.summary || ""}`;
+            if (this._isRunning && this.activeQuery) {
+              this.injectMessage(exitMsg, 'next').catch(() => {});
+            } else if (this.onMonitorOutput) {
+              this.onMonitorOutput(exitMsg);
+            }
+            this._cleanupMonitor(sdkTaskId, false);
+          }
+
           if (sdkTaskId) this._taskIdToToolUseId.delete(sdkTaskId);
+          if (sdkTaskId) this._taskOutputFiles.delete(sdkTaskId);
           this.send({
             type: "task_notification",
             taskId: sdkTaskId,
@@ -2146,6 +2529,9 @@ export class ClaudeSession {
                   const bgTaskId = bgMatch[1];
                   const outputFile = bgMatch[2];
                   console.log(`[SDK] Bash moved to background: taskId=${bgTaskId}, outputFile=${outputFile}, toolUseId=${toolUseId}`);
+
+                  // Track output file for Monitor toggle mode
+                  this._taskOutputFiles.set(bgTaskId, outputFile);
 
                   // Stop watching the tee file and switch to the SDK's output file
                   this._stopBashWatcher();

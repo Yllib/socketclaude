@@ -135,6 +135,11 @@ export interface StopTaskMessage {
   taskId: string;
 }
 
+export interface StopMonitorMessage {
+  type: "stop_monitor";
+  taskId: string;
+}
+
 export interface ForkSessionMessage {
   type: "fork_session";
   sessionId: string;
@@ -253,6 +258,7 @@ export type ClientMessage =
   | SetDisallowedToolsMessage
   | SetSystemPromptMessage
   | StopTaskMessage
+  | StopMonitorMessage
   | ForkSessionMessage
   | SetModelMessage
   | SetPermissionModeMessage
@@ -667,6 +673,22 @@ export interface SessionLifecycleServerMessage {
   sessionId: string;
 }
 
+export interface MonitorStartedServerMessage {
+  type: "monitor_started";
+  taskId: string;
+  description: string;
+  monitoring: boolean;
+  command?: string;
+  sessionId: string;
+}
+
+export interface MonitorOutputServerMessage {
+  type: "monitor_output";
+  taskId: string;
+  content: string;
+  sessionId: string;
+}
+
 export interface TaskCompletedHookServerMessage {
   type: "task_completed_hook";
   taskId: string;
@@ -768,4 +790,6 @@ export type ServerMessage =
   | UsageUpdateServerMessage
   | HookStartedServerMessage
   | HookProgressServerMessage
-  | HookResponseServerMessage;
+  | HookResponseServerMessage
+  | MonitorStartedServerMessage
+  | MonitorOutputServerMessage;
