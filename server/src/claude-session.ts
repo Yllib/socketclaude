@@ -245,12 +245,23 @@ export class ClaudeSession {
           const lines = newContent.split("\n").filter(l => l.length > 0);
           if (lines.length > 0) {
             // Send to app immediately for live display in task pane
+            const lineContent = lines.join("\n");
             this.send({
               type: "monitor_output",
               taskId,
-              content: lines.join("\n"),
+              content: lineContent,
               sessionId: this.sessionId || "",
             } as any);
+            // Persist to history so monitor cards restore on session load
+            if (this.sessionId) {
+              appendHistory(this.sessionId, {
+                role: "monitor",
+                content: lineContent,
+                taskId,
+                description: state.description,
+                timestamp: new Date().toISOString(),
+              });
+            }
             // Accumulate for Claude injection (5s debounce)
             state.outputBuffer.push(...lines);
             if (state.debounceTimer) clearTimeout(state.debounceTimer);

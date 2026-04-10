@@ -434,7 +434,7 @@ export interface SessionCreatedServerMessage {
 }
 
 export interface HistoryEntry {
-  role: "user" | "assistant" | "tool_call" | "tool_result" | "tool_image" | "question" | "todos_update" | "user_uuid" | "elicitation_url" | "prompt_suggestion";
+  role: "user" | "assistant" | "tool_call" | "tool_result" | "tool_image" | "question" | "todos_update" | "user_uuid" | "elicitation_url" | "prompt_suggestion" | "monitor";
   content: string;
   toolName?: string;
   toolInput?: Record<string, unknown>;
@@ -460,6 +460,9 @@ export interface HistoryEntry {
   // Elicitation URL fields (role === "elicitation_url")
   mcpServerName?: string;
   url?: string;
+  // Monitor fields (role === "monitor")
+  taskId?: string;
+  description?: string;
 }
 
 export interface SessionHistoryServerMessage {
