@@ -554,23 +554,31 @@ function createConnectionHandler(transport: ClientTransport) {
       case "answer": {
         const qId = msg.questionId as string;
         let answerHandled = false;
-        if (activeSession) {
-          const sessionCtx = activeSession.getSessionContext();
-          for (const plugin of plugins) {
-            if (plugin.answerMiddleware) {
-              const result = await plugin.answerMiddleware(qId, msg.answers, sessionCtx);
-              if (result.handled) {
-                answerHandled = true;
-                // Notify app so card marks as answered
-                sendJson({ type: "question_answered", questionId: qId });
-                // Persist answered state in history
+        // Get session context if available, or build a minimal one for plugin-only answers
+        const sessionCtx = activeSession
+          ? activeSession.getSessionContext()
+          : {
+              sessionId: activeSessionId || "",
+              cwd: DEFAULT_CWD,
+              send: (m: any) => sendJson(m),
+              appendHistory: () => {},
+              pendingQuestions: new Map(),
+              questionCounter: { next: () => "" },
+            };
+        for (const plugin of plugins) {
+          if (plugin.answerMiddleware) {
+            const result = await plugin.answerMiddleware(qId, msg.answers, sessionCtx);
+            if (result.handled) {
+              answerHandled = true;
+              sendJson({ type: "question_answered", questionId: qId });
+              if (activeSession) {
                 const sid = activeSession.getSessionId()
                   || (activeSession as any)._resumeSessionId
                   || activeSessionId
                   || undefined;
                 if (sid) markQuestionAnswered(sid, qId);
-                break;
               }
+              break;
             }
           }
         }
@@ -2183,6 +2191,7 @@ function buildStatusSyncMessage(): string {
     backgroundTaskIds,
     ...(desktopCliSessions.length > 0 ? { desktopCliSessions } : {}),
     ...(Object.keys(sessionModels).length > 0 ? { sessionModels } : {}),
+    plugins: plugins.map(p => p.name),
   });
 }
 
