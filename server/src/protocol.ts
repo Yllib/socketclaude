@@ -578,13 +578,6 @@ export interface TtsAudioServerMessage {
   sessionId: string;
 }
 
-export interface DesktopCliStatusServerMessage {
-  type: "desktop_cli_status";
-  sessionId: string;
-  active: boolean;
-  pid?: number;
-}
-
 export interface ActiveSubagentsServerMessage {
   type: "active_subagents";
   sessionId: string;
@@ -776,7 +769,6 @@ export type ServerMessage =
   | TtsAudioServerMessage
   | ThinkingServerMessage
   | ToolImageServerMessage
-  | DesktopCliStatusServerMessage
   | ActiveSubagentsServerMessage
   | ScheduledTaskListServerMessage
   | ScheduledTaskUpdateServerMessage

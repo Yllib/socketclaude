@@ -9,7 +9,6 @@ import { WebSocketServer, WebSocket } from "ws";
 import { ClaudeSession } from "./claude-session";
 import { listSessions, getSession, saveSession, getHistory, getHistoryPage, getHistoryPageToLastPrompt, deleteSession, clearSessionContext, cleanupPendingToolCalls, getTodos, getMissedMessages, appendHistory, getSdkEvents, markQuestionAnswered, getLastHistoryTimestamp, listSdkSessions, getRecentCwds, addRecentCwd, removeRecentCwd, truncateHistoryAtMessage, getLastPromptSuggestion } from "./session-store";
 import { listScheduledTasks, getScheduledTask, saveScheduledTask, deleteScheduledTask, getDueTasks, getNextRunTime, getScheduledTaskSessionIds, ScheduledTask } from "./scheduled-task-store";
-import { DesktopCliWatcher } from "./desktop-cli-watcher";
 import { ClientMessage, SessionInfo } from "./protocol";
 import { SocketClaudePlugin, PluginContext } from "./plugin-api";
 import { RelayClient, RelayStatus } from "./relay-client";
@@ -93,9 +92,6 @@ if (fs.existsSync(pluginsDir)) {
 
 // Global session registry — sessions survive client disconnects
 const activeSessions: Map<string, ClaudeSession> = new Map();
-
-// Desktop CLI watchers — detect when desktop CLI is using a session
-const desktopWatchers: Map<string, DesktopCliWatcher> = new Map();
 
 // Sessions whose context has been cleared — next query should NOT pass resume
 const clearedSessions: Set<string> = new Set();
@@ -410,32 +406,6 @@ function createConnectionHandler(transport: ClientTransport) {
           }
         }
 
-        // Start desktop CLI watcher for this session (syncs JSONL changes)
-        if (!desktopWatchers.has(msg.sessionId)) {
-          const watcherSessionId = msg.sessionId;
-          const watcher = new DesktopCliWatcher({
-            sessionId: watcherSessionId,
-            cwd: sessionInfo.cwd,
-            onNewMessages: (messages) => {
-              console.log(`[DesktopCLI] Syncing ${messages.length} messages to app for session ${watcherSessionId}`);
-              sendJson({
-                type: "session_history",
-                sessionId: watcherSessionId,
-                messages,
-                total: -1,
-                offset: -1,
-                append: true,
-              });
-              broadcastSessionList();
-            },
-            isOurQueryRunning: () => {
-              const session = activeSessions.get(watcherSessionId);
-              return session?.isRunning || false;
-            },
-          });
-          watcher.start();
-          desktopWatchers.set(watcherSessionId, watcher);
-        }
         break;
       }
 
@@ -503,7 +473,6 @@ function createConnectionHandler(transport: ClientTransport) {
             const s = activeSession?.getSessionId();
             if (s && activeSessions.get(s) === activeSession) {
               activeSessions.delete(s);
-              desktopWatchers.get(s)?.markQueryEnded();
             }
             broadcastSessionList();
           }).catch((err) => {
@@ -521,8 +490,6 @@ function createConnectionHandler(transport: ClientTransport) {
               activeSessions.delete(sid);
               console.log(`Session ${sid} completed, removed from active pool`);
             }
-            // Notify desktop CLI watcher our query ended (prevent false active detection)
-            desktopWatchers.get(sid)?.markQueryEnded();
           }
           broadcastSessionList();
         }).catch((err) => {
@@ -614,8 +581,7 @@ function createConnectionHandler(transport: ClientTransport) {
                 const s = activeSession?.getSessionId();
                 if (s && activeSessions.get(s) === activeSession) {
                   activeSessions.delete(s);
-                  desktopWatchers.get(s)?.markQueryEnded();
-                }
+                    }
                 broadcastSessionList();
               }).catch((err) => {
                 sendJson({ type: "error", message: err.message || "Query failed" });
@@ -670,29 +636,12 @@ function createConnectionHandler(transport: ClientTransport) {
         break;
       }
 
-      case "sync_desktop": {
-        const syncSid = (msg as any).sessionId as string;
-        if (syncSid) {
-          const watcher = desktopWatchers.get(syncSid);
-          if (watcher) {
-            watcher.syncNow();
-          }
-        }
-        break;
-      }
-
       case "delete_session": {
         const sid = msg.sessionId;
         const running = activeSessions.get(sid);
         if (running) {
           running.abort();
           activeSessions.delete(sid);
-        }
-        // Stop desktop CLI watcher
-        const delWatcher = desktopWatchers.get(sid);
-        if (delWatcher) {
-          delWatcher.stop();
-          desktopWatchers.delete(sid);
         }
         deleteSession(sid);
         console.log(`Deleted session ${sid}`);
@@ -874,12 +823,6 @@ function createConnectionHandler(transport: ClientTransport) {
           if (running) {
             running.abort();
             activeSessions.delete(sid);
-          }
-          // Stop desktop CLI watcher (JSONL gets archived)
-          const clearWatcher = desktopWatchers.get(sid);
-          if (clearWatcher) {
-            clearWatcher.stop();
-            desktopWatchers.delete(sid);
           }
           clearSessionContext(sid, sessionInfo.cwd);
           clearedSessions.add(sid);
@@ -1778,12 +1721,10 @@ const httpServer = http.createServer((req, res) => {
           const sid = session.getSessionId() || sessionId;
           if (activeSessions.get(sid) === session) {
             activeSessions.delete(sid);
-            desktopWatchers.get(sid)?.markQueryEnded();
           }
           broadcastSessionList();
         }).catch((err) => {
           console.error(`[Continue] Query error: ${err.message}`);
-          desktopWatchers.get(sessionId)?.markQueryEnded();
           activeSessions.delete(sessionId);
         });
 
@@ -2157,7 +2098,6 @@ function buildStatusSyncMessage(): string {
   const runningSessions: string[] = [];
   const compactingSessions: string[] = [];
   const backgroundTaskIds: string[] = [];
-  const desktopCliSessions: string[] = [];
   const sessionModels: Record<string, string> = {};
   for (const [sid, session] of activeSessions) {
     if (session.isRunning) {
@@ -2174,12 +2114,6 @@ function buildStatusSyncMessage(): string {
       sessionModels[sid] = session.sessionModel;
     }
   }
-  // Check which sessions have active desktop CLI usage
-  for (const [sid, watcher] of desktopWatchers) {
-    if (watcher.isActive) {
-      desktopCliSessions.push(sid);
-    }
-  }
   return JSON.stringify({
     type: "status_sync",
     running: anyRunning,
@@ -2189,7 +2123,6 @@ function buildStatusSyncMessage(): string {
     serverPid: process.pid,
     serverVersion: SERVER_GIT_HASH || undefined,
     backgroundTaskIds,
-    ...(desktopCliSessions.length > 0 ? { desktopCliSessions } : {}),
     ...(Object.keys(sessionModels).length > 0 ? { sessionModels } : {}),
     plugins: plugins.map(p => p.name),
   });
@@ -2589,10 +2522,6 @@ for (const sig of ["SIGTERM", "SIGINT"] as const) {
   process.on(sig, async () => {
     console.log(`Received ${sig}, cleaning up...`);
     if (relayClient) relayClient.close();
-    for (const [, watcher] of desktopWatchers) {
-      watcher.stop();
-    }
-    desktopWatchers.clear();
     for (const plugin of plugins) {
       if (plugin.cleanup) {
         try { await plugin.cleanup(); } catch {}
