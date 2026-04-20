@@ -59,6 +59,7 @@ export class ClaudeSession {
   private _taskOutputFiles: Map<string, string> = new Map();  // taskId → outputFile path
   private _activeSubagents: Map<string, { toolUseId: string; description: string; subagentType: string; startedAt: string }> = new Map();
   private _activeBashStream: { interval: NodeJS.Timeout; filePath: string; lastSize: number } | null = null;
+  private _bgBashWatchers: Map<string, { interval: NodeJS.Timeout; filePath: string; lastSize: number }> = new Map();
   private _activeToolUseId: string | null = null;  // currently-executing tool call
   private _activeToolName: string | null = null;
   private _readToolPaths: Map<string, string> = new Map();  // toolUseId → file_path for Read tool calls
@@ -220,6 +221,43 @@ export class ClaudeSession {
     if (this._activeBashStream) {
       clearInterval(this._activeBashStream.interval);
       this._activeBashStream = null;
+    }
+  }
+
+  /** Independent watcher for backgrounded bash tasks — survives when next tool starts */
+  private _startBgBashWatcher(taskId: string, toolUseId: string, filePath: string): void {
+    this._stopBgBashWatcher(taskId);
+    console.log(`[BgBashWatcher] Starting for ${taskId} (toolUseId=${toolUseId}) on ${filePath}`);
+    const state = { interval: null as any, filePath, lastSize: 0 };
+    state.interval = setInterval(() => {
+      try {
+        if (!fs.existsSync(filePath)) return;
+        const stat = fs.statSync(filePath);
+        if (stat.size > state.lastSize) {
+          const fd = fs.openSync(filePath, "r");
+          const buf = Buffer.alloc(stat.size - state.lastSize);
+          fs.readSync(fd, buf, 0, buf.length, state.lastSize);
+          fs.closeSync(fd);
+          state.lastSize = stat.size;
+          const content = buf.toString("utf8");
+          this.send({
+            type: "tool_stderr",
+            toolUseId,
+            content,
+            sessionId: this.sessionId || "",
+          } as any);
+        }
+      } catch {}
+    }, 1000);
+    state.interval = state.interval;
+    this._bgBashWatchers.set(taskId, state);
+  }
+
+  private _stopBgBashWatcher(taskId: string): void {
+    const watcher = this._bgBashWatchers.get(taskId);
+    if (watcher) {
+      clearInterval(watcher.interval);
+      this._bgBashWatchers.delete(taskId);
     }
   }
 
@@ -512,6 +550,10 @@ export class ClaudeSession {
     }
     // Kill all monitored processes and clean up readers
     this._cleanupAllMonitors();
+    // Stop all background bash watchers
+    for (const [taskId] of this._bgBashWatchers) {
+      this._stopBgBashWatcher(taskId);
+    }
   }
 
   /** Gracefully stop the current query between turns — session stays alive and can continue */
@@ -1966,6 +2008,7 @@ export class ClaudeSession {
 
           if (sdkTaskId) this._taskIdToToolUseId.delete(sdkTaskId);
           if (sdkTaskId) this._taskOutputFiles.delete(sdkTaskId);
+          if (sdkTaskId) this._stopBgBashWatcher(sdkTaskId);
           this.send({
             type: "task_notification",
             taskId: sdkTaskId,
@@ -2543,9 +2586,11 @@ export class ClaudeSession {
                   // Track output file for Monitor toggle mode
                   this._taskOutputFiles.set(bgTaskId, outputFile);
 
-                  // Stop watching the tee file and switch to the SDK's output file
+                  // Stop the active bash watcher (will be replaced by next tool's watcher)
                   this._stopBashWatcher();
-                  this._startBashWatcher(outputFile);
+
+                  // Start an independent watcher that survives next tool calls
+                  this._startBgBashWatcher(bgTaskId, toolUseId, outputFile);
 
                   // Send a background notification so the app tracks it
                   this.send({
