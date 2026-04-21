@@ -434,7 +434,7 @@ export interface SessionCreatedServerMessage {
 }
 
 export interface HistoryEntry {
-  role: "user" | "assistant" | "tool_call" | "tool_result" | "tool_image" | "question" | "todos_update" | "user_uuid" | "elicitation_url" | "prompt_suggestion" | "monitor";
+  role: "user" | "assistant" | "tool_call" | "tool_result" | "tool_image" | "question" | "todos_update" | "user_uuid" | "elicitation_url" | "prompt_suggestion" | "monitor" | "notification";
   content: string;
   toolName?: string;
   toolInput?: Record<string, unknown>;
@@ -463,6 +463,9 @@ export interface HistoryEntry {
   // Monitor fields (role === "monitor")
   taskId?: string;
   description?: string;
+  // Notification fields (role === "notification")
+  status?: string;
+  originToolUseId?: string;
 }
 
 export interface SessionHistoryServerMessage {

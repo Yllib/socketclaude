@@ -2006,22 +2006,47 @@ export class ClaudeSession {
             this._cleanupMonitor(sdkTaskId, false);
           }
 
+          // Read full output file before cleaning up (for history persistence)
+          let bgOutputContent = "";
+          const bgOutputFile = tn.output_file || (sdkTaskId ? this._taskOutputFiles.get(sdkTaskId) : undefined);
+          if (bgOutputFile) {
+            try {
+              if (fs.existsSync(bgOutputFile)) {
+                bgOutputContent = fs.readFileSync(bgOutputFile, "utf-8");
+              }
+            } catch {}
+          }
+
           if (sdkTaskId) this._taskIdToToolUseId.delete(sdkTaskId);
           if (sdkTaskId) this._taskOutputFiles.delete(sdkTaskId);
           if (sdkTaskId) this._stopBgBashWatcher(sdkTaskId);
+
+          // Persist the full output as the tool_result for the bash card in history
+          if (bgOutputContent && originToolUseId && this.sessionId) {
+            appendHistory(this.sessionId, {
+              role: "tool_result",
+              content: "",
+              toolUseId: originToolUseId,
+              toolOutput: bgOutputContent,
+              timestamp: new Date().toISOString(),
+            });
+          }
+
           this.send({
             type: "task_notification",
             taskId: sdkTaskId,
             status: tn.status || "completed",
-            outputFile: tn.output_file || undefined,
+            outputFile: bgOutputFile || undefined,
             summary: tn.summary || "",
             originToolUseId,
             sessionId: this.sessionId || "",
           } as any);
           if (this.sessionId) {
             appendHistory(this.sessionId, {
-              role: "assistant",
-              content: `[Task ${tn.status}] ${tn.summary || ''}`,
+              role: "notification",
+              content: tn.summary || `Task ${tn.status}`,
+              status: tn.status || "completed",
+              originToolUseId,
               timestamp: new Date().toISOString(),
             });
           }
