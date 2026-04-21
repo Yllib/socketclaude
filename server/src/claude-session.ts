@@ -17,6 +17,28 @@ import { saveScheduledTask, ScheduledTask, RecurrenceConfig } from "./scheduled-
 import { SocketClaudePlugin, SessionContext } from "./plugin-api";
 import { generateKokoroAudio, isKokoroAvailable } from "./kokoro-tts";
 
+// SDK 0.2.116 tries the linux-*-musl optional-dep package before the glibc one.
+// Both get installed as peer optional deps, so on a glibc host the SDK picks the
+// musl binary and the exec fails with ENOENT (no /lib/ld-musl-*.so.1), which the
+// SDK then reports as "native binary not found". Resolve the right variant here
+// and pass it as pathToClaudeCodeExecutable.
+const CLAUDE_BINARY_OVERRIDE: string | undefined = (() => {
+  if (process.platform !== "linux") return undefined;
+  const arch = process.arch;
+  const glibcRuntime = (process.report?.getReport() as any)?.header?.glibcVersionRuntime;
+  const isGlibc = typeof glibcRuntime === "string" && glibcRuntime.length > 0;
+  const glibcPkg = `@anthropic-ai/claude-agent-sdk-linux-${arch}/claude`;
+  const muslPkg = `@anthropic-ai/claude-agent-sdk-linux-${arch}-musl/claude`;
+  const preferred = isGlibc ? [glibcPkg, muslPkg] : [muslPkg, glibcPkg];
+  for (const pkg of preferred) {
+    try { return require.resolve(pkg); } catch {}
+  }
+  return undefined;
+})();
+if (CLAUDE_BINARY_OVERRIDE) {
+  console.log(`[SDK] Using Claude binary: ${CLAUDE_BINARY_OVERRIDE}`);
+}
+
 interface PendingQuestion {
   questionId: string;
   resolve: (answers: Record<string, string>) => void;
@@ -1113,6 +1135,7 @@ export class ClaudeSession {
         prompt: prompt,
         options: {
           cwd: this.cwd,
+          ...(CLAUDE_BINARY_OVERRIDE ? { pathToClaudeCodeExecutable: CLAUDE_BINARY_OVERRIDE } : {}),
           permissionMode: "bypassPermissions",
           allowDangerouslySkipPermissions: true,
           includePartialMessages: true,
