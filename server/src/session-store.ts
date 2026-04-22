@@ -633,18 +633,20 @@ export function listArchives(): ArchiveEntry[] {
 
   const entries: ArchiveEntry[] = [];
   for (const group of groups.values()) {
-    let title = "Untitled";
+    let title = "";
     let cwd = "";
     let createdAt = "";
-    let clearedAt = group.ts.replace(/-/g, ":"); // fallback if meta is missing
+    // Timestamp encoding in the archive filename is `toISOString().replace(/[:.]/g, "-")`.
+    // Reverse it: the first three dashes after `T` were `:`/`:`/`.` in the original.
+    let clearedAt = tsToIso(group.ts);
     const metaName = group.files.get("meta");
     if (metaName) {
       try {
         const meta = JSON.parse(fs.readFileSync(path.join(ARCHIVE_DIR, metaName), "utf-8"));
-        title = meta.title || title;
-        cwd = meta.cwd || cwd;
-        createdAt = meta.createdAt || "";
-        clearedAt = meta.clearedAt || clearedAt;
+        if (typeof meta.title === "string" && meta.title) title = meta.title;
+        if (typeof meta.cwd === "string" && meta.cwd) cwd = meta.cwd;
+        if (typeof meta.createdAt === "string") createdAt = meta.createdAt;
+        if (typeof meta.clearedAt === "string" && meta.clearedAt) clearedAt = meta.clearedAt;
       } catch {}
     }
 
@@ -657,6 +659,26 @@ export function listArchives(): ArchiveEntry[] {
         messageCount = Array.isArray(hist) ? hist.length : 0;
         const firstUser = (hist as any[]).find((e) => e.role === "user");
         if (firstUser) messagePreview = String(firstUser.content || "").slice(0, 200);
+      } catch {}
+    }
+
+    // Title fallback: the session's first user message, trimmed to a single line.
+    if (!title && messagePreview) {
+      const firstLine = messagePreview.split(/\r?\n/)[0].trim();
+      title = firstLine.length > 60 ? firstLine.slice(0, 60) + "…" : firstLine || "Untitled";
+    }
+    if (!title) title = "Untitled";
+
+    // cwd fallback: pull from the first line of the archived Claude Code JSONL.
+    const jsonlName = group.files.get("jsonl");
+    if (!cwd && jsonlName) {
+      try {
+        const buf = fs.readFileSync(path.join(ARCHIVE_DIR, jsonlName), "utf-8");
+        const firstLine = buf.split("\n", 1)[0];
+        if (firstLine) {
+          const obj = JSON.parse(firstLine);
+          if (typeof obj.cwd === "string") cwd = obj.cwd;
+        }
       } catch {}
     }
 
@@ -676,6 +698,13 @@ export function listArchives(): ArchiveEntry[] {
   return entries.sort((a, b) => b.clearedAt.localeCompare(a.clearedAt));
 }
 
+function tsToIso(ts: string): string {
+  // `2026-04-22T10-30-45-123Z` → `2026-04-22T10:30:45.123Z`
+  const m = ts.match(/^(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})-(\d+)(Z?)$/);
+  if (!m) return ts;
+  return `${m[1]}T${m[2]}:${m[3]}:${m[4]}.${m[5]}${m[6] || "Z"}`;
+}
+
 export function getArchiveHistory(sid: string, ts: string): HistoryEntry[] {
   const p = path.join(ARCHIVE_DIR, `${sid}_${ts}_history.json`);
   if (!fs.existsSync(p)) return [];
@@ -690,21 +719,40 @@ export function restoreArchive(sid: string, ts: string): { ok: true; session: Se
   ensureArchiveDir();
 
   const metaPath = path.join(ARCHIVE_DIR, `${sid}_${ts}_meta.json`);
-  if (!fs.existsSync(metaPath)) return { ok: false, reason: "archive metadata missing" };
-  const meta = JSON.parse(fs.readFileSync(metaPath, "utf-8"));
-  const cwd: string = meta.cwd || "";
-  if (!cwd) return { ok: false, reason: "archive metadata has no cwd" };
+  const jsonlArchive = path.join(ARCHIVE_DIR, `${sid}_${ts}.jsonl`);
+  const histArchive = path.join(ARCHIVE_DIR, `${sid}_${ts}_history.json`);
+  const todosArchive = path.join(ARCHIVE_DIR, `${sid}_${ts}_todos.json`);
+  const sdkEventsArchive = path.join(ARCHIVE_DIR, `${sid}_${ts}_sdk-events.jsonl`);
+
+  let metaTitle = "";
+  let metaCreatedAt = "";
+  let cwd = "";
+  if (fs.existsSync(metaPath)) {
+    try {
+      const meta = JSON.parse(fs.readFileSync(metaPath, "utf-8"));
+      if (typeof meta.title === "string") metaTitle = meta.title;
+      if (typeof meta.createdAt === "string") metaCreatedAt = meta.createdAt;
+      if (typeof meta.cwd === "string") cwd = meta.cwd;
+    } catch {}
+  }
+
+  // cwd fallback: first line of the archived JSONL carries the session's cwd.
+  if (!cwd && fs.existsSync(jsonlArchive)) {
+    try {
+      const firstLine = fs.readFileSync(jsonlArchive, "utf-8").split("\n", 1)[0];
+      if (firstLine) {
+        const obj = JSON.parse(firstLine);
+        if (typeof obj.cwd === "string") cwd = obj.cwd;
+      }
+    } catch {}
+  }
+  if (!cwd) return { ok: false, reason: "cannot determine cwd for this archive" };
 
   const liveHist = historyFile(sid);
   const liveJsonl = getJsonlPath(sid, cwd);
   if (fs.existsSync(liveHist) || fs.existsSync(liveJsonl)) {
     return { ok: false, reason: "session id is already in use" };
   }
-
-  const jsonlArchive = path.join(ARCHIVE_DIR, `${sid}_${ts}.jsonl`);
-  const histArchive = path.join(ARCHIVE_DIR, `${sid}_${ts}_history.json`);
-  const todosArchive = path.join(ARCHIVE_DIR, `${sid}_${ts}_todos.json`);
-  const sdkEventsArchive = path.join(ARCHIVE_DIR, `${sid}_${ts}_sdk-events.jsonl`);
 
   if (fs.existsSync(jsonlArchive)) {
     const destDir = path.dirname(liveJsonl);
@@ -723,23 +771,29 @@ export function restoreArchive(sid: string, ts: string): { ok: true; session: Se
     ensureSdkEventsDir();
     fs.renameSync(sdkEventsArchive, sdkEventsFile(sid));
   }
-  fs.unlinkSync(metaPath);
+  if (fs.existsSync(metaPath)) fs.unlinkSync(metaPath);
 
   const restoredAt = new Date().toISOString();
   let messagePreview = "";
+  let titleFallback = "";
   try {
     const hist = JSON.parse(fs.readFileSync(liveHist, "utf-8")) as any[];
     const lastUser = [...hist].reverse().find((e) => e.role === "user");
     if (lastUser) messagePreview = String(lastUser.content || "").slice(0, 200);
+    const firstUser = (hist as any[]).find((e) => e.role === "user");
+    if (firstUser) {
+      const line = String(firstUser.content || "").split(/\r?\n/)[0].trim();
+      titleFallback = line.length > 60 ? line.slice(0, 60) + "…" : line;
+    }
   } catch {}
 
   const sessions = readStore();
   const existingIdx = sessions.findIndex((s) => s.id === sid);
   const restored: SessionInfo = {
     id: sid,
-    title: meta.title || "Untitled",
+    title: metaTitle || titleFallback || "Untitled",
     cwd,
-    createdAt: meta.createdAt || restoredAt,
+    createdAt: metaCreatedAt || restoredAt,
     lastActive: restoredAt,
     messagePreview,
   };
