@@ -93,6 +93,11 @@ export interface ClearContextMessage {
   sessionId: string;
 }
 
+export interface ArchiveSessionMessage {
+  type: "archive_session";
+  sessionId: string;
+}
+
 export interface ListArchivesMessage {
   type: "list_archives";
 }
@@ -271,6 +276,7 @@ export type ClientMessage =
   | DeleteSessionMessage
   | RenameSessionMessage
   | ClearContextMessage
+  | ArchiveSessionMessage
   | AbortMessage
   | InterruptMessage
   | SetTtsMessage

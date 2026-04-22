@@ -846,6 +846,24 @@ function createConnectionHandler(transport: ClientTransport) {
         break;
       }
 
+      case "archive_session": {
+        const sid = (msg as any).sessionId as string;
+        const sessionInfo = getSession(sid);
+        if (sessionInfo) {
+          const running = activeSessions.get(sid);
+          if (running) {
+            running.abort();
+            activeSessions.delete(sid);
+          }
+          clearSessionContext(sid, sessionInfo.cwd);
+          deleteSession(sid);
+          console.log(`Archived session ${sid}`);
+          sendJson({ type: "session_archived", sessionId: sid });
+          broadcastSessionList();
+        }
+        break;
+      }
+
       case "list_archives": {
         sendJson({ type: "archive_list", archives: listArchives() });
         break;
