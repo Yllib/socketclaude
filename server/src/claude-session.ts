@@ -12,7 +12,7 @@ import {
   QuestionItem,
   SessionInfo,
 } from "./protocol";
-import { saveSession, getSession, updateSessionActivity, appendHistory, saveTodos, getTodos, remapSession, markQuestionAnswered, appendSdkEvent, assignUserUuid } from "./session-store";
+import { saveSession, getSession, updateSessionActivity, updateSessionContextUsage, appendHistory, saveTodos, getTodos, remapSession, markQuestionAnswered, appendSdkEvent, assignUserUuid } from "./session-store";
 import { saveScheduledTask, ScheduledTask, RecurrenceConfig } from "./scheduled-task-store";
 import { SocketClaudePlugin, SessionContext } from "./plugin-api";
 import { generateKokoroAudio, isKokoroAvailable } from "./kokoro-tts";
@@ -1900,6 +1900,7 @@ export class ClaudeSession {
                   sessionId: this.sessionId || "",
                   ...ctx,
                 } as any);
+                if (this.sessionId) updateSessionContextUsage(this.sessionId, ctx);
               }
             }).catch(() => {});
           }
@@ -2830,6 +2831,7 @@ export class ClaudeSession {
                   sessionId: this.sessionId || "",
                   ...ctx,
                 } as any);
+                if (this.sessionId) updateSessionContextUsage(this.sessionId, ctx);
               }
             }).catch(() => {});
           }

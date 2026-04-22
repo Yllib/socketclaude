@@ -369,6 +369,16 @@ function createConnectionHandler(transport: ClientTransport) {
           });
         }
 
+        // Restore last context usage breakdown (persisted between sessions).
+        // If there's a live query below, it'll overwrite this with fresh data.
+        if ((sessionInfo as any).lastContextUsage) {
+          sendJson({
+            type: "context_usage",
+            sessionId: msg.sessionId,
+            ...(sessionInfo as any).lastContextUsage,
+          });
+        }
+
         // Always send status so the app resets its processing state on resume
         const resumeRunning = !!(existing && existing.isRunning);
         const resumeCompacting = !!(existing && existing.isCompacting);

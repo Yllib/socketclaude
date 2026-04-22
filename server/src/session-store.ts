@@ -122,6 +122,15 @@ export function updateSessionActivity(
   }
 }
 
+export function updateSessionContextUsage(id: string, contextUsage: any): void {
+  const sessions = readStore();
+  const session = sessions.find((s) => s.id === id);
+  if (session) {
+    (session as any).lastContextUsage = contextUsage;
+    writeStore(sessions);
+  }
+}
+
 // ── Message history per session ──
 
 function ensureHistoryDir(): void {
@@ -555,6 +564,7 @@ export function clearSessionContext(sessionId: string, cwd: string): void {
   if (session) {
     session.messagePreview = "(context cleared)";
     session.lastActive = new Date().toISOString();
+    delete (session as any).lastContextUsage;
     writeStore(sessions);
   }
 }
