@@ -750,26 +750,29 @@ export function restoreArchive(sid: string, ts: string): { ok: true; session: Se
 
   const liveHist = historyFile(sid);
   const liveJsonl = getJsonlPath(sid, cwd);
-  if (fs.existsSync(liveHist) || fs.existsSync(liveJsonl)) {
-    return { ok: false, reason: "session id is already in use" };
-  }
 
   if (fs.existsSync(jsonlArchive)) {
     const destDir = path.dirname(liveJsonl);
     if (!fs.existsSync(destDir)) fs.mkdirSync(destDir, { recursive: true });
+    if (fs.existsSync(liveJsonl)) fs.unlinkSync(liveJsonl);
     fs.renameSync(jsonlArchive, liveJsonl);
   }
   if (fs.existsSync(histArchive)) {
     ensureHistoryDir();
+    if (fs.existsSync(liveHist)) fs.unlinkSync(liveHist);
     fs.renameSync(histArchive, liveHist);
   }
   if (fs.existsSync(todosArchive)) {
     ensureTodosDir();
-    fs.renameSync(todosArchive, todosFile(sid));
+    const liveTodos = todosFile(sid);
+    if (fs.existsSync(liveTodos)) fs.unlinkSync(liveTodos);
+    fs.renameSync(todosArchive, liveTodos);
   }
   if (fs.existsSync(sdkEventsArchive)) {
     ensureSdkEventsDir();
-    fs.renameSync(sdkEventsArchive, sdkEventsFile(sid));
+    const liveSdkEvents = sdkEventsFile(sid);
+    if (fs.existsSync(liveSdkEvents)) fs.unlinkSync(liveSdkEvents);
+    fs.renameSync(sdkEventsArchive, liveSdkEvents);
   }
   if (fs.existsSync(metaPath)) fs.unlinkSync(metaPath);
 
