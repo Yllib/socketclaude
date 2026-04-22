@@ -1355,8 +1355,11 @@ export class ClaudeSession {
           stderr: (data: string) => {
             const trimmed = data.trimEnd();
             if (trimmed) {
-              // Filter out SDK internal errors (stream closing race conditions)
-              if (/Error in hook callback.*Stream closed/i.test(trimmed)) {
+              // Filter out SDK internal errors (stream closing race conditions).
+              // The CLI dumps multi-line source context between the header and the
+              // trailing `error: Stream closed`, so we match across newlines.
+              if (/Error in hook callback.*Stream closed/is.test(trimmed)
+                  || /^error: Stream closed\b[\s\S]*at sendRequest/i.test(trimmed)) {
                 console.warn(`[Claude stderr] (suppressed SDK hook error) ${trimmed.slice(0, 100)}`);
                 return;
               }
