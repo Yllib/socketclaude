@@ -418,6 +418,9 @@ function createConnectionHandler(transport: ClientTransport) {
             if (savedSession) {
               cwd = savedSession.cwd;
             }
+          } else if (msg.cwd) {
+            cwd = msg.cwd;
+            addRecentCwd(cwd);
           }
           activeSession = new ClaudeSession(transport as any, cwd, plugins);
           activeSession.setTtsEnabled(pendingTtsEnabled);

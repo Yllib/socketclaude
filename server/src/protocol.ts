@@ -4,6 +4,7 @@ export interface PromptMessage {
   type: "prompt";
   text: string;
   sessionId?: string;
+  cwd?: string;
 }
 
 export interface AnswerMessage {
