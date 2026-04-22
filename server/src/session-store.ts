@@ -558,14 +558,210 @@ export function clearSessionContext(sessionId: string, cwd: string): void {
     console.log(`[ClearContext] Archived SDK events: ${archiveName}`);
   }
 
-  // 5. Update session metadata to reflect the clear
+  // 5. Write a metadata sidecar so restore can recover the title/cwd
+  // even after the session row has been remapped to a new SDK session id.
   const sessions = readStore();
   const session = sessions.find((s) => s.id === sessionId);
   if (session) {
+    const metaName = `${sessionId}_${ts}_meta.json`;
+    const meta = {
+      sid: sessionId,
+      title: session.title,
+      cwd: session.cwd,
+      createdAt: session.createdAt,
+      clearedAt: new Date().toISOString(),
+    };
+    fs.writeFileSync(path.join(ARCHIVE_DIR, metaName), JSON.stringify(meta, null, 2), "utf-8");
+    console.log(`[ClearContext] Wrote meta: ${metaName}`);
+
+    // 6. Update session metadata to reflect the clear
     session.messagePreview = "(context cleared)";
     session.lastActive = new Date().toISOString();
     delete (session as any).lastContextUsage;
     writeStore(sessions);
+  }
+}
+
+export interface ArchiveEntry {
+  sid: string;
+  ts: string;
+  title: string;
+  cwd: string;
+  createdAt: string;
+  clearedAt: string;
+  messagePreview: string;
+  messageCount: number;
+  hasJsonl: boolean;
+}
+
+const ARCHIVE_SUFFIXES: Array<[string, string]> = [
+  ["_sdk-events.jsonl", "sdk-events"],
+  ["_history.json", "history"],
+  ["_todos.json", "todos"],
+  ["_meta.json", "meta"],
+  [".jsonl", "jsonl"],
+];
+
+function parseArchiveFilename(name: string): { sid: string; ts: string; kind: string } | null {
+  for (const [suffix, kind] of ARCHIVE_SUFFIXES) {
+    if (name.endsWith(suffix)) {
+      const base = name.slice(0, -suffix.length);
+      const underscoreIdx = base.lastIndexOf("_");
+      if (underscoreIdx < 0) return null;
+      return { sid: base.slice(0, underscoreIdx), ts: base.slice(underscoreIdx + 1), kind };
+    }
+  }
+  return null;
+}
+
+export function listArchives(): ArchiveEntry[] {
+  ensureArchiveDir();
+  if (!fs.existsSync(ARCHIVE_DIR)) return [];
+  const files = fs.readdirSync(ARCHIVE_DIR);
+  const groups = new Map<string, { sid: string; ts: string; files: Map<string, string> }>();
+  for (const f of files) {
+    const parsed = parseArchiveFilename(f);
+    if (!parsed) continue;
+    const key = `${parsed.sid}_${parsed.ts}`;
+    let group = groups.get(key);
+    if (!group) {
+      group = { sid: parsed.sid, ts: parsed.ts, files: new Map() };
+      groups.set(key, group);
+    }
+    group.files.set(parsed.kind, f);
+  }
+
+  const entries: ArchiveEntry[] = [];
+  for (const group of groups.values()) {
+    let title = "Untitled";
+    let cwd = "";
+    let createdAt = "";
+    let clearedAt = group.ts.replace(/-/g, ":"); // fallback if meta is missing
+    const metaName = group.files.get("meta");
+    if (metaName) {
+      try {
+        const meta = JSON.parse(fs.readFileSync(path.join(ARCHIVE_DIR, metaName), "utf-8"));
+        title = meta.title || title;
+        cwd = meta.cwd || cwd;
+        createdAt = meta.createdAt || "";
+        clearedAt = meta.clearedAt || clearedAt;
+      } catch {}
+    }
+
+    let messagePreview = "";
+    let messageCount = 0;
+    const histName = group.files.get("history");
+    if (histName) {
+      try {
+        const hist = JSON.parse(fs.readFileSync(path.join(ARCHIVE_DIR, histName), "utf-8")) as any[];
+        messageCount = Array.isArray(hist) ? hist.length : 0;
+        const firstUser = (hist as any[]).find((e) => e.role === "user");
+        if (firstUser) messagePreview = String(firstUser.content || "").slice(0, 200);
+      } catch {}
+    }
+
+    entries.push({
+      sid: group.sid,
+      ts: group.ts,
+      title,
+      cwd,
+      createdAt,
+      clearedAt,
+      messagePreview,
+      messageCount,
+      hasJsonl: group.files.has("jsonl"),
+    });
+  }
+
+  return entries.sort((a, b) => b.clearedAt.localeCompare(a.clearedAt));
+}
+
+export function getArchiveHistory(sid: string, ts: string): HistoryEntry[] {
+  const p = path.join(ARCHIVE_DIR, `${sid}_${ts}_history.json`);
+  if (!fs.existsSync(p)) return [];
+  try {
+    return JSON.parse(fs.readFileSync(p, "utf-8"));
+  } catch {
+    return [];
+  }
+}
+
+export function restoreArchive(sid: string, ts: string): { ok: true; session: SessionInfo } | { ok: false; reason: string } {
+  ensureArchiveDir();
+
+  const metaPath = path.join(ARCHIVE_DIR, `${sid}_${ts}_meta.json`);
+  if (!fs.existsSync(metaPath)) return { ok: false, reason: "archive metadata missing" };
+  const meta = JSON.parse(fs.readFileSync(metaPath, "utf-8"));
+  const cwd: string = meta.cwd || "";
+  if (!cwd) return { ok: false, reason: "archive metadata has no cwd" };
+
+  const liveHist = historyFile(sid);
+  const liveJsonl = getJsonlPath(sid, cwd);
+  if (fs.existsSync(liveHist) || fs.existsSync(liveJsonl)) {
+    return { ok: false, reason: "session id is already in use" };
+  }
+
+  const jsonlArchive = path.join(ARCHIVE_DIR, `${sid}_${ts}.jsonl`);
+  const histArchive = path.join(ARCHIVE_DIR, `${sid}_${ts}_history.json`);
+  const todosArchive = path.join(ARCHIVE_DIR, `${sid}_${ts}_todos.json`);
+  const sdkEventsArchive = path.join(ARCHIVE_DIR, `${sid}_${ts}_sdk-events.jsonl`);
+
+  if (fs.existsSync(jsonlArchive)) {
+    const destDir = path.dirname(liveJsonl);
+    if (!fs.existsSync(destDir)) fs.mkdirSync(destDir, { recursive: true });
+    fs.renameSync(jsonlArchive, liveJsonl);
+  }
+  if (fs.existsSync(histArchive)) {
+    ensureHistoryDir();
+    fs.renameSync(histArchive, liveHist);
+  }
+  if (fs.existsSync(todosArchive)) {
+    ensureTodosDir();
+    fs.renameSync(todosArchive, todosFile(sid));
+  }
+  if (fs.existsSync(sdkEventsArchive)) {
+    ensureSdkEventsDir();
+    fs.renameSync(sdkEventsArchive, sdkEventsFile(sid));
+  }
+  fs.unlinkSync(metaPath);
+
+  const restoredAt = new Date().toISOString();
+  let messagePreview = "";
+  try {
+    const hist = JSON.parse(fs.readFileSync(liveHist, "utf-8")) as any[];
+    const lastUser = [...hist].reverse().find((e) => e.role === "user");
+    if (lastUser) messagePreview = String(lastUser.content || "").slice(0, 200);
+  } catch {}
+
+  const sessions = readStore();
+  const existingIdx = sessions.findIndex((s) => s.id === sid);
+  const restored: SessionInfo = {
+    id: sid,
+    title: meta.title || "Untitled",
+    cwd,
+    createdAt: meta.createdAt || restoredAt,
+    lastActive: restoredAt,
+    messagePreview,
+  };
+  if (existingIdx >= 0) {
+    sessions[existingIdx] = restored;
+  } else {
+    sessions.push(restored);
+  }
+  writeStore(sessions);
+  console.log(`[RestoreArchive] Restored ${sid}_${ts} (title="${restored.title}", cwd=${cwd})`);
+
+  return { ok: true, session: restored };
+}
+
+export function deleteArchive(sid: string, ts: string): void {
+  ensureArchiveDir();
+  for (const suffix of [".jsonl", "_history.json", "_todos.json", "_sdk-events.jsonl", "_meta.json"]) {
+    const p = path.join(ARCHIVE_DIR, `${sid}_${ts}${suffix}`);
+    if (fs.existsSync(p)) {
+      fs.unlinkSync(p);
+      console.log(`[DeleteArchive] Removed ${sid}_${ts}${suffix}`);
+    }
   }
 }
 

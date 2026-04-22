@@ -93,6 +93,28 @@ export interface ClearContextMessage {
   sessionId: string;
 }
 
+export interface ListArchivesMessage {
+  type: "list_archives";
+}
+
+export interface GetArchiveHistoryMessage {
+  type: "get_archive_history";
+  sid: string;
+  ts: string;
+}
+
+export interface RestoreArchiveMessage {
+  type: "restore_archive";
+  sid: string;
+  ts: string;
+}
+
+export interface DeleteArchiveMessage {
+  type: "delete_archive";
+  sid: string;
+  ts: string;
+}
+
 export interface UploadStartMessage {
   type: "upload_start";
   uploadId: string;
@@ -283,6 +305,10 @@ export type ClientMessage =
   | CancelScheduledTaskMessage
   | UpdateScheduledTaskMessage
   | DeleteScheduledTaskMessage
+  | ListArchivesMessage
+  | GetArchiveHistoryMessage
+  | RestoreArchiveMessage
+  | DeleteArchiveMessage
   | { type: "auth_code"; code: string; sessionId?: string }
   | { type: "version_check" }
   | { type: "force_update" }

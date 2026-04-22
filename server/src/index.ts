@@ -7,7 +7,7 @@ import * as http from "http";
 import * as path from "path";
 import { WebSocketServer, WebSocket } from "ws";
 import { ClaudeSession } from "./claude-session";
-import { listSessions, getSession, saveSession, getHistory, getHistoryPage, getHistoryPageToLastPrompt, deleteSession, clearSessionContext, cleanupPendingToolCalls, getTodos, getMissedMessages, appendHistory, getSdkEvents, markQuestionAnswered, getLastHistoryTimestamp, listSdkSessions, getRecentCwds, addRecentCwd, removeRecentCwd, truncateHistoryAtMessage, getLastPromptSuggestion } from "./session-store";
+import { listSessions, getSession, saveSession, getHistory, getHistoryPage, getHistoryPageToLastPrompt, deleteSession, clearSessionContext, cleanupPendingToolCalls, getTodos, getMissedMessages, appendHistory, getSdkEvents, markQuestionAnswered, getLastHistoryTimestamp, listSdkSessions, getRecentCwds, addRecentCwd, removeRecentCwd, truncateHistoryAtMessage, getLastPromptSuggestion, listArchives, getArchiveHistory, restoreArchive, deleteArchive } from "./session-store";
 import { listScheduledTasks, getScheduledTask, saveScheduledTask, deleteScheduledTask, getDueTasks, getNextRunTime, getScheduledTaskSessionIds, ScheduledTask } from "./scheduled-task-store";
 import { ClientMessage, SessionInfo } from "./protocol";
 import { SocketClaudePlugin, PluginContext } from "./plugin-api";
@@ -843,6 +843,38 @@ function createConnectionHandler(transport: ClientTransport) {
           sendJson({ type: "context_cleared", sessionId: sid });
           broadcastSessionList();
         }
+        break;
+      }
+
+      case "list_archives": {
+        sendJson({ type: "archive_list", archives: listArchives() });
+        break;
+      }
+
+      case "get_archive_history": {
+        const { sid, ts } = msg as any;
+        const entries = getArchiveHistory(sid, ts);
+        sendJson({ type: "archive_history", sid, ts, messages: entries });
+        break;
+      }
+
+      case "restore_archive": {
+        const { sid, ts } = msg as any;
+        const result = restoreArchive(sid, ts);
+        if (result.ok) {
+          sendJson({ type: "archive_restored", sid, ts, session: result.session });
+          broadcastSessionList();
+        } else {
+          sendJson({ type: "error", message: `Restore failed: ${result.reason}` });
+        }
+        break;
+      }
+
+      case "delete_archive": {
+        const { sid, ts } = msg as any;
+        deleteArchive(sid, ts);
+        sendJson({ type: "archive_deleted", sid, ts });
+        sendJson({ type: "archive_list", archives: listArchives() });
         break;
       }
 
