@@ -860,12 +860,17 @@ function createConnectionHandler(transport: ClientTransport) {
 
       case "restore_archive": {
         const { sid, ts } = msg as any;
-        const result = restoreArchive(sid, ts);
-        if (result.ok) {
-          sendJson({ type: "archive_restored", sid, ts, session: result.session });
-          broadcastSessionList();
-        } else {
-          sendJson({ type: "error", message: `Restore failed: ${result.reason}` });
+        try {
+          const result = restoreArchive(sid, ts);
+          if (result.ok) {
+            sendJson({ type: "archive_restored", sid, ts, session: result.session });
+            broadcastSessionList();
+          } else {
+            sendJson({ type: "archive_restore_failed", sid, ts, reason: result.reason });
+          }
+        } catch (e: any) {
+          console.error(`[RestoreArchive] Exception: ${e.message}`, e.stack);
+          sendJson({ type: "archive_restore_failed", sid, ts, reason: e.message || String(e) });
         }
         break;
       }
