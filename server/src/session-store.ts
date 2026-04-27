@@ -154,6 +154,112 @@ export function appendHistory(sessionId: string, entry: HistoryEntry): void {
   fs.writeFileSync(file, JSON.stringify(entries, null, 2), "utf-8");
 }
 
+// Sessions whose user-uuid backfill has already run this process lifetime.
+// Re-running is harmless but doubles the disk reads — once per restart is enough.
+const _backfilledSessions = new Set<string>();
+
+/**
+ * Locate the Claude Code JSONL transcript for a session without needing the cwd.
+ * Scans ~/.claude/projects/* for `<sessionId>.jsonl` and returns the first match.
+ */
+function findJsonlForSession(sessionId: string): string | undefined {
+  const homeDir = process.env.HOME || require("os").homedir();
+  const projectsRoot = path.join(homeDir, ".claude", "projects");
+  if (!fs.existsSync(projectsRoot)) return undefined;
+  let projects: string[];
+  try { projects = fs.readdirSync(projectsRoot); } catch { return undefined; }
+  for (const proj of projects) {
+    const p = path.join(projectsRoot, proj, `${sessionId}.jsonl`);
+    if (fs.existsSync(p)) return p;
+  }
+  return undefined;
+}
+
+/** Extract plain text from a Claude Code JSONL user message's content field. */
+function extractJsonlUserText(content: any): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .filter((b: any) => b?.type === "text" && typeof b.text === "string")
+      .map((b: any) => b.text)
+      .join("");
+  }
+  return "";
+}
+
+/**
+ * Backfill UUIDs onto user history entries that pre-date self-assigned UUIDs.
+ * Reads the Claude Code JSONL transcript for the session and matches user
+ * entries by content in order. Idempotent: if no entries are missing UUIDs,
+ * the JSONL is never read.
+ */
+export function backfillUserUuids(sessionId: string): void {
+  if (_backfilledSessions.has(sessionId)) return;
+  _backfilledSessions.add(sessionId);
+
+  ensureHistoryDir();
+  const file = historyFile(sessionId);
+  if (!fs.existsSync(file)) return;
+
+  let entries: HistoryEntry[];
+  try { entries = JSON.parse(fs.readFileSync(file, "utf-8")); } catch { return; }
+
+  const missingIdx: number[] = [];
+  for (let i = 0; i < entries.length; i++) {
+    if (entries[i].role === "user" && !entries[i].uuid) missingIdx.push(i);
+  }
+  if (missingIdx.length === 0) return;
+
+  const jsonlPath = findJsonlForSession(sessionId);
+  if (!jsonlPath) return;
+
+  // Pull user prompts from the JSONL in order. Skip entries that don't carry a
+  // uuid (queue-operation rows etc.) and synthetic tool_result echoes.
+  const jsonlUsers: { uuid: string; text: string }[] = [];
+  try {
+    const lines = fs.readFileSync(jsonlPath, "utf-8").split("\n").filter(Boolean);
+    for (const line of lines) {
+      let row: any;
+      try { row = JSON.parse(line); } catch { continue; }
+      if (row.type !== "user" || !row.uuid || !row.message) continue;
+      const text = extractJsonlUserText(row.message.content);
+      if (!text) continue;
+      jsonlUsers.push({ uuid: row.uuid, text });
+    }
+  } catch { return; }
+
+  if (jsonlUsers.length === 0) return;
+
+  // Don't reuse UUIDs that other history entries already claim.
+  const usedUuids = new Set<string>();
+  for (const e of entries) {
+    if (e.role === "user" && e.uuid) usedUuids.add(e.uuid);
+  }
+  const available = jsonlUsers.filter(j => !usedUuids.has(j.uuid));
+
+  // Match in order, but a missing entry that can't be found doesn't stop the
+  // rest of the run. The cursor only advances when we consume an entry.
+  let cursor = 0;
+  let changed = false;
+  for (const idx of missingIdx) {
+    const histText = entries[idx].content || "";
+    let found = -1;
+    for (let j = cursor; j < available.length; j++) {
+      if (available[j].text === histText) { found = j; break; }
+    }
+    if (found >= 0) {
+      entries[idx].uuid = available[found].uuid;
+      cursor = found + 1;
+      changed = true;
+    }
+  }
+
+  if (changed) {
+    fs.writeFileSync(file, JSON.stringify(entries, null, 2), "utf-8");
+    console.log(`[Backfill] Restored UUIDs for ${sessionId} (${missingIdx.length} candidate entries)`);
+  }
+}
+
 /** Assign UUID to the most recent user history entry (for rewind support) */
 export function assignUserUuid(sessionId: string, uuid: string): void {
   ensureHistoryDir();
@@ -197,6 +303,9 @@ export function getHistory(sessionId: string): HistoryEntry[] {
   if (!fs.existsSync(file)) {
     return [];
   }
+  // Recover UUIDs on user prompts saved before self-assigned UUIDs (Apr 22 →
+  // Apr 27). Once-per-process and a no-op when nothing's missing.
+  backfillUserUuids(sessionId);
   return JSON.parse(fs.readFileSync(file, "utf-8"));
 }
 

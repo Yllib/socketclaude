@@ -641,19 +641,27 @@ export class ClaudeSession {
     console.log(`[Inject] Queuing message (priority=${priority}): ${text.slice(0, 80)}...`);
 
     const sessionId = this.sessionId || "";
+    const userMsgUuid = crypto.randomUUID();
 
     // Log injected message to history so it persists across sessions
     if (sessionId) {
       appendHistory(sessionId, {
         role: "user",
         content: text,
+        uuid: userMsgUuid,
         timestamp: new Date().toISOString(),
       });
+      this.send({
+        type: "user_message_uuid",
+        uuid: userMsgUuid,
+        sessionId,
+      } as any);
     }
 
     // Create an async iterable that yields the user message
     const userMessage = {
       type: "user" as const,
+      uuid: userMsgUuid,
       message: {
         role: "user" as const,
         content: text,
@@ -1129,10 +1137,27 @@ export class ClaudeSession {
       const resumeAt = this._resumeSessionAt;
       this._resumeSessionAt = undefined;
 
-      console.log(`Starting query: resume=${resumeTarget || 'none'}${shouldFork ? ' (FORK)' : ''}${resumeAt ? ` resumeAt=${resumeAt}` : ''}, effort=${this._effort}, thinking=${JSON.stringify(this._thinking)}, prompt=${prompt.slice(0, 80)}..., cwd=${this.cwd}`);
+      // Pre-assign a UUID for this user message so we can wire up rewind support
+      // immediately, without waiting for the SDK to echo it back. (SDK 0.2.116 stopped
+      // emitting a `user` message echo for string prompts; we control the UUID here
+      // and pass it via streaming-input mode so it lands in the SDK transcript with
+      // the same ID we hand to the app.)
+      const userMsgUuid = crypto.randomUUID();
+      const promptSessionId = resumeTarget || this.sessionId || "";
+      const promptStream = (async function* () {
+        yield {
+          type: "user" as const,
+          uuid: userMsgUuid,
+          session_id: promptSessionId,
+          message: { role: "user" as const, content: prompt },
+          parent_tool_use_id: null,
+        };
+      })();
+
+      console.log(`Starting query: resume=${resumeTarget || 'none'}${shouldFork ? ' (FORK)' : ''}${resumeAt ? ` resumeAt=${resumeAt}` : ''}, effort=${this._effort}, thinking=${JSON.stringify(this._thinking)}, prompt=${prompt.slice(0, 80)}..., uuid=${userMsgUuid}, cwd=${this.cwd}`);
 
       const q = this.activeQuery = query({
-        prompt: prompt,
+        prompt: promptStream as any,
         options: {
           cwd: this.cwd,
           ...(CLAUDE_BINARY_OVERRIDE ? { pathToClaudeCodeExecutable: CLAUDE_BINARY_OVERRIDE } : {}),
@@ -1668,8 +1693,16 @@ export class ClaudeSession {
         appendHistory(sid, {
           role: "user",
           content: prompt,
+          uuid: userMsgUuid,
           timestamp: now(),
         });
+        // Forward UUID to app right away so the rewind affordance shows on the
+        // bubble without waiting for an SDK echo.
+        this.send({
+          type: "user_message_uuid",
+          uuid: userMsgUuid,
+          sessionId: sid,
+        } as any);
         promptLogged = true;
       }
 
@@ -1910,8 +1943,15 @@ export class ClaudeSession {
             appendHistory(message.session_id, {
               role: "user",
               content: prompt,
+              uuid: userMsgUuid,
               timestamp: now(),
             });
+            // Forward UUID once we know which session it belongs to.
+            this.send({
+              type: "user_message_uuid",
+              uuid: userMsgUuid,
+              sessionId: message.session_id,
+            } as any);
             promptLogged = true;
           }
         }
