@@ -84,7 +84,7 @@ test("repeated sends of an unchanged path receive independent durable delivery I
   };
 
   try {
-    appendHistory(sessionId, {
+    const firstCall = appendHistory(sessionId, {
       role: "tool_call",
       content: "",
       toolName: "SendFile",
@@ -93,6 +93,20 @@ test("repeated sends of an unchanged path receive independent durable delivery I
       timestamp: new Date().toISOString(),
     });
     await handleSendFileTool(ctx, { file_path: filePath });
+
+    // Backend/native history may revise the canonical tool row after the app
+    // handler attaches transport metadata. That later revision must not erase
+    // the immutable delivery path.
+    appendHistory(sessionId, {
+      role: "tool_call",
+      content: "",
+      toolName: "SendFile",
+      toolInput: { file_path: filePath },
+      toolUseId: "send-call-1",
+      timestamp: firstCall.timestamp,
+      entryId: firstCall.entryId,
+      sessionSeq: firstCall.sessionSeq,
+    });
 
     appendHistory(sessionId, {
       role: "tool_call",
@@ -106,7 +120,18 @@ test("repeated sends of an unchanged path receive independent durable delivery I
 
     assert.equal(packets.length, 2);
     assert.notEqual(packets[0].fileId, packets[1].fileId);
-    assert.equal(packets[0].fileVersion, packets[1].fileVersion);
+    assert.ok(packets[0].fileVersion);
+    assert.ok(packets[1].fileVersion);
+    assert.equal(packets[0].filePath, filePath);
+    assert.notEqual(packets[0].downloadPath, filePath);
+    assert.equal(fs.readFileSync(packets[0].downloadPath, "utf8"), "unchanged content");
+
+    fs.writeFileSync(filePath, "replacement content");
+    assert.equal(
+      fs.readFileSync(packets[0].downloadPath, "utf8"),
+      "unchanged content",
+      "a sent delivery must not change when its source path is overwritten",
+    );
 
     const calls = getHistory(sessionId).filter(
       (entry) => entry.role === "tool_call" && entry.toolName === "SendFile",
@@ -117,6 +142,12 @@ test("repeated sends of an unchanged path receive independent durable delivery I
     );
     assert.equal(calls[0].fileVersion, packets[0].fileVersion);
     assert.equal(calls[1].fileVersion, packets[1].fileVersion);
+    assert.equal(calls[0].fileDeliveryPath, packets[0].downloadPath);
+    assert.equal(calls[1].fileDeliveryPath, packets[1].downloadPath);
+
+    deleteSessionArtifacts(sessionId);
+    assert.equal(fs.existsSync(packets[0].downloadPath), false);
+    assert.equal(fs.existsSync(packets[1].downloadPath), false);
   } finally {
     deleteSessionArtifacts(sessionId);
     fs.rmSync(dir, { recursive: true, force: true });

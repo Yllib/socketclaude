@@ -13,6 +13,7 @@ import { socketAgentDataPath } from "./socket-agent-paths";
 import { remapHtmlPlans } from "./html-plan-store";
 import { createInteractiveRequestId } from "./interactive-request-id";
 import { repairTranscriptIdentityCollisions, sameLogicalTranscriptEntry } from "./transcript-repair";
+import { deleteSendFileDelivery } from "./send-file-store";
 import {
   TranscriptDatabase,
   type TranscriptLegacyFingerprint,
@@ -270,6 +271,17 @@ export function deleteSessionArtifacts(sessionId: string, sessionInfo?: SessionI
   const warnings: string[] = [];
   const info = sessionInfo || getSession(sessionId) || getCodexThreadSessionInfo(sessionId) || undefined;
   const backend = info?.backend;
+
+  // SendFile cards own immutable snapshots so their downloads survive source
+  // rebuilds and deletions. Remove those snapshots only when the session itself
+  // is permanently deleted.
+  try {
+    for (const entry of readHistoryEntries(sessionId)) {
+      if (entry.fileDeliveryPath) deleteSendFileDelivery(entry.fileDeliveryPath);
+    }
+  } catch (error: any) {
+    warnings.push(`Failed to delete sent-file snapshots: ${error?.message || String(error)}`);
+  }
 
   unlinkIfExists(historyFile(sessionId), removed, "history");
   unlinkIfExists(historyBackupFile(sessionId), removed, "history-backup");
@@ -846,6 +858,8 @@ export function normalizeSendFileHistoryEntries(entries: HistoryEntry[]): Histor
       canonical.fileId ??= synthetic.fileId;
       canonical.fileName ??= synthetic.fileName;
       canonical.fileSize ??= synthetic.fileSize;
+      canonical.fileVersion ??= synthetic.fileVersion;
+      canonical.fileDeliveryPath ??= synthetic.fileDeliveryPath;
       removedIndexes.add(syntheticIndex);
       removedToolUseIds.add(syntheticId);
     }
@@ -1298,6 +1312,7 @@ export function appendHistory(sessionId: string, entry: HistoryEntry): HistoryEn
       positioned.fileName ??= existing.fileName;
       positioned.fileSize ??= existing.fileSize;
       positioned.fileVersion ??= existing.fileVersion;
+      positioned.fileDeliveryPath ??= existing.fileDeliveryPath;
     }
     positioned.revision = Math.max(
       positiveInteger(positioned.revision) || 1,
@@ -1325,6 +1340,7 @@ export function appendHistory(sessionId: string, entry: HistoryEntry): HistoryEn
 
 export interface SendFileDeliveryMetadata {
   filePath: string;
+  fileDeliveryPath: string;
   fileId: string;
   fileName: string;
   fileSize: number;
@@ -1359,6 +1375,7 @@ export function attachSendFileDeliveryToHistory(
     entry.fileName = metadata.fileName;
     entry.fileSize = metadata.fileSize;
     entry.fileVersion = metadata.fileVersion;
+    entry.fileDeliveryPath = metadata.fileDeliveryPath;
     entry.revision = (positiveInteger(entry.revision) || 1) + 1;
     return hydrateHistoryEntry(appendHistory(sessionId, entry));
   }

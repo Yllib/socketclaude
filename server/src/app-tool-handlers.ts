@@ -28,6 +28,7 @@ import {
   saveTodos,
 } from "./session-store";
 import { fileTransferVersion } from "./file-transfer-wire";
+import { snapshotSendFile } from "./send-file-store";
 import {
   createDurableMonitorRecord,
   DurableMonitorRecord,
@@ -958,13 +959,18 @@ export async function handleSendFileTool(
     if (!fs.existsSync(filePath)) {
       return { content: [{ type: "text", text: `File not found: ${filePath}` }] };
     }
-    const stat = fs.statSync(filePath);
+    const sourceStat = fs.statSync(filePath);
+    if (!sourceStat.isFile()) {
+      return { content: [{ type: "text", text: `Not a file: ${filePath}` }], isError: true };
+    }
     const fileName = path.basename(filePath);
     const sessionId = ctx.getSessionId();
     // This identifies one delivery, not the underlying path/content. Reusing
     // a deterministic path hash made a later card inherit an earlier card's
     // downloaded state whenever the file had not changed.
     const fileId = `send_${crypto.randomUUID()}`;
+    const fileDeliveryPath = await snapshotSendFile(filePath, fileId);
+    const stat = fs.statSync(fileDeliveryPath);
     const fileVersion = fileTransferVersion(stat);
     const advertisedAtMs = Date.now();
 
@@ -977,6 +983,7 @@ export async function handleSendFileTool(
         fileId,
         fileName,
         filePath,
+        downloadPath: fileDeliveryPath,
         fileSize: stat.size,
         fileVersion,
         sessionId,
@@ -989,6 +996,7 @@ export async function handleSendFileTool(
       try {
         attachedEntry = attachSendFileDeliveryToHistory(sessionId, {
           filePath,
+          fileDeliveryPath,
           fileId,
           fileName,
           fileSize: stat.size,

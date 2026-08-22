@@ -1722,6 +1722,8 @@ export interface HistoryEntry {
   fileSize?: number;
   /** Content identity at advertisement time; distinct from the delivery ID. */
   fileVersion?: string;
+  /** Immutable server-side snapshot used to restore this SendFile delivery. */
+  fileDeliveryPath?: string;
   // Server-internal large-output storage. These fields may be present in
   // persisted history; the server hydrates toolOutput before sending to clients.
   toolOutputRef?: string;
@@ -1975,6 +1977,8 @@ export interface FileAvailableServerMessage {
   fileId: string;
   fileName: string;
   filePath: string;
+  /** Immutable server-side path used for the actual download. */
+  downloadPath?: string;
   fileSize: number;
   fileVersion?: string;
   sessionId: string;
