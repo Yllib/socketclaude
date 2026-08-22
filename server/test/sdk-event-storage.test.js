@@ -1,6 +1,7 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
 const { randomUUID } = require("node:crypto");
+require("./test-data-dir");
 
 const {
   appendSdkEvent,

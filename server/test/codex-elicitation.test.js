@@ -1,6 +1,7 @@
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const test = require("node:test");
+require("./test-data-dir");
 
 const {
   prepareCodexMcpElicitation,

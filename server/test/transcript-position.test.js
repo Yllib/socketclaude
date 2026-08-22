@@ -4,6 +4,7 @@ const { randomUUID } = require("node:crypto");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+require("./test-data-dir");
 
 const {
   appendHistory,
@@ -17,7 +18,11 @@ const {
 
 test("corrupt retained JSON cannot roll durable SQLite history backward", () => {
   const sessionId = `test-history-recovery-${randomUUID()}`;
-  const historyPath = path.join(os.homedir(), ".socket-agent", "history", `${sessionId}.json`);
+  const historyPath = path.join(
+    process.env.SOCKET_AGENT_DATA_DIR || path.join(os.homedir(), ".socket-agent"),
+    "history",
+    `${sessionId}.json`,
+  );
   try {
     appendHistory(sessionId, {
       role: "user",

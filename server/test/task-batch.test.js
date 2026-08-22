@@ -1,6 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const { randomUUID } = require("node:crypto");
+require("./test-data-dir");
 
 const { handleTaskBatchTool } = require("../dist/app-tool-handlers");
 const { getTodos, saveTodos } = require("../dist/session-store");
