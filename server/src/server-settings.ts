@@ -40,8 +40,20 @@ let cachedSettings: ServerSettings | null = null;
 let cachedDriversAvailable: { checkedAt: number; value: CodexDriver[] } | null = null;
 let cachedBackendHealth: { checkedAt: number; value: BackendHealthInfo[] } | null = null;
 
-function normalizeSystemPrompt(value: unknown): string {
-  return typeof value === "string" ? value.slice(0, 20_000) : "";
+const LEGACY_AUTOMATIC_HTML_PLAN_RULES = [
+  "- For any non-trivial UI, layout, or copy change, build several distinct static mocks, publish them with the html plan tool, and stop. Wait for a pick before implementing. Non-trivial is a key word here. If exact direction is given this isnt necessary.",
+  "- Do not edit real components first. For any non-trivial UI, layout, or copy change, build several distinct static mocks, publish them with the html plan tool, and stop. Wait for a pick before implementing. Non-trivial is a key word here.",
+];
+const EXPLICIT_HTML_PLAN_RULE =
+  "- Use the HTML plan tool only when the user explicitly asks for an HTML plan or explicitly asks to use that tool. Never invoke it automatically for UI, layout, copy, mockups, or implementation planning. When the user gives exact UI direction, implement it directly.";
+
+export function normalizeSystemPrompt(value: unknown): string {
+  if (typeof value !== "string") return "";
+  let prompt = value;
+  for (const legacyRule of LEGACY_AUTOMATIC_HTML_PLAN_RULES) {
+    prompt = prompt.replace(legacyRule, EXPLICIT_HTML_PLAN_RULE);
+  }
+  return prompt.slice(0, 20_000);
 }
 
 export function normalizeClaudeAutoCompactWindow(value: unknown): number | null {

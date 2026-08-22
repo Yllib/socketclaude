@@ -45,6 +45,12 @@ import type {
   AgentSessionToolExecutor,
   DelegatedAgentRecord,
 } from "./delegated-agent-types";
+import {
+  deleteSessionMemoryEntry,
+  getSessionMemoryState,
+  SessionMemoryKind,
+  upsertSessionMemoryEntry,
+} from "./session-memory-store";
 
 export interface AppToolContext {
   getSessionId(): string;
@@ -63,6 +69,17 @@ export interface AppToolContext {
   manageAgentSession?: AgentSessionToolExecutor;
   reportSubagentAssignment?(agentPath: string, prompt: string): boolean;
   requestPluginAuthorization?(pluginName: string): Promise<boolean>;
+}
+
+export interface SessionMemoryToolArgs {
+  action: "list" | "upsert" | "delete";
+  entry_id?: string;
+  kind?: SessionMemoryKind;
+  text?: string;
+  pinned?: boolean;
+  status?: "active" | "superseded";
+  source_session_seq?: number;
+  source_entry_id?: string;
 }
 
 export interface McpTextResult {
@@ -1386,6 +1403,64 @@ export async function handleRememberTool(
       default:
         throw new Error(`Unsupported Remember action: ${String(args.action)}`);
     }
+  } catch (error) {
+    return {
+      content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }],
+      isError: true,
+    };
+  }
+}
+
+/** Persist a small set of confirmed facts across native thread rollovers. */
+export async function handleSessionMemoryTool(
+  ctx: AppToolContext,
+  args: SessionMemoryToolArgs,
+): Promise<McpTextResult> {
+  const sessionId = ctx.getSessionId();
+  if (!sessionId) {
+    return {
+      content: [{ type: "text", text: "Session memory is unavailable until this session has an ID." }],
+      isError: true,
+    };
+  }
+  try {
+    let state;
+    switch (args.action) {
+      case "list":
+        state = getSessionMemoryState(sessionId);
+        break;
+      case "upsert":
+        if (!args.kind || !args.text?.trim()) {
+          throw new Error("kind and text are required for SessionMemory upsert");
+        }
+        state = upsertSessionMemoryEntry(sessionId, {
+          id: args.entry_id,
+          kind: args.kind,
+          text: args.text,
+          pinned: args.pinned,
+          status: args.status,
+          sourceSessionSeq: args.source_session_seq,
+          sourceEntryId: args.source_entry_id,
+        });
+        break;
+      case "delete":
+        if (!args.entry_id) throw new Error("entry_id is required for SessionMemory delete");
+        state = deleteSessionMemoryEntry(sessionId, args.entry_id);
+        break;
+      default:
+        throw new Error(`Unsupported SessionMemory action: ${String(args.action)}`);
+    }
+    ctx.send({ type: "session_memory_state", sessionId, state: { ...state } });
+    return {
+      content: [{
+        type: "text",
+        text: JSON.stringify({
+          action: args.action,
+          entries: state.entries,
+          rollover_pending: state.rolloverPending,
+        }, null, 2),
+      }],
+    };
   } catch (error) {
     return {
       content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }],

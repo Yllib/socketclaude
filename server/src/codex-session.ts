@@ -64,6 +64,11 @@ import { LatestSnapshotDispatcher } from "./latest-snapshot-dispatcher";
 import { createInteractiveRequestId } from "./interactive-request-id";
 import { buildCodexRateLimitEvents } from "./rate-limit-events";
 import { recordRateLimitEvent } from "./rate-limit-cache";
+import {
+  recordSessionMemoryCompaction,
+  recordSessionMemoryContextUsage,
+  remapSessionMemory,
+} from "./session-memory-store";
 
 const TRANSIENT_CODEX_RAW_EVENT_METHODS = new Set([
   "item/agentMessage/delta",
@@ -535,6 +540,7 @@ export class CodexSession {
   private _appendSystemPrompt = "";
   private _systemPromptOverride: string | undefined;
   private _pendingTransferContext: string | null = null;
+  private _preparedRolloverSessionId: string | null = null;
   private _disallowedTools: string[] = [];
   private _collaborationMode = "default";
   private _ttsEnabled = false;
@@ -1195,6 +1201,17 @@ export class CodexSession {
   }
   setPendingTransferContext(context: string): void {
     this._pendingTransferContext = context.trim() || null;
+  }
+  prepareContextRollover(previousSessionId: string, context: string): void {
+    if (this.isBusy) throw new Error("Cannot roll over a running Codex session");
+    this._preparedRolloverSessionId = previousSessionId;
+    this.replacesSessionId = previousSessionId;
+    this.sessionId = null;
+    this.threadId = null;
+    this._resumeSessionId = undefined;
+    this._sessionInfoSaved = false;
+    this._lastUsage = null;
+    this.setPendingTransferContext(context);
   }
   setCodexCollaborationMode(mode: string): void {
     const trimmed = (mode || "default").trim();
@@ -2267,6 +2284,15 @@ export class CodexSession {
         }
       }
     } catch (err: any) {
+      if (this._preparedRolloverSessionId && !this.sessionId) {
+        const previousSessionId = this._preparedRolloverSessionId;
+        this.sessionId = previousSessionId;
+        this.threadId = previousSessionId;
+        this._resumeSessionId = previousSessionId;
+        this._sessionInfoSaved = true;
+        this.replacesSessionId = undefined;
+        this._preparedRolloverSessionId = null;
+      }
       this._pendingUserPrompt = null;
       this.clearPendingAppServerSteers(`codex app-server error: ${err?.message || String(err)}`);
       if (isTimedOutCodexThreadResume(err) || isCodexActiveWriterError(err)) {
@@ -2725,6 +2751,10 @@ export class CodexSession {
       };
       if (replacesSessionId) {
         remapSession(replacesSessionId, this.sessionId);
+        remapSessionMemory(replacesSessionId, this.sessionId);
+        void this.appServer?.archiveThread(replacesSessionId).catch((error: unknown) => {
+          console.warn(`[SessionMemory] Could not archive prior Codex thread ${replacesSessionId}: ${String(error)}`);
+        });
         const remapped = getSession(this.sessionId);
         saveSession({
           ...info,
@@ -2737,6 +2767,7 @@ export class CodexSession {
           agentSettings: this.getAgentSettings(),
         });
         this.replacesSessionId = undefined;
+        this._preparedRolloverSessionId = null;
       } else {
         saveSession(info);
       }
@@ -3702,6 +3733,11 @@ export class CodexSession {
             ...contextUsage,
           } as any);
           updateSessionContextUsage(this.sessionId, contextUsage);
+          recordSessionMemoryContextUsage(
+            this.sessionId,
+            Number(contextUsage.totalTokens || 0),
+            Number(contextUsage.maxTokens || 0),
+          );
         }
         updateSessionActivity(this.sessionId, this._lastAssistantText, usage);
         return;
@@ -5005,6 +5041,7 @@ export class CodexSession {
       content: `[compact_boundary:${preTokens}:${boundaryTrigger}]`,
       timestamp: now(),
     });
+    recordSessionMemoryCompaction(sid, preTokens);
   }
 
   private emitAppServerRawEvent(method: string, params: any): void {

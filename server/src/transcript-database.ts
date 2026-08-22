@@ -222,7 +222,7 @@ export class TranscriptDatabase {
       }
     }
     if (ftsEnabled && (!hadFtsTable || schemaVersion < 2)) {
-      console.log(`[History] Rebuilding transcript FTS rowid index (schema ${schemaVersion} -> 2)`);
+      console.error(`[History] Rebuilding transcript FTS rowid index (schema ${schemaVersion} -> 2)`);
       this.db.exec("BEGIN IMMEDIATE");
       try {
         this.db.exec("DROP TABLE IF EXISTS transcript_fts");
@@ -414,6 +414,17 @@ export class TranscriptDatabase {
 
   count(sessionId: string): number {
     return this.summary(sessionId)?.entryCount ?? 0;
+  }
+
+  countCompactionBoundaries(sessionId: string): number {
+    const row = this.db.prepare(`
+      SELECT COUNT(*) AS value
+      FROM transcript_entries
+      WHERE session_id = ?
+        AND role = 'assistant'
+        AND json_extract(entry_json, '$.content') LIKE '[compact_boundary:%'
+    `).get(sessionId) as unknown as { value: number };
+    return Number(row.value);
   }
 
   getPage(sessionId: string, offset: number, limit: number): HistoryEntry[] {

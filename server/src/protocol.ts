@@ -536,6 +536,48 @@ export interface CompactContextMessage {
   sessionId?: string;
 }
 
+export interface GetSessionMemoryMessage {
+  type: "get_session_memory";
+  sessionId: string;
+  requestId?: string;
+}
+
+export interface UpsertSessionMemoryMessage {
+  type: "upsert_session_memory";
+  sessionId: string;
+  requestId?: string;
+  entryId?: string;
+  kind: "active_work" | "decision" | "constraint" | "preference" | "project_fact" | "open_question";
+  text: string;
+  pinned?: boolean;
+  status?: "active" | "superseded";
+  sourceSessionSeq?: number;
+  sourceEntryId?: string;
+}
+
+export interface DeleteSessionMemoryMessage {
+  type: "delete_session_memory";
+  sessionId: string;
+  requestId?: string;
+  entryId: string;
+}
+
+export interface SetSessionMemorySettingsMessage {
+  type: "set_session_memory_settings";
+  sessionId: string;
+  requestId?: string;
+  autoRollover?: boolean;
+  maxCompactions?: number;
+  maxPostCompactionTokens?: number;
+  recentRuns?: number;
+}
+
+export interface RolloverSessionMemoryMessage {
+  type: "rollover_session_memory";
+  sessionId: string;
+  requestId?: string;
+}
+
 export interface CodexRollbackThreadMessage {
   type: "codex_rollback_thread";
   sessionId?: string;
@@ -1047,6 +1089,11 @@ export type ClientMessage =
   | RenameSessionMessage
   | ClearContextMessage
   | CompactContextMessage
+  | GetSessionMemoryMessage
+  | UpsertSessionMemoryMessage
+  | DeleteSessionMemoryMessage
+  | SetSessionMemorySettingsMessage
+  | RolloverSessionMemoryMessage
   | CodexRollbackThreadMessage
   | ArchiveSessionMessage
   | SessionTransferExportMessage
@@ -2526,6 +2573,20 @@ export interface PhoneAdbCancelServerMessage {
   requestId: string;
 }
 
+export interface SessionMemoryStateServerMessage {
+  type: "session_memory_state";
+  sessionId: string;
+  requestId?: string;
+  state: Record<string, unknown>;
+}
+
+export interface SessionMemoryErrorServerMessage {
+  type: "session_memory_error";
+  sessionId: string;
+  requestId?: string;
+  message: string;
+}
+
 export type ServerMessage =
   | TextServerMessage
   | ToolCallServerMessage
@@ -2622,4 +2683,6 @@ export type ServerMessage =
   | PhoneAdbRequestServerMessage
   | PhoneAdbFileChunkServerMessage
   | PhoneAdbFileEndServerMessage
-  | PhoneAdbCancelServerMessage;
+  | PhoneAdbCancelServerMessage
+  | SessionMemoryStateServerMessage
+  | SessionMemoryErrorServerMessage;

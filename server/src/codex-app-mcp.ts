@@ -12,6 +12,7 @@ import {
   handleNotifyUserTool,
   handlePrivateIntegrationAuthTool,
   handleRememberTool,
+  handleSessionMemoryTool,
   handleRequestSecureInputTool,
   handleReadSkillTool,
   handleReportSubagentAssignmentTool,
@@ -27,6 +28,7 @@ import {
   AGENT_SESSION_TOOL_DESCRIPTION,
   HTML_PLAN_TOOL_DESCRIPTION,
   REMEMBER_TOOL_DESCRIPTION,
+  SESSION_MEMORY_TOOL_DESCRIPTION,
   WORK_REVIEW_TOOL_DESCRIPTION,
 } from "./socketagent-instructions";
 
@@ -91,6 +93,10 @@ export const SOCKETAGENT_APP_TOOLS: SocketAgentAppToolManifest[] = [
   {
     name: "Remember",
     description: REMEMBER_TOOL_DESCRIPTION,
+  },
+  {
+    name: "SessionMemory",
+    description: SESSION_MEMORY_TOOL_DESCRIPTION,
   },
   {
     name: "SearchSkills",
@@ -409,6 +415,25 @@ function createServer(context: AppToolContext): McpServer {
       },
     },
     async (args) => handleRememberTool(context, args as any),
+  );
+
+  server.registerTool(
+    "SessionMemory",
+    {
+      title: "Session Memory",
+      description: SESSION_MEMORY_TOOL_DESCRIPTION,
+      inputSchema: {
+        action: z.enum(["list", "upsert", "delete"]),
+        entry_id: z.string().optional().describe("Existing memory entry ID for update or delete"),
+        kind: z.enum(["active_work", "decision", "constraint", "preference", "project_fact", "open_question"]).optional(),
+        text: z.string().max(20000).optional().describe("Concise confirmed memory text for upsert"),
+        pinned: z.boolean().optional().describe("Keep this item at the top of rollover context"),
+        status: z.enum(["active", "superseded"]).optional(),
+        source_session_seq: z.number().int().positive().optional(),
+        source_entry_id: z.string().optional(),
+      },
+    },
+    async (args) => handleSessionMemoryTool(context, args as any),
   );
 
   server.registerTool(

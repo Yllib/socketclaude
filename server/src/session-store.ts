@@ -1778,6 +1778,12 @@ export function getHistoryCount(sessionId: string): number {
   return historyDatabase().count(sessionId);
 }
 
+/** Count persisted Codex compaction boundaries without hydrating transcript rows. */
+export function getSessionCompactionCount(sessionId: string): number {
+  ensureHistoryDatabaseSession(sessionId);
+  return historyDatabase().countCompactionBoundaries(sessionId);
+}
+
 export interface RememberSearchOptions {
   query: string;
   roles?: string[];
