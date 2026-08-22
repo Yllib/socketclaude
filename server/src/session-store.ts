@@ -344,24 +344,38 @@ export function remapSession(oldId: string, newId: string): void {
         TOOL_IMAGE_CACHE_DIR,
         newId.replace(/[^A-Za-z0-9_-]/g, "_"),
       );
-      const transferredHistory = getHistory(oldId).map((entry) => {
-        if (!entry.filePath || !entry.filePath.startsWith(oldImageDir + path.sep)) {
-          return entry;
-        }
-        return {
-          ...entry,
-          filePath: path.join(newImageDir, path.relative(oldImageDir, entry.filePath)),
-        };
-      });
+      const oldToolOutputDir = toolOutputSessionDir(oldId);
+      const newToolOutputDir = toolOutputSessionDir(newId);
+      let movedImages = false;
+      let movedToolOutput = false;
       if (fs.existsSync(oldImageDir) && !fs.existsSync(newImageDir)) {
         fs.mkdirSync(path.dirname(newImageDir), { recursive: true });
         fs.renameSync(oldImageDir, newImageDir);
+        movedImages = true;
       }
-      replaceHistory(newId, transferredHistory);
+      if (fs.existsSync(oldToolOutputDir) && !fs.existsSync(newToolOutputDir)) {
+        fs.mkdirSync(path.dirname(newToolOutputDir), { recursive: true });
+        fs.renameSync(oldToolOutputDir, newToolOutputDir);
+        movedToolOutput = true;
+      }
+      try {
+        historyDatabase().remapSession(oldId, newId, {
+          ...(movedImages ? {
+            filePathPrefix: { from: oldImageDir + path.sep, to: newImageDir + path.sep },
+          } : {}),
+          ...(movedToolOutput ? {
+            toolOutputRefPrefix: { from: `${oldId}/`, to: `${newId}/` },
+          } : {}),
+        });
+      } catch (error) {
+        if (movedImages && !fs.existsSync(oldImageDir)) fs.renameSync(newImageDir, oldImageDir);
+        if (movedToolOutput && !fs.existsSync(oldToolOutputDir)) {
+          fs.renameSync(newToolOutputDir, oldToolOutputDir);
+        }
+        throw error;
+      }
       fs.rmSync(oldHistory, { force: true });
       fs.rmSync(oldHistoryBackup, { force: true });
-      historyDatabase().deleteSession(oldId);
-      fs.rmSync(toolOutputSessionDir(oldId), { recursive: true, force: true });
     }
     historyCache.delete(oldId);
     historyCache.delete(newId);

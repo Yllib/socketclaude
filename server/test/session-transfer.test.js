@@ -215,3 +215,45 @@ test("cross-harness clone keeps history and remaps it to the first native thread
     deleteHtmlPlansForSession(placeholderId);
   }
 });
+
+test("session remap preserves cached images and large tool output", () => {
+  const oldId = crypto.randomUUID();
+  const newId = crypto.randomUUID();
+  const cwd = path.join(testHome, "artifact-remap");
+  const imageDir = path.join(
+    process.env.SOCKET_AGENT_DATA_DIR,
+    "tool-images",
+    oldId,
+  );
+  const imagePath = path.join(imageDir, "result.png");
+  fs.mkdirSync(imageDir, { recursive: true });
+  fs.writeFileSync(imagePath, "image-data");
+  saveSession(makeSession(oldId, "codex", cwd));
+  const fullOutput = "tool output ".repeat(2_000);
+  replaceHistory(oldId, [
+    {
+      role: "tool_result",
+      toolUseId: "tool-1",
+      content: fullOutput,
+      toolOutput: fullOutput,
+      filePath: imagePath,
+      timestamp: "2026-07-26T12:01:00.000Z",
+    },
+  ]);
+
+  try {
+    remapSession(oldId, newId);
+    const [entry] = getHistory(newId);
+    assert.equal(entry.toolOutput, fullOutput);
+    assert.equal(entry.filePath, path.join(
+      process.env.SOCKET_AGENT_DATA_DIR,
+      "tool-images",
+      newId,
+      "result.png",
+    ));
+    assert.equal(fs.readFileSync(entry.filePath, "utf8"), "image-data");
+  } finally {
+    deleteSessionArtifacts(newId, getSession(newId));
+    deleteSessionArtifacts(oldId, getSession(oldId));
+  }
+});

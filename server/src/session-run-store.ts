@@ -1,5 +1,6 @@
 import * as crypto from "crypto";
 import type {
+  HistoryEntry,
   SessionRunRecord,
   SessionRunOutcome,
   SessionRunStats,
@@ -49,6 +50,30 @@ export function hasOutstandingDelegatedRuns(
     if (run.status === "starting" || run.status === "running") return true;
     return run.reportStatus !== "delivered";
   }));
+}
+
+export function inferStaleRunCompletion(
+  entries: HistoryEntry[],
+  startedAt: string,
+): { finishedAt: string; outcome: SessionRunOutcome } {
+  const startedMs = Date.parse(startedAt);
+  let finishedAt = startedAt;
+  let finishedMs = Number.isFinite(startedMs) ? startedMs : 0;
+  let hasAssistantResponse = false;
+  for (const entry of entries) {
+    const timestampMs = Date.parse(entry.timestamp || "");
+    if (!Number.isFinite(timestampMs)) continue;
+    if (Number.isFinite(startedMs) && timestampMs < startedMs) continue;
+    if (entry.role === "assistant") hasAssistantResponse = true;
+    if (timestampMs >= finishedMs) {
+      finishedMs = timestampMs;
+      finishedAt = entry.timestamp!;
+    }
+  }
+  return {
+    finishedAt,
+    outcome: hasAssistantResponse ? "completed" : "failed",
+  };
 }
 
 export function getSessionRunStats(sessionId: string): SessionRunStats | undefined {

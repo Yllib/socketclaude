@@ -34,6 +34,11 @@ export interface TranscriptSearchOptions {
   offset?: number;
 }
 
+export interface TranscriptSessionRemapOptions {
+  filePathPrefix?: { from: string; to: string };
+  toolOutputRefPrefix?: { from: string; to: string };
+}
+
 export interface TranscriptSearchHit {
   sessionSeq: number;
   entryId: string;
@@ -670,6 +675,71 @@ export class TranscriptDatabase {
         );
       }
       this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  /** Re-key a transcript in one SQLite transaction without parsing every entry. */
+  remapSession(
+    oldSessionId: string,
+    newSessionId: string,
+    options: TranscriptSessionRemapOptions = {},
+  ): boolean {
+    if (oldSessionId === newSessionId) return this.hasSession(oldSessionId);
+    if (!this.hasSession(oldSessionId)) return false;
+
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.prepare(`DELETE FROM ${this.searchTable} WHERE session_id = ?`).run(newSessionId);
+      this.db.prepare("DELETE FROM transcript_sessions WHERE session_id = ?").run(newSessionId);
+      this.db.prepare(`
+        INSERT INTO transcript_sessions (
+          session_id, entry_count, user_prompt_count, latest_timestamp,
+          message_preview, latest_conversation_seq, legacy_path, legacy_size,
+          legacy_mtime_ms, migrated_at, updated_at
+        )
+        SELECT ?, entry_count, user_prompt_count, latest_timestamp,
+          message_preview, latest_conversation_seq, NULL, NULL, NULL,
+          migrated_at, ?
+        FROM transcript_sessions WHERE session_id = ?
+      `).run(newSessionId, new Date().toISOString(), oldSessionId);
+
+      const replaceJsonPrefix = (
+        jsonPath: "$.filePath" | "$.toolOutputRef",
+        replacement?: { from: string; to: string },
+      ): void => {
+        if (!replacement || replacement.from === replacement.to) return;
+        this.db.prepare(`
+          UPDATE transcript_entries
+          SET entry_json = json_set(
+            entry_json,
+            '${jsonPath}',
+            ? || substr(json_extract(entry_json, '${jsonPath}'), length(?) + 1)
+          )
+          WHERE session_id = ?
+            AND json_type(entry_json, '${jsonPath}') = 'text'
+            AND substr(json_extract(entry_json, '${jsonPath}'), 1, length(?)) = ?
+        `).run(
+          replacement.to,
+          replacement.from,
+          oldSessionId,
+          replacement.from,
+          replacement.from,
+        );
+      };
+      replaceJsonPrefix("$.filePath", options.filePathPrefix);
+      replaceJsonPrefix("$.toolOutputRef", options.toolOutputRefPrefix);
+
+      this.db.prepare(
+        "UPDATE transcript_entries SET session_id = ? WHERE session_id = ?",
+      ).run(newSessionId, oldSessionId);
+      this.db.prepare(`UPDATE ${this.searchTable} SET session_id = ? WHERE session_id = ?`)
+        .run(newSessionId, oldSessionId);
+      this.db.prepare("DELETE FROM transcript_sessions WHERE session_id = ?").run(oldSessionId);
+      this.db.exec("COMMIT");
+      return true;
     } catch (error) {
       this.db.exec("ROLLBACK");
       throw error;

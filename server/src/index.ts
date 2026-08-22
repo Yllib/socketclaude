@@ -73,6 +73,7 @@ import { getCachedRateLimitEvents } from "./rate-limit-cache";
 import { activeAppMonitorRecords, AppToolContext, publishWorkReviewCard, rebindAppMonitorsForSession, restoreAppMonitors } from "./app-tool-handlers";
 import type { DurableMonitorRecord } from "./durable-monitor-store";
 import { applyInitialSessionSettings } from "./initial-session-settings";
+import { TurnAbortTracker } from "./turn-abort-tracker";
 import { SessionEventDelivery } from "./session-event-delivery";
 import { routeMonitorOutputToSession } from "./monitor-output-route";
 import { SERVER_RELEASE_VERSION } from "./server-build-info";
@@ -123,6 +124,7 @@ import {
   finishSessionRun,
   getSessionRunStats,
   hasOutstandingDelegatedRuns,
+  inferStaleRunCompletion,
   SESSION_RUN_BACKFILL_VERSION,
   setSessionRunSupervisorSettled,
 } from "./session-run-store";
@@ -1081,7 +1083,7 @@ function persistedPromptSubmission(sessionId: string, messageId: string): boolea
 const liveSessionInstances = new SessionInstanceRegistry<Session>();
 const sessionAutomationLocks = new SessionAutomationLockStore();
 const hardAbortCoordinator = new HardAbortCoordinator();
-const hardAbortedSessions = new WeakSet<Session>();
+const turnAbortTracker = new TurnAbortTracker<Session>();
 
 type BackendOperationKind = "repair" | "auth";
 type ActiveBackendInstall = {
@@ -1291,11 +1293,31 @@ function persistPendingLogicalRun(session: Session, fallbackSessionId?: string):
   return sessionId;
 }
 
-function beginLogicalRun(session: Session, fallbackSessionId?: string): void {
+function beginLogicalRun(
+  session: Session,
+  fallbackSessionId?: string,
+  options: { repairIdleCurrent?: boolean } = {},
+): void {
   const sessionId = session.getSessionId() || fallbackSessionId;
   if (sessionId && getSession(sessionId)) {
     const startedAt = new Date().toISOString();
     backfillSessionRunStats(sessionId, listDelegatedAgents(sessionId));
+    const current = getSessionRunStats(sessionId)?.current;
+    if (
+      current
+      && options.repairIdleCurrent
+      && !delegatedWorkOutstanding(sessionId, current.startedAt)
+    ) {
+      const repaired = inferStaleRunCompletion(
+        getHistory(sessionId),
+        current.startedAt,
+      );
+      finishLogicalRunNow(
+        sessionId,
+        current.pendingOutcome || repaired.outcome,
+        { finishedAt: repaired.finishedAt, suppressNotification: true },
+      );
+    }
     if (!getSessionRunStats(sessionId)?.current) beginSessionRun(sessionId, startedAt);
     else setSessionRunSupervisorSettled(sessionId, false);
     logicalRunSessionIds.add(sessionId);
@@ -1323,10 +1345,14 @@ function maybeFinalizeLogicalRun(sessionId: string): void {
   finishLogicalRunNow(sessionId, current.pendingOutcome || "completed");
 }
 
-function finishLogicalRunNow(sessionId: string, outcome: SessionRunOutcome): void {
+function finishLogicalRunNow(
+  sessionId: string,
+  outcome: SessionRunOutcome,
+  options: { finishedAt?: string; suppressNotification?: boolean } = {},
+): void {
   const current = getSessionRunStats(sessionId)?.current;
   const runId = current?.runId;
-  const runStats = finishSessionRun(sessionId, outcome);
+  const runStats = finishSessionRun(sessionId, outcome, options.finishedAt);
   logicalRunSessionIds.delete(sessionId);
   if (!runId || !runStats) return;
   const boundary = [...getHistory(sessionId)].reverse().find((entry) =>
@@ -1339,7 +1365,7 @@ function finishLogicalRunNow(sessionId: string, outcome: SessionRunOutcome): voi
     runStats,
     boundary,
   }), sessionId);
-  if (outcome !== "stopped" && current) {
+  if (outcome !== "stopped" && current && !options.suppressNotification) {
     const fallback = outcome === "failed" ? "Prompt failed" : "Prompt complete";
     const info = getSession(sessionId);
     maybeSendPushNotification({
@@ -2688,9 +2714,11 @@ async function launchDelegatedAgentTurn(
 
   let launchFailure: Error | null = null;
   const resumeId = record.childSessionId || undefined;
+  const turnAbortState = turnAbortTracker.begin(child);
   const runPromise = child.runQuery(prompt, resumeId);
   void runPromise
     .then(() => {
+      if (turnAbortTracker.finish(child, turnAbortState)) return;
       const sid = child.getSessionId() || childSessionId;
       finishDelegatedAgentTurn(
         record.delegationId,
@@ -2700,6 +2728,7 @@ async function launchDelegatedAgentTurn(
       );
     })
     .catch((err: any) => {
+      if (turnAbortTracker.finish(child, turnAbortState)) return;
       launchFailure = err instanceof Error ? err : new Error(String(err));
       finishDelegatedAgentTurn(
         record.delegationId,
@@ -2747,7 +2776,7 @@ async function stopDelegatedAgent(record: DelegatedAgentRecord): Promise<Delegat
       () => abortGroupForSession(sessionId, [activeSessions.get(sessionId)]),
       (target) => {
         for (const runner of abortTargets(target as Session)) {
-          hardAbortedSessions.add(runner);
+          turnAbortTracker.markHardAborted(runner);
           liveSessionInstances.remove(runner, sessionId);
           if (activeSessions.get(sessionId) === runner) activeSessions.delete(sessionId);
         }
@@ -4883,10 +4912,11 @@ function createConnectionHandler(
         };
 
         const sessionForRun = activeSession;
-        // This handler is reached only for an idle harness. A stored current
-        // run means the supervisor is between delegated continuations, so the
-        // prompt joins that logical run instead of creating another one.
-        beginLogicalRun(sessionForRun, resumeId);
+        // This handler is reached only for an idle runner. Keep a stored run
+        // open only when delegated work still belongs to it. Otherwise repair
+        // its missing boundary before starting the user's new prompt.
+        beginLogicalRun(sessionForRun, resumeId, { repairIdleCurrent: true });
+        const turnAbortState = turnAbortTracker.begin(sessionForRun);
         const runOptions = sessionForRun instanceof CodexSession
           ? {
               fastMode: promptCodexFastMode ?? sessionForRun.getCodexFastMode(),
@@ -4919,7 +4949,7 @@ function createConnectionHandler(
               console.log(`Session ${sid} completed, removed from active pool`);
             }
           }
-          if (!hardAbortedSessions.delete(sessionForRun)) {
+          if (!turnAbortTracker.finish(sessionForRun, turnAbortState)) {
             settleLogicalRun(sessionForRun, "completed", resumeId);
           }
           broadcastSessionList();
@@ -4934,7 +4964,7 @@ function createConnectionHandler(
           if (sid && activeSessions.get(sid) === sessionForRun && !sessionShouldRemainPooled(sessionForRun)) {
             activeSessions.delete(sid);
           }
-          if (hardAbortedSessions.delete(sessionForRun)) {
+          if (turnAbortTracker.finish(sessionForRun, turnAbortState)) {
             console.log(`[Abort] Suppressed completion handling for hard-stopped session ${sid || "(pending)"}`);
           } else if (sessionForRun instanceof CodexSession && isCodexAuthError(err)) {
             settleLogicalRun(sessionForRun, "failed", resumeId);
@@ -6098,7 +6128,7 @@ function createConnectionHandler(
             (target) => {
               const runners = abortTargets(target as Session);
               for (const runner of runners) {
-                hardAbortedSessions.add(runner);
+                turnAbortTracker.markHardAborted(runner);
                 liveSessionInstances.remove(runner, targetSid);
                 persistPendingLogicalRun(runner, targetSid);
                 if (activeSessions.get(targetSid) === runner) {
@@ -8793,6 +8823,7 @@ const httpServer = http.createServer((req, res) => {
           }
         }
         const continueRunPromise = session.runQuery(prompt, sessionId);
+        const turnAbortState = turnAbortTracker.begin(session);
         sendSessionStartedPush(session);
         continueRunPromise.then(() => {
           if (delegatedContinuation) {
@@ -8807,7 +8838,7 @@ const httpServer = http.createServer((req, res) => {
           if (activeSessions.get(sid) === session && !sessionShouldRemainPooled(session)) {
             activeSessions.delete(sid);
           }
-          if (!hardAbortedSessions.delete(session)) {
+          if (!turnAbortTracker.finish(session, turnAbortState)) {
             settleLogicalRun(session, "completed", sessionId);
           }
           broadcastSessionList();
@@ -8823,7 +8854,7 @@ const httpServer = http.createServer((req, res) => {
             );
           }
           if (!sessionShouldRemainPooled(session)) activeSessions.delete(sessionId);
-          if (!hardAbortedSessions.delete(session)) {
+          if (!turnAbortTracker.finish(session, turnAbortState)) {
             settleLogicalRun(session, "failed", sessionId);
           }
         });

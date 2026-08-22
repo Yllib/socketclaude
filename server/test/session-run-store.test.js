@@ -8,7 +8,21 @@ const path = require("node:path");
 
 const {
   hasOutstandingDelegatedRuns,
+  inferStaleRunCompletion,
 } = require("../dist/session-run-store");
+
+test("stale runs close at their last transcript activity", () => {
+  const completion = inferStaleRunCompletion([
+    { role: "user", timestamp: "2026-08-21T17:39:20.000Z" },
+    { role: "assistant", timestamp: "2026-08-21T17:40:45.000Z" },
+    { role: "notification", timestamp: "2026-08-21T17:40:46.000Z" },
+  ], "2026-08-21T17:39:20.000Z");
+
+  assert.deepEqual(completion, {
+    finishedAt: "2026-08-21T17:40:46.000Z",
+    outcome: "completed",
+  });
+});
 
 test("logical runs persist exact aggregate durations and transcript boundaries", () => {
   const sessionId = `test-session-runs-${randomUUID()}`;
