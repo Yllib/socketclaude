@@ -1530,6 +1530,10 @@ export interface SessionInfo {
   turnCount?: number;
   /** Number of SocketAgent history entries when known. */
   historyCount?: number;
+  /** Native thread ids previously used by this visible SocketAgent session. */
+  replacedSessionIds?: string[];
+  /** Compactions in the current native thread since its last manual rollover. */
+  compactionsSinceRollover?: number;
   running?: boolean;
   /** Server-owned ISO timestamp for the current active turn/compaction. */
   activeStartedAt?: string;

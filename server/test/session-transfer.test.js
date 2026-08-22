@@ -192,6 +192,7 @@ test("cross-harness clone keeps history and remaps it to the first native thread
     remapSession(placeholderId, nativeId);
     assert.equal(getSession(placeholderId), undefined);
     assert.match(getSession(nativeId).pendingHandoffContext, /Recent transcript/);
+    assert.deepEqual(getSession(nativeId).replacedSessionIds, [placeholderId]);
     assert.deepEqual(
       getHistory(nativeId).map((entry) => [entry.role, entry.content]),
       sampleHistory().map((entry) => [entry.role, entry.content]),

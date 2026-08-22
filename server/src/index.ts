@@ -112,6 +112,7 @@ import { findUntrackedDelegatedRestartContinuation } from "./delegated-agent-res
 import {
   buildSessionMemoryContinuityContext,
   deleteSessionMemoryEntry,
+  getSessionMemoryListSummary,
   getSessionMemoryState,
   requestSessionMemoryRollover,
   shouldRolloverSessionMemory,
@@ -1471,6 +1472,15 @@ async function getEnrichedSessions(): Promise<SessionInfo[]> {
   return [...byId.values()]
     .filter(s => !taskSessionIds.has(s.id))
     .map(s => {
+      const memory = s.backend === "codex"
+        ? getSessionMemoryListSummary(s.id)
+        : undefined;
+      const replacedSessionIds = memory
+        ? [...new Set([
+          ...(s.replacedSessionIds || []),
+          ...memory.replacedSessionIds,
+        ])]
+        : s.replacedSessionIds;
       const active = activeSessions.get(s.id);
       const logicalRun = s.runStats?.current;
       // A persisted logical run alone is not proof of live work: a server
@@ -1484,13 +1494,20 @@ async function getEnrichedSessions(): Promise<SessionInfo[]> {
           || (active ? getSessionActiveStartedAt(active) : undefined);
         return {
           ...s,
+          ...(replacedSessionIds?.length ? { replacedSessionIds } : {}),
+          ...(memory ? { compactionsSinceRollover: memory.compactionsSinceRollover } : {}),
           running: true,
           ...(activeStartedAt ? { activeStartedAt } : {}),
           messagePreview: active?.lastPreview || s.messagePreview,
           lastActive: new Date().toISOString(),
         };
       }
-      return { ...s, running: false };
+      return {
+        ...s,
+        ...(replacedSessionIds?.length ? { replacedSessionIds } : {}),
+        ...(memory ? { compactionsSinceRollover: memory.compactionsSinceRollover } : {}),
+        running: false,
+      };
     });
 }
 
@@ -7583,6 +7600,11 @@ function createConnectionHandler(
         const sessionId = String((msg as any).sessionId || activeSessionId || "").trim();
         const requestId = (msg as any).requestId;
         try {
+          const session = getSession(sessionId);
+          if (!session) throw new Error("Session was not found");
+          if (session.backend !== "codex") {
+            throw new Error("Fresh-thread handoff is available for Codex sessions only");
+          }
           const state = requestSessionMemoryRollover(sessionId);
           sendJson({ type: "session_memory_state", sessionId, requestId, state });
         } catch (error: any) {

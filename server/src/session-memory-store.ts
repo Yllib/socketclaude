@@ -61,14 +61,20 @@ export interface SessionMemoryState {
   awaitingPostCompactionMeasurement: boolean;
   rolloverPending: boolean;
   rolloverReason?: string;
+  rolloverTrigger?: "manual";
   historicalCompactionsSeeded: boolean;
   updatedAt: string;
 }
 
+export interface SessionMemoryListSummary {
+  compactionsSinceRollover: number;
+  replacedSessionIds: string[];
+}
+
 const MEMORY_DIR = path.join(socketAgentDataPath(), "session-memory");
 const DEFAULT_SETTINGS: SessionMemorySettings = {
-  autoRollover: true,
-  maxCompactions: 3,
+  autoRollover: false,
+  maxCompactions: 10,
   maxPostCompactionTokens: 90_000,
   recentRuns: 3,
 };
@@ -102,7 +108,6 @@ function cloneState(state: SessionMemoryState): SessionMemoryState {
 function defaultState(sessionId: string): SessionMemoryState {
   const createdAt = now();
   const historicalCompactions = getSessionCompactionCount(sessionId);
-  const rolloverPending = historicalCompactions >= DEFAULT_SETTINGS.maxCompactions;
   return {
     version: 1,
     sessionId,
@@ -118,10 +123,7 @@ function defaultState(sessionId: string): SessionMemoryState {
     contextWindow: 0,
     compactionsSinceRollover: historicalCompactions,
     awaitingPostCompactionMeasurement: false,
-    rolloverPending,
-    ...(rolloverPending
-      ? { rolloverReason: `${historicalCompactions} existing compactions exceed the configured limit` }
-      : {}),
+    rolloverPending: false,
     historicalCompactionsSeeded: true,
     updatedAt: createdAt,
   };
@@ -145,8 +147,20 @@ function normalizeState(sessionId: string, value: Partial<SessionMemoryState>): 
     settings: {
       ...DEFAULT_SETTINGS,
       ...(value.settings || {}),
+      // Native thread rollover is deliberately user-triggered. Keep the old
+      // setting in the wire shape so older apps remain compatible, but never
+      // let a persisted automatic preference re-enable it.
+      autoRollover: false,
     },
     epochs,
+    rolloverPending:
+      value.rolloverPending === true && value.rolloverTrigger === "manual",
+    ...(value.rolloverPending === true && value.rolloverTrigger === "manual"
+      ? {
+        rolloverTrigger: "manual" as const,
+        ...(value.rolloverReason ? { rolloverReason: value.rolloverReason } : {}),
+      }
+      : { rolloverReason: undefined, rolloverTrigger: undefined }),
   };
   if (value.historicalCompactionsSeeded !== true && state.epochs.length === 1) {
     const historicalCompactions = getSessionCompactionCount(sessionId);
@@ -155,13 +169,6 @@ function normalizeState(sessionId: string, value: Partial<SessionMemoryState>): 
       historicalCompactions,
     );
     state.epochs[0].compactions = state.compactionsSinceRollover;
-    if (
-      state.settings.autoRollover
-      && state.compactionsSinceRollover >= state.settings.maxCompactions
-    ) {
-      state.rolloverPending = true;
-      state.rolloverReason = `${state.compactionsSinceRollover} existing compactions exceed the configured limit`;
-    }
   }
   state.historicalCompactionsSeeded = true;
   return state;
@@ -219,6 +226,32 @@ function mutateState(
 
 export function getSessionMemoryState(sessionId: string): SessionMemoryState {
   return cloneState(readState(sessionId));
+}
+
+/** Read only the fields needed by the session list without opening history. */
+export function getSessionMemoryListSummary(
+  sessionId: string,
+): SessionMemoryListSummary {
+  const cached = cache.get(sessionId);
+  let value: Partial<SessionMemoryState> | undefined = cached;
+  if (!value) {
+    try {
+      value = JSON.parse(fs.readFileSync(memoryPath(sessionId), "utf8"));
+    } catch {
+      return { compactionsSinceRollover: 0, replacedSessionIds: [] };
+    }
+  }
+  if (!value) return { compactionsSinceRollover: 0, replacedSessionIds: [] };
+
+  const compactions = Number(value.compactionsSinceRollover);
+  const epochs = Array.isArray(value.epochs) ? value.epochs : [];
+  return {
+    compactionsSinceRollover:
+      Number.isFinite(compactions) && compactions > 0 ? Math.floor(compactions) : 0,
+    replacedSessionIds: [...new Set(epochs
+      .map((epoch) => epoch?.nativeSessionId)
+      .filter((id): id is string => typeof id === "string" && id.length > 0 && id !== sessionId))],
+  };
 }
 
 export function upsertSessionMemoryEntry(
@@ -280,7 +313,7 @@ export function updateSessionMemorySettings(
 ): SessionMemoryState {
   return mutateState(sessionId, (state) => {
     state.settings = {
-      autoRollover: patch.autoRollover ?? state.settings.autoRollover,
+      autoRollover: false,
       maxCompactions: Math.max(1, Math.min(20,
         Math.floor(patch.maxCompactions ?? state.settings.maxCompactions))),
       maxPostCompactionTokens: Math.max(20_000, Math.min(500_000,
@@ -299,13 +332,6 @@ export function recordSessionMemoryCompaction(sessionId: string, preTokens: numb
     state.awaitingPostCompactionMeasurement = true;
     const epoch = state.epochs.at(-1);
     if (epoch) epoch.compactions = state.compactionsSinceRollover;
-    if (
-      state.settings.autoRollover
-      && state.compactionsSinceRollover >= state.settings.maxCompactions
-    ) {
-      state.rolloverPending = true;
-      state.rolloverReason = `${state.compactionsSinceRollover} compactions reached the configured limit`;
-    }
   });
 }
 
@@ -324,13 +350,6 @@ export function recordSessionMemoryContextUsage(
     if (!state.awaitingPostCompactionMeasurement) return;
     state.awaitingPostCompactionMeasurement = false;
     state.lastPostCompactionTokens = state.currentTokens;
-    if (
-      state.settings.autoRollover
-      && state.currentTokens >= state.settings.maxPostCompactionTokens
-    ) {
-      state.rolloverPending = true;
-      state.rolloverReason = `post-compaction context remained at ${state.currentTokens.toLocaleString()} tokens`;
-    }
   });
 }
 
@@ -341,11 +360,13 @@ export function requestSessionMemoryRollover(
   return mutateState(sessionId, (state) => {
     state.rolloverPending = true;
     state.rolloverReason = reason;
+    state.rolloverTrigger = "manual";
   }, true);
 }
 
 export function shouldRolloverSessionMemory(sessionId: string): boolean {
-  return readState(sessionId).rolloverPending;
+  const state = readState(sessionId);
+  return state.rolloverPending && state.rolloverTrigger === "manual";
 }
 
 function clipped(value: unknown, limit: number): string {
@@ -398,7 +419,7 @@ export function buildSessionMemoryContinuityContext(sessionId: string, cwd: stri
   const runs = recentRunContext(sessionId, state.settings.recentRuns);
   const epoch = state.epochs.at(-1);
   return [
-    "This is an automatic SocketAgent context rollover inside the same visible session.",
+    "This is a user-requested SocketAgent context rollover inside the same visible session.",
     "Treat the current user message as a continuation, not a new project.",
     `Project directory: ${cwd}`,
     `Previous native thread: ${sessionId}`,
@@ -440,6 +461,7 @@ export function remapSessionMemory(
   oldState.awaitingPostCompactionMeasurement = false;
   oldState.rolloverPending = false;
   delete oldState.rolloverReason;
+  delete oldState.rolloverTrigger;
   oldState.historicalCompactionsSeeded = true;
   oldState.updatedAt = timestamp;
 

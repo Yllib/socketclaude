@@ -2749,6 +2749,7 @@ export class CodexSession {
         permissionMode: this.permissionMode || undefined,
         agentSettings: this.getAgentSettings(),
       };
+      let visibleTitle = title;
       if (replacesSessionId) {
         remapSession(replacesSessionId, this.sessionId);
         remapSessionMemory(replacesSessionId, this.sessionId);
@@ -2756,7 +2757,7 @@ export class CodexSession {
           console.warn(`[SessionMemory] Could not archive prior Codex thread ${replacesSessionId}: ${String(error)}`);
         });
         const remapped = getSession(this.sessionId);
-        saveSession({
+        const replacementInfo: SessionInfo = {
           ...info,
           ...remapped,
           id: this.sessionId,
@@ -2765,7 +2766,9 @@ export class CodexSession {
           messagePreview: "",
           permissionMode: this.permissionMode || undefined,
           agentSettings: this.getAgentSettings(),
-        });
+        };
+        saveSession(replacementInfo);
+        visibleTitle = replacementInfo.title;
         this.replacesSessionId = undefined;
         this._preparedRolloverSessionId = null;
       } else {
@@ -2780,7 +2783,7 @@ export class CodexSession {
           sessionId: this.sessionId,
           ...(replacesSessionId ? { replacesSessionId } : {}),
           cwd: this.cwd,
-          title,
+          title: visibleTitle,
           backend: "codex",
           permissionMode: this.permissionMode,
         } as ServerMessage);

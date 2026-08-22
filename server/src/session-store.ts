@@ -398,6 +398,9 @@ export function remapSession(oldId: string, newId: string): void {
     }
 
     session.id = newId;
+    session.replacedSessionIds = [
+      ...new Set([...(session.replacedSessionIds || []), oldId]),
+    ];
     delete (session as any).contextClearedAt;
     session.lastActive = new Date().toISOString();
     writeStore(sessions);
