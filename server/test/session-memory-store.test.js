@@ -135,11 +135,19 @@ test("reads session-list lineage without initializing transcript history", () =>
   assert.deepEqual(getSessionMemoryListSummary(sessionId), {
     compactionsSinceRollover: 11,
     replacedSessionIds: ["list-summary-old"],
+    freshThreadPending: false,
   });
   assert.deepEqual(getSessionMemoryListSummary("missing-summary"), {
     compactionsSinceRollover: 0,
     replacedSessionIds: [],
+    freshThreadPending: false,
   });
+});
+
+test("session-list summary exposes a manually queued fresh thread", () => {
+  const sessionId = "list-summary-pending";
+  requestSessionMemoryRollover(sessionId);
+  assert.equal(getSessionMemoryListSummary(sessionId).freshThreadPending, true);
 });
 
 test("SessionMemory tool validates and edits the durable set", async () => {

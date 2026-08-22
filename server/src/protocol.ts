@@ -1534,6 +1534,8 @@ export interface SessionInfo {
   replacedSessionIds?: string[];
   /** Compactions in the current native thread since its last manual rollover. */
   compactionsSinceRollover?: number;
+  /** A user requested a fresh native thread for this visible session. */
+  freshThreadPending?: boolean;
   running?: boolean;
   /** Server-owned ISO timestamp for the current active turn/compaction. */
   activeStartedAt?: string;

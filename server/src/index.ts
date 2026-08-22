@@ -1496,6 +1496,7 @@ async function getEnrichedSessions(): Promise<SessionInfo[]> {
           ...s,
           ...(replacedSessionIds?.length ? { replacedSessionIds } : {}),
           ...(memory ? { compactionsSinceRollover: memory.compactionsSinceRollover } : {}),
+          ...(memory ? { freshThreadPending: memory.freshThreadPending } : {}),
           running: true,
           ...(activeStartedAt ? { activeStartedAt } : {}),
           messagePreview: active?.lastPreview || s.messagePreview,
@@ -1506,6 +1507,7 @@ async function getEnrichedSessions(): Promise<SessionInfo[]> {
         ...s,
         ...(replacedSessionIds?.length ? { replacedSessionIds } : {}),
         ...(memory ? { compactionsSinceRollover: memory.compactionsSinceRollover } : {}),
+        ...(memory ? { freshThreadPending: memory.freshThreadPending } : {}),
         running: false,
       };
     });
@@ -7607,6 +7609,7 @@ function createConnectionHandler(
           }
           const state = requestSessionMemoryRollover(sessionId);
           sendJson({ type: "session_memory_state", sessionId, requestId, state });
+          broadcastSessionList(0, "fresh-thread-requested");
         } catch (error: any) {
           sendJson({ type: "session_memory_error", sessionId, requestId, message: error.message || String(error) });
         }

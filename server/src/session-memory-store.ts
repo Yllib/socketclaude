@@ -69,6 +69,7 @@ export interface SessionMemoryState {
 export interface SessionMemoryListSummary {
   compactionsSinceRollover: number;
   replacedSessionIds: string[];
+  freshThreadPending: boolean;
 }
 
 const MEMORY_DIR = path.join(socketAgentDataPath(), "session-memory");
@@ -238,10 +239,20 @@ export function getSessionMemoryListSummary(
     try {
       value = JSON.parse(fs.readFileSync(memoryPath(sessionId), "utf8"));
     } catch {
-      return { compactionsSinceRollover: 0, replacedSessionIds: [] };
+      return {
+        compactionsSinceRollover: 0,
+        replacedSessionIds: [],
+        freshThreadPending: false,
+      };
     }
   }
-  if (!value) return { compactionsSinceRollover: 0, replacedSessionIds: [] };
+  if (!value) {
+    return {
+      compactionsSinceRollover: 0,
+      replacedSessionIds: [],
+      freshThreadPending: false,
+    };
+  }
 
   const compactions = Number(value.compactionsSinceRollover);
   const epochs = Array.isArray(value.epochs) ? value.epochs : [];
@@ -251,6 +262,8 @@ export function getSessionMemoryListSummary(
     replacedSessionIds: [...new Set(epochs
       .map((epoch) => epoch?.nativeSessionId)
       .filter((id): id is string => typeof id === "string" && id.length > 0 && id !== sessionId))],
+    freshThreadPending:
+      value.rolloverPending === true && value.rolloverTrigger === "manual",
   };
 }
 
