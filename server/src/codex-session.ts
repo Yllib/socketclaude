@@ -2769,6 +2769,9 @@ export class CodexSession {
         };
         saveSession(replacementInfo);
         visibleTitle = replacementInfo.title;
+        void this.appServer?.setThreadName(this.sessionId, visibleTitle).catch((error: unknown) => {
+          console.warn(`[SessionMemory] Could not copy title to new Codex thread ${this.sessionId}: ${String(error)}`);
+        });
         this.replacesSessionId = undefined;
         this._preparedRolloverSessionId = null;
       } else {

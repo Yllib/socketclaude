@@ -3271,17 +3271,20 @@ function codexThreadPayloadIsArchived(thread: any): boolean {
   return false;
 }
 
-function codexThreadToSessionInfo(thread: any, stored?: SessionInfo): SessionInfo | null {
+export function codexThreadToSessionInfo(thread: any, stored?: SessionInfo): SessionInfo | null {
   const id = String(thread?.id || thread?.threadId || "").trim();
   const cwd = String(thread?.cwd || stored?.cwd || "").trim();
   if (!id || !cwd) return null;
   const createdAt = unixSecondsToIso(thread?.createdAt, stored?.createdAt || nowIso());
   const lastActive = unixSecondsToIso(thread?.updatedAt, stored?.lastActive || createdAt);
   const preview = codexThreadPreview(thread);
+  const storedTitle = stored?.title?.trim();
   return {
     ...(stored || {}),
     id,
-    title: codexThreadTitle(thread),
+    title: storedTitle && storedTitle !== "Untitled"
+      ? storedTitle
+      : codexThreadTitle(thread),
     cwd,
     createdAt,
     lastActive,
@@ -3566,9 +3569,13 @@ export async function listSessionsWithNativeCodex(useCache = true): Promise<Sess
   for (const session of stored) {
     const nativeSession = nativeById.get(session.id);
     if (nativeSession) {
+      const storedTitle = session.title?.trim();
       merged.push({
         ...session,
         ...nativeSession,
+        title: storedTitle && storedTitle !== "Untitled"
+          ? storedTitle
+          : nativeSession.title,
         messagePreview: session.messagePreview || nativeSession.messagePreview,
         turnCount: normalizedTurnCount(session.turnCount ?? nativeSession.turnCount) ?? 0,
         historyCount: normalizedTurnCount((session as any).historyCount ?? (nativeSession as any).historyCount),
