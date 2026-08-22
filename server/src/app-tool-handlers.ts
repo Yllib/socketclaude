@@ -131,6 +131,7 @@ export interface ScheduleTaskArgs {
   scheduledTime: string;
   recurrenceType?: "once" | "daily" | "weekly" | "monthly" | "custom";
   customIntervalMs?: number;
+  /** Carry summaries from the two most recent runs into a fresh session. */
   reuseSession?: boolean;
   notificationMode?: "completion" | "quiet";
 }

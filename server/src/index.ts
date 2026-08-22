@@ -27,7 +27,7 @@ import { WebSocketServer, WebSocket } from "ws";
 import { ClaudeSession, refreshClaudeExecutableInfo } from "./claude-session";
 import { CODEX_NATIVE_SLASH_COMMANDS, CodexSession, archiveCodexAppServerThread, clearCodexAppServerGoal, compactCodexAppServerThread, createSession, getCodexAppServerGoal, rollbackCodexAppServerThread, Session, setCodexAppServerGoal, detectAvailableBackends, getCodexAvailability, invalidateCodexAvailabilityCache, isCodexAuthError, unarchiveCodexAppServerThread } from "./codex-session";
 import { listSessions as listStoredSessions, listSessionsWithNativeBackends, getSession, saveSession, getHistory, getHistoryCount, getHistoryPage, getHistoryPageToLastPrompt, getResumeHistoryPage, deleteSession, deleteSessionArtifacts, clearSessionContext, cleanupPendingToolCalls, compactHistoryStorage, getTodos, getTaskStates, backfillClaudeTasksFromHistory, settleStaleRuntimeTaskStates, getMissedMessages, appendHistory, appendHistoryBulk, appendNativeHistorySuffix, updateSessionActivity, updateSessionAgentSettings, getSdkEvents, getSdkEventCount, markQuestionAnswered, getPersistedSecureInputRequest, markSecureInputRequestResolved, getLastHistoryTimestamp, listSdkSessions, listCodexSessions, listCodexNativeSdkSessions, readCodexRolloutHistory, readCodexRolloutAgentSettings, readCodexAppServerThreadHistory, getRecentCwds, addRecentCwd, removeRecentCwd, truncateHistoryAtMessage, getLastPromptSuggestion, listArchivesWithNativeCodex, getArchiveHistory, restoreArchive, restoreCodexNativeArchive, deleteArchive, isCodexThreadArchived, isCodexNativeArchiveTs, getCodexNativeThreadSessionInfo, getClaudeNativeSessionInfo, markSessionArchived, renameCodexNativeThread, invalidateCodexNativeListCache, findCodexRolloutFile, getJsonlPath, removeHtmlPlanHistoryEntries, updateHtmlPlanHistoryEntry, repairStoredTranscriptIdentitiesOnce } from "./session-store";
-import { listScheduledTasks, getScheduledTask, saveScheduledTask, deleteScheduledTask, getDueTasks, getNextRunTime, getScheduledTaskSessionIds, getScheduledTaskRevision, reconcileInterruptedScheduledTasks, scheduledTaskCanArchive, scheduledTaskDisplayName, scheduledTaskUsesAutomaticNotifications, setScheduledTaskArchiveState, setScheduledTaskReadState, ScheduledTask } from "./scheduled-task-store";
+import { listScheduledTasks, getScheduledTask, saveScheduledTask, deleteScheduledTask, getDueTasks, getNextRunTime, getScheduledTaskSessionIds, getScheduledTaskRevision, reconcileInterruptedScheduledTasks, scheduledTaskCanArchive, scheduledTaskDisplayName, scheduledTaskPriorRunContext, scheduledTaskUsesAutomaticNotifications, setScheduledTaskArchiveState, setScheduledTaskReadState, ScheduledTask } from "./scheduled-task-store";
 import {
   AgentEffort,
   AgentSessionSettings,
@@ -9438,17 +9438,21 @@ scheduleStatusSync();
 const SCHEDULER_INTERVAL = 30000; // 30s
 
 function scheduledTaskPrompt(task: ScheduledTask): string {
-  if (scheduledTaskUsesAutomaticNotifications(task)) return task.prompt;
-  return [
-    "<socketagent_scheduled_task>",
-    "This scheduled task is running in quiet mode.",
-    "The user will not automatically be notified on their device when you send a message or complete the task.",
-    "If the user should be alerted because something is wrong, important, or requires attention, call NotifyUser with a concise title and body.",
-    "Otherwise, follow the users instructions as you normally would, they can see the full session if they open it or click the notification.",
-    "</socketagent_scheduled_task>",
-    "",
-    task.prompt,
-  ].join("\n");
+  const sections: string[] = [];
+  if (!scheduledTaskUsesAutomaticNotifications(task)) {
+    sections.push([
+      "<socketagent_scheduled_task>",
+      "This scheduled task is running in quiet mode.",
+      "The user will not automatically be notified on their device when you send a message or complete the task.",
+      "If the user should be alerted because something is wrong, important, or requires attention, call NotifyUser with a concise title and body.",
+      "Otherwise, follow the users instructions as you normally would, they can see the full session if they open it or click the notification.",
+      "</socketagent_scheduled_task>",
+    ].join("\n"));
+  }
+  const priorRunContext = scheduledTaskPriorRunContext(task);
+  if (priorRunContext) sections.push(priorRunContext);
+  sections.push(task.prompt);
+  return sections.join("\n\n");
 }
 
 function applyLatestScheduledTaskEditableFields(task: ScheduledTask): void {
@@ -9521,13 +9525,12 @@ async function executeScheduledTask(task: ScheduledTask, trigger: "scheduled" | 
       return;
     }
 
-    const shouldResume = task.reuseSession && task.sessionId;
-    if (shouldResume && task.sessionId) {
-      assertSessionAutomationAllowed(task.sessionId, "scheduled task continuation");
-    }
-    const reusableSessionInfo = shouldResume && task.sessionId ? getSession(task.sessionId) : undefined;
+    const carriesPriorRunContext = Boolean(task.reuseSession);
+    const previousSessionInfo = carriesPriorRunContext && task.sessionId
+      ? getSession(task.sessionId)
+      : undefined;
     const backend = task.backend
-      || reusableSessionInfo?.backend
+      || previousSessionInfo?.backend
       || "claude";
     task.backend = backend;
     const codexDriver: CodexDriver | undefined = backend === "codex" ? "app-server" : undefined;
@@ -9553,9 +9556,8 @@ async function executeScheduledTask(task: ScheduledTask, trigger: "scheduled" | 
       !scheduledTaskUsesAutomaticNotifications(task);
     (session as any)._scheduledTaskId = task.id;
     (session as any)._scheduledTaskName = scheduledTaskDisplayName(task);
-    await restorePersistedPermissionMode(session, reusableSessionInfo || undefined);
-    if (shouldResume) (session as any)._resumeSessionId = task.sessionId;
-    await restorePersistedAgentSettings(session, reusableSessionInfo || undefined);
+    await restorePersistedPermissionMode(session, previousSessionInfo || undefined);
+    await restorePersistedAgentSettings(session, previousSessionInfo || undefined);
     if (task.permissionMode) {
       const permissionMode = backend === "claude" && task.permissionMode === "superYolo"
         ? "bypassPermissions"
@@ -9571,8 +9573,8 @@ async function executeScheduledTask(task: ScheduledTask, trigger: "scheduled" | 
     }
     attachSessionLifecycleCallbacks(session);
 
-    if (shouldResume) {
-      console.log(`[Scheduler] Reusing ${backend} session ${task.sessionId}`);
+    if (carriesPriorRunContext) {
+      console.log(`[Scheduler] Starting fresh ${backend} session with bounded prior-run context`);
     }
 
     const tempId = `scheduled-${task.id}`;
@@ -9604,9 +9606,7 @@ async function executeScheduledTask(task: ScheduledTask, trigger: "scheduled" | 
     }, 500);
     setTimeout(() => clearInterval(registerInterval), 30000);
 
-    const resumeId = shouldResume ? task.sessionId : undefined;
-
-    session.runQuery(scheduledTaskPrompt(task), resumeId).then(() => {
+    session.runQuery(scheduledTaskPrompt(task)).then(() => {
       clearInterval(registerInterval);
       const realSessionId = session.getSessionId();
       const sid = realSessionId || tempId;

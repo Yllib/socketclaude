@@ -3042,7 +3042,7 @@ export class ClaudeSession {
               scheduledTime: z.string().describe("When to run the task, in ISO 8601 format (e.g. 2026-03-13T09:00:00)"),
               recurrenceType: z.enum(["once", "daily", "weekly", "monthly", "custom"]).optional().describe("How often to repeat. Default: once (no recurrence)"),
               customIntervalMs: z.number().optional().describe("Custom interval in milliseconds (only used when recurrenceType is 'custom')"),
-              reuseSession: z.boolean().optional().describe("If true and recurring, reuse the same session for all occurrences instead of creating new ones"),
+              reuseSession: z.boolean().optional().describe("If true and recurring, start each occurrence in a fresh session with summaries from the two most recent runs"),
               notificationMode: z.enum(["completion", "quiet"]).optional().describe("completion sends the normal completion notification. quiet sends no automatic notifications; the scheduled agent must call NotifyUser if the user should be alerted."),
             },
             async (args) => {

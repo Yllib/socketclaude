@@ -7,6 +7,7 @@ const test = require("node:test");
 const {
   reconcileInterruptedScheduledTask,
   scheduledTaskDisplayName,
+  scheduledTaskPriorRunContext,
   scheduledTaskRevisionForPath,
   scheduledTaskUsesAutomaticNotifications,
   scheduledTaskCanArchive,
@@ -63,6 +64,80 @@ test("quiet scheduled tasks disable every automatic notification path", () => {
     scheduledTaskUsesAutomaticNotifications({}),
     true,
   );
+});
+
+test("recurring task continuity includes only the two most recent finished runs", () => {
+  const context = scheduledTaskPriorRunContext(scheduledTask({
+    reuseSession: true,
+    runs: [
+      {
+        sessionId: "session-old",
+        startedAt: "2026-07-29T01:00:00.000Z",
+        completedAt: "2026-07-29T01:05:00.000Z",
+        status: "completed",
+        resultSummary: "Old result that should be dropped",
+      },
+      {
+        sessionId: "session-recent",
+        startedAt: "2026-07-30T01:00:00.000Z",
+        completedAt: "2026-07-30T01:05:00.000Z",
+        status: "completed",
+        resultSummary: "Restarted the unhealthy service",
+      },
+      {
+        sessionId: "session-failed",
+        startedAt: "2026-07-31T01:00:00.000Z",
+        completedAt: "2026-07-31T01:01:00.000Z",
+        status: "failed",
+        error: "Health endpoint timed out",
+      },
+      {
+        sessionId: "session-current",
+        startedAt: "2026-08-01T01:00:00.000Z",
+        status: "running",
+      },
+    ],
+  }));
+
+  assert.ok(context);
+  assert.doesNotMatch(context, /Old result that should be dropped/);
+  assert.match(context, /Restarted the unhealthy service/);
+  assert.match(context, /Health endpoint timed out/);
+  assert.doesNotMatch(context, /session-current/);
+});
+
+test("recurring task continuity is disabled when reuseSession is false", () => {
+  const context = scheduledTaskPriorRunContext(scheduledTask({
+    reuseSession: false,
+    runs: [{
+      sessionId: "session-1",
+      startedAt: "2026-07-31T01:00:00.000Z",
+      completedAt: "2026-07-31T01:05:00.000Z",
+      status: "completed",
+      resultSummary: "This must not be carried forward",
+    }],
+  }));
+
+  assert.equal(context, undefined);
+});
+
+test("recurring task continuity bounds unusually large run summaries", () => {
+  const context = scheduledTaskPriorRunContext(scheduledTask({
+    reuseSession: true,
+    runs: [{
+      sessionId: "session-1",
+      startedAt: "2026-07-31T01:00:00.000Z",
+      completedAt: "2026-07-31T01:05:00.000Z",
+      status: "completed",
+      resultSummary: `start-${"x".repeat(12_000)}-end`,
+    }],
+  }));
+
+  assert.ok(context);
+  assert.match(context, /start-/);
+  assert.match(context, /prior run summary truncated/);
+  assert.match(context, /-end/);
+  assert.ok(context.length < 9_000);
 });
 
 test("scheduled task result read state is durable and reversible", () => {

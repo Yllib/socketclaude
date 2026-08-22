@@ -950,6 +950,7 @@ export interface ScheduleTaskMessage {
     type: "once" | "daily" | "weekly" | "monthly" | "custom";
     intervalMs?: number;
   };
+  /** Carry summaries from the two most recent runs into a fresh session. */
   reuseSession?: boolean;
   notificationMode?: "completion" | "quiet";
 }
@@ -981,6 +982,7 @@ export interface UpdateScheduledTaskMessage {
   permissionMode?: string;
   scheduledTime?: string;
   recurrence?: { type: "once" | "daily" | "weekly" | "monthly" | "custom"; intervalMs?: number } | null;
+  /** Carry summaries from the two most recent runs into a fresh session. */
   reuseSession?: boolean;
   notificationMode?: "completion" | "quiet";
 }
