@@ -941,7 +941,6 @@ export async function handleSpeakTool(
 
     console.log("[MCP:Speak] Returning result");
     const resultText = "Speaking to user.";
-    appendVisibleToolHistory(ctx, "Speak", { text: args.text }, resultText);
     return { content: [{ type: "text", text: resultText }] };
   } catch (e: any) {
     console.error(`[MCP:Speak] Error: ${e.message}`, e.stack);

@@ -835,11 +835,59 @@ function sendFilePath(entry: HistoryEntry): string {
   return String(entry.toolInput?.file_path || "");
 }
 
-function sendFileTimestampsMatch(first: HistoryEntry, second: HistoryEntry): boolean {
+function visibleToolTimestampsMatch(first: HistoryEntry, second: HistoryEntry): boolean {
   const firstMs = Date.parse(first.timestamp || "");
   const secondMs = Date.parse(second.timestamp || "");
   if (!Number.isFinite(firstMs) || !Number.isFinite(secondMs)) return true;
   return Math.abs(firstMs - secondMs) <= 2_500;
+}
+
+function isSpeakCall(entry: HistoryEntry): boolean {
+  if (entry.role !== "tool_call") return false;
+  const name = String(entry.toolName || "");
+  return name === "Speak" || name.endsWith("__Speak") || name.endsWith("/Speak");
+}
+
+function speakText(entry: HistoryEntry): string {
+  return String(entry.toolInput?.text || "");
+}
+
+/** Remove the old handler-generated Speak pair beside its canonical call. */
+export function normalizeSpeakHistoryEntries(entries: HistoryEntry[]): HistoryEntry[] {
+  const normalized = entries.map(cloneHistoryEntry);
+  const removedIndexes = new Set<number>();
+  const removedToolUseIds = new Set<string>();
+
+  for (let canonicalIndex = 0; canonicalIndex < normalized.length; canonicalIndex++) {
+    const canonical = normalized[canonicalIndex];
+    const canonicalId = String(canonical.toolUseId || "");
+    const text = speakText(canonical);
+    if (!isSpeakCall(canonical)
+      || !canonicalId
+      || canonicalId.startsWith("mcp_Speak_")
+      || !text) continue;
+
+    const start = Math.max(0, canonicalIndex - 4);
+    const end = Math.min(normalized.length - 1, canonicalIndex + 4);
+    for (let syntheticIndex = start; syntheticIndex <= end; syntheticIndex++) {
+      if (syntheticIndex === canonicalIndex) continue;
+      const synthetic = normalized[syntheticIndex];
+      const syntheticId = String(synthetic.toolUseId || "");
+      if (!isSpeakCall(synthetic)
+        || !syntheticId.startsWith("mcp_Speak_")
+        || speakText(synthetic) !== text
+        || !visibleToolTimestampsMatch(canonical, synthetic)) continue;
+
+      removedIndexes.add(syntheticIndex);
+      removedToolUseIds.add(syntheticId);
+    }
+  }
+
+  return normalized.filter((entry, index) =>
+    !removedIndexes.has(index)
+    && !(entry.role === "tool_result"
+      && removedToolUseIds.has(String(entry.toolUseId || ""))),
+  );
 }
 
 /**
@@ -870,7 +918,7 @@ export function normalizeSendFileHistoryEntries(entries: HistoryEntry[]): Histor
       if (!isSendFileCall(synthetic)
         || !syntheticId.startsWith("mcp_SendFile_")
         || sendFilePath(synthetic) !== filePath
-        || !sendFileTimestampsMatch(canonical, synthetic)) continue;
+        || !visibleToolTimestampsMatch(canonical, synthetic)) continue;
 
       canonical.fileId ??= synthetic.fileId;
       canonical.fileName ??= synthetic.fileName;
@@ -1007,7 +1055,9 @@ function parseHistorySnapshot(file: string): HistoryEntry[] {
   return normalizeClaudeResultFallbackHistoryEntries(
     normalizeSocketAgentAppToolEntries(
       normalizeMisclassifiedCodexItemEntries(
-        normalizeSendFileHistoryEntries(parsed as HistoryEntry[]),
+        normalizeSpeakHistoryEntries(
+          normalizeSendFileHistoryEntries(parsed as HistoryEntry[]),
+        ),
       ),
     ),
   );
