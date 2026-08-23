@@ -9,7 +9,8 @@ set -euo pipefail
 #   ./build-app.sh --deploy --bump minor   # Build, bump minor, deploy
 
 REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
-APP_DIR="$REPO_ROOT/app"
+REPO_PARENT="$(cd "$REPO_ROOT/.." && pwd)"
+APP_DIR="${SOCKETAGENT_APP_DIR:-$REPO_PARENT/socketagent-app}"
 PUBSPEC="$APP_DIR/pubspec.yaml"
 VERSION_FILE="$REPO_ROOT/app-version.json"
 SERVER_REPO="Yllib/socketagent"
@@ -76,6 +77,12 @@ git_tag_release() {
 
 if $DEPLOY && [[ ! "$SIGN_RELEASES" =~ ^(0|false|off)$ ]]; then
   [[ -f "$SIGNING_KEY" ]] || { echo "Signing key not found: $SIGNING_KEY"; exit 1; }
+fi
+
+if [[ ! -d "$APP_DIR/.git" || ! -f "$PUBSPEC" ]]; then
+  echo "SocketAgent app repo not found: $APP_DIR" >&2
+  echo "Set SOCKETAGENT_APP_DIR to its absolute path if it is not beside the server repo." >&2
+  exit 1
 fi
 
 # ── Read current version ──

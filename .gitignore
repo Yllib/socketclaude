@@ -10,8 +10,9 @@ server/src/**/*.js.map
 server/src/**/*.d.ts
 server/src/**/*.d.ts.map
 
-# Flutter app (private repo — lives in app/ as a nested git repo)
-app/
+# Local agent instructions
+AGENTS.md
+CLAUDE.md
 
 # Claude Code project settings
 .claude/
