@@ -33,15 +33,15 @@ test("Claude usage snapshots independently surface five-hour and weekly windows"
     rate_limits_available: true,
     rate_limits: {
       five_hour: {
-        utilization: 0.86,
+        utilization: 86,
         resets_at: "2026-07-28T13:00:00.000Z",
       },
       seven_day: {
-        utilization: 0.89,
+        utilization: 89,
         resets_at: "2026-08-02T12:00:00.000Z",
       },
       seven_day_opus: {
-        utilization: 0.97,
+        utilization: 97,
         resets_at: "2026-08-02T12:00:00.000Z",
       },
     },
@@ -67,6 +67,34 @@ test("Claude usage snapshots independently surface five-hour and weekly windows"
         status: "allowed_warning",
         utilizationPercent: 97,
       },
+    ],
+  );
+});
+
+test("Claude usage snapshots treat utilization as percentage points", () => {
+  const events = buildClaudeUsageRateLimitEvents({
+    rate_limits_available: true,
+    rate_limits: {
+      five_hour: {
+        utilization: 9,
+        resets_at: "2026-07-28T13:00:00.000Z",
+      },
+      seven_day: {
+        utilization: 1,
+        resets_at: "2026-08-02T12:00:00.000Z",
+      },
+    },
+  }, "session-1");
+
+  assert.deepEqual(
+    events.map((event) => ({
+      status: event.status,
+      utilization: event.utilization,
+      utilizationPercent: event.utilizationPercent,
+    })),
+    [
+      { status: "allowed", utilization: 0.09, utilizationPercent: 9 },
+      { status: "allowed", utilization: 0.01, utilizationPercent: 1 },
     ],
   );
 });

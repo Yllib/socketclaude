@@ -30,6 +30,7 @@ export function rateLimitWindowForType(
     : "five_hour";
 }
 
+/** Normalize legacy Claude rate-limit events that may report a 0-1 ratio. */
 export function normalizeUtilizationPercent(value: unknown): number | undefined {
   const raw = Number(value);
   if (!Number.isFinite(raw)) return undefined;
@@ -111,7 +112,9 @@ export function buildClaudeUsageRateLimitEvents(
     .map(([type, value]) => ({
       type: String(type),
       value: value as Record<string, unknown>,
-      percent: normalizeUtilizationPercent(
+      // The structured Claude SDK /usage contract reports percentage points.
+      // Unlike legacy rate_limit_event payloads, 1 means 1%, not 100%.
+      percent: normalizeExplicitPercent(
         (value as Record<string, unknown>).utilization,
       ),
     }))
@@ -121,7 +124,7 @@ export function buildClaudeUsageRateLimitEvents(
     ...(weeklyCandidates.length > 0 ? [weeklyCandidates[0]] : []),
   ];
   return selected.map(({ type, value }) => {
-    const utilizationPercent = normalizeUtilizationPercent(value.utilization);
+    const utilizationPercent = normalizeExplicitPercent(value.utilization);
     return {
       type: "rate_limit_event",
       backend: "claude",
