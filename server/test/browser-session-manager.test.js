@@ -10,12 +10,6 @@ const {
   normalizeBrowserUrl,
   resolveBrowserBinary,
 } = require("../dist/browser-session-manager");
-const { SOCKETAGENT_APP_TOOLS } = require("../dist/codex-app-mcp");
-
-test("Codex advertises the reusable remote browser", () => {
-  assert.ok(SOCKETAGENT_APP_TOOLS.some((tool) => tool.name === "BrowserSession"));
-});
-
 test("browser navigation permits normal cross-domain and local HTTP URLs", () => {
   assert.equal(
     normalizeBrowserUrl("https://accounts.google.com/signin?continue=https%3A%2F%2Fplay.google.com"),

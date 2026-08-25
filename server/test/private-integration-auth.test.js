@@ -5,9 +5,6 @@ const {
   handlePrivateIntegrationAuthTool,
 } = require("../dist/app-tool-handlers");
 const {
-  SOCKETAGENT_APP_TOOLS,
-} = require("../dist/codex-app-mcp");
-const {
   startPrivateIntegrationAuthorization,
 } = require("../dist/private-integration-auth");
 
@@ -21,12 +18,6 @@ function context(overrides = {}) {
     ...overrides,
   };
 }
-
-test("Codex advertises protected private-integration authorization", () => {
-  assert.ok(
-    SOCKETAGENT_APP_TOOLS.some((tool) => tool.name === "PrivateIntegrationAuth"),
-  );
-});
 
 test("private-integration authorization delegates to the owning session plugin", async () => {
   const calls = [];

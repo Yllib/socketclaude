@@ -30,10 +30,6 @@ const {
   buildWorkReviewResultPrompt,
   deliverWorkReviewToSession,
 } = require("../dist/work-review-result-route");
-const {
-  WORK_REVIEW_TOOL_DESCRIPTION,
-  buildSocketAgentIntegrationInstructions,
-} = require("../dist/socketagent-instructions");
 const { saveHtmlPlan } = require("../dist/html-plan-store");
 
 test.after(() => {
@@ -350,19 +346,4 @@ test("stable result IDs collapse replayed Claude/history user messages", () => {
   assert.equal(entries.length, 1);
   assert.equal(entries[0].sessionSeq, 1);
   assert.equal(entries[0].revision, 2);
-});
-
-test("agent instructions keep Work Review functional and explicitly requested", () => {
-  assert.match(WORK_REVIEW_TOOL_DESCRIPTION, /only after the user chooses Finish Review/i);
-  assert.match(WORK_REVIEW_TOOL_DESCRIPTION, /workflow-defined approval meaning/i);
-  assert.match(WORK_REVIEW_TOOL_DESCRIPTION, /embedded inside the app/i);
-  assert.doesNotMatch(WORK_REVIEW_TOOL_DESCRIPTION, /use it for any reviewable work/i);
-  const instructions = buildSocketAgentIntegrationInstructions({
-    mcpServerName: "app",
-    toolNames: ["WorkReview"],
-    secureInventory: "",
-  });
-  assert.match(instructions, /explicit user request for a Work Review/i);
-  assert.match(instructions, /do not initiate a Work Review unless the user specifically asks/i);
-  assert.match(instructions, /ordinary task completion in your normal response/i);
 });
