@@ -3,7 +3,7 @@
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
-const { spawnSync } = require("node:child_process");
+const { spawn, spawnSync } = require("node:child_process");
 const {
   Browser,
   BrowserTag,
@@ -76,7 +76,38 @@ function executableWorks(executable) {
   return result.status === 0;
 }
 
-function validateHeadlessLaunch(executable) {
+function runBrowserCheck(executable, args, outputFd, errorFd) {
+  return new Promise((resolve) => {
+    let settled = false;
+    let timedOut = false;
+    const child = spawn(executable, args, {
+      windowsHide: true,
+      stdio: ["ignore", outputFd, errorFd],
+    });
+    const finish = (status, error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      resolve({ status, error, timedOut });
+    };
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      if (process.platform === "win32" && child.pid) {
+        spawnSync("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"], {
+          stdio: "ignore",
+          windowsHide: true,
+        });
+      } else {
+        child.kill("SIGKILL");
+      }
+      setTimeout(() => finish(null, new Error("Browser launch timed out.")), 5_000);
+    }, 30_000);
+    child.once("error", (error) => finish(null, error));
+    child.once("close", (status) => finish(status, undefined));
+  });
+}
+
+async function validateHeadlessLaunch(executable) {
   const profileRoot = process.platform === "linux"
     && (executable === "/usr/bin/chromium-browser" || executable === "/snap/bin/chromium")
     ? path.join(process.env.HOME || os.homedir(), "snap", "chromium", "common")
@@ -88,7 +119,7 @@ function validateHeadlessLaunch(executable) {
   const outputFd = fs.openSync(outputPath, "w");
   const errorFd = fs.openSync(errorPath, "w");
   try {
-    const result = spawnSync(executable, [
+    const result = await runBrowserCheck(executable, [
       "--headless",
       "--disable-gpu",
       "--disable-background-mode",
@@ -98,17 +129,13 @@ function validateHeadlessLaunch(executable) {
       `--user-data-dir=${profileDir}`,
       "--dump-dom",
       "data:text/html,<title>SocketAgent</title><p>ok</p>",
-    ], {
-      timeout: 30_000,
-      windowsHide: true,
-      stdio: ["ignore", outputFd, errorFd],
-    });
+    ], outputFd, errorFd);
     fs.closeSync(outputFd);
     fs.closeSync(errorFd);
     const output = fs.readFileSync(outputPath, "utf8");
     const errorOutput = fs.readFileSync(errorPath, "utf8");
     if (result.status !== 0 || !output.includes("<p>ok</p>")) {
-      const detail = String(errorOutput || output || result.error?.message || "Browser launch failed")
+      const detail = String(errorOutput || output || result.error?.message || (result.timedOut ? "Browser launch timed out." : "Browser launch failed"))
         .trim()
         .split(/\r?\n/)
         .slice(-4)
@@ -134,9 +161,14 @@ function writeMarker(executable) {
 async function main() {
   const systemBrowser = systemCandidates().find(executableWorks);
   if (systemBrowser) {
-    validateHeadlessLaunch(systemBrowser);
-    console.log(`Browser runtime available: ${systemBrowser}`);
-    return;
+    try {
+      await validateHeadlessLaunch(systemBrowser);
+      console.log(`Browser runtime available: ${systemBrowser}`);
+      return;
+    } catch (error) {
+      if (process.platform === "linux") throw error;
+      console.warn(`System browser is not automation-compatible; installing a managed runtime. ${error.message}`);
+    }
   }
 
   if (process.platform === "linux") {
@@ -147,7 +179,7 @@ async function main() {
 
   const markedBrowser = existingMarker();
   if (executableWorks(markedBrowser)) {
-    validateHeadlessLaunch(markedBrowser);
+    await validateHeadlessLaunch(markedBrowser);
     console.log(`Managed browser runtime available: ${markedBrowser}`);
     return;
   }
@@ -180,7 +212,7 @@ async function main() {
     });
   }
 
-  validateHeadlessLaunch(browser.executablePath);
+  await validateHeadlessLaunch(browser.executablePath);
   writeMarker(browser.executablePath);
   console.log(`Managed browser runtime installed: ${browser.executablePath}`);
 }
