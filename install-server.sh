@@ -80,7 +80,7 @@ run_as_root() {
   elif command -v sudo >/dev/null 2>&1; then
     sudo "$@"
   else
-    fail "Administrator access is required to install native build tools."
+    fail "Administrator access is required to install system dependencies."
     exit 1
   fi
 }
@@ -215,6 +215,46 @@ install_server_dependencies_and_build() {
   (cd "$SERVER_DIR" && npx tsc)
   ok "Server built successfully"
   SERVER_BUILD_DONE=true
+}
+
+install_browser_runtime() {
+  if [[ "$OS_NAME" == "Linux" ]] && ! {
+    command -v google-chrome >/dev/null 2>&1 \
+      || command -v google-chrome-stable >/dev/null 2>&1 \
+      || command -v chromium >/dev/null 2>&1 \
+      || command -v chromium-browser >/dev/null 2>&1 \
+      || command -v microsoft-edge >/dev/null 2>&1 \
+      || command -v microsoft-edge-stable >/dev/null 2>&1;
+  }; then
+    echo "  Installing the OS-packaged Chromium browser..."
+    if command -v apt-get >/dev/null 2>&1; then
+      run_as_root apt-get update
+      local chromium_package="chromium"
+      local chromium_candidate
+      chromium_candidate="$(apt-cache policy chromium 2>/dev/null | awk '/Candidate:/ { print $2; exit }')"
+      if [[ -z "$chromium_candidate" || "$chromium_candidate" == "(none)" ]]; then
+        chromium_package="chromium-browser"
+      fi
+      run_as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y "$chromium_package"
+    elif command -v dnf >/dev/null 2>&1; then
+      run_as_root dnf install -y chromium
+    elif command -v yum >/dev/null 2>&1; then
+      run_as_root yum install -y chromium
+    elif command -v pacman >/dev/null 2>&1; then
+      run_as_root pacman -Sy --noconfirm chromium
+    elif command -v zypper >/dev/null 2>&1; then
+      run_as_root zypper --non-interactive install chromium
+    elif command -v apk >/dev/null 2>&1; then
+      run_as_root apk add chromium
+    else
+      fail "No supported package manager was found for Chromium."
+      exit 1
+    fi
+  fi
+
+  echo "  Validating the browser runtime with a headless launch..."
+  (cd "$SERVER_DIR" && node scripts/install-browser-runtime.js)
+  ok "Browser runtime ready"
 }
 
 echo ""
@@ -395,6 +435,7 @@ fi
 phase "Phase 4: Install Dependencies & Build"
 
 install_server_dependencies_and_build
+install_browser_runtime
 
 # ══════════════════════════════════════════════
 #  Phase 5: Generate Configuration

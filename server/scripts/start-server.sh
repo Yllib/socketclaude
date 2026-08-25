@@ -364,6 +364,10 @@ if build_needs_compile; then
   fi
 fi
 
+if ! "$NODE_BIN" scripts/install-browser-runtime.js; then
+  log "Browser runtime is unavailable; BrowserSession will remain disabled"
+fi
+
 log "Starting SocketAgent server"
 release_lock
 exec "$NODE_BIN" "$SERVER_DIR/dist/index.js"

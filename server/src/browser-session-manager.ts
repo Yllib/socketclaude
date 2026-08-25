@@ -87,8 +87,23 @@ function socketAgentDataDir(): string {
     || path.join(process.env.HOME || os.homedir(), ".socket-agent");
 }
 
-function browserDataDir(): string {
+export function browserDataDir(browserExecutable = resolveBrowserBinary()): string {
+  if (process.platform === "linux"
+    && (browserExecutable === "/usr/bin/chromium-browser" || browserExecutable === "/snap/bin/chromium")) {
+    return path.join(process.env.HOME || os.homedir(), "snap", "chromium", "common", "socketagent-browser-sessions");
+  }
   return path.join(socketAgentDataDir(), "browser-sessions");
+}
+
+function managedBrowserPath(): string {
+  try {
+    return fs.readFileSync(
+      path.join(socketAgentDataDir(), "browser-runtime", "executable-path"),
+      "utf8",
+    ).trim();
+  } catch {
+    return "";
+  }
 }
 
 function restrictDirectory(target: string): void {
@@ -115,7 +130,9 @@ export function normalizeBrowserUrl(value: string): string {
 
 function browserCandidates(): string[] {
   const configured = process.env.SOCKETAGENT_BROWSER_BINARY?.trim();
+  const managed = managedBrowserPath();
   const candidates = configured ? [configured] : [];
+  if (managed) candidates.push(managed);
   if (process.platform === "win32") {
     for (const root of [process.env.PROGRAMFILES, process.env["PROGRAMFILES(X86)"], process.env.LOCALAPPDATA]) {
       if (!root) continue;
@@ -256,12 +273,13 @@ export class BrowserSessionManager {
       return await this.summary(existing);
     }
 
-    const root = browserDataDir();
+    const browserExecutable = resolveBrowserBinary();
+    const root = browserDataDir(browserExecutable);
     const profileDir = path.join(root, profile);
     fs.mkdirSync(profileDir, { recursive: true, mode: 0o700 });
     restrictDirectory(root);
     restrictDirectory(profileDir);
-    const processHandle = spawn(resolveBrowserBinary(), [
+    const processHandle = spawn(browserExecutable, [
       "--headless=new",
       "--remote-debugging-port=0",
       `--user-data-dir=${profileDir}`,
