@@ -280,7 +280,7 @@ export class BrowserSessionManager {
     restrictDirectory(root);
     restrictDirectory(profileDir);
     const processHandle = spawn(browserExecutable, [
-      "--headless=new",
+      "--headless",
       "--remote-debugging-port=0",
       `--user-data-dir=${profileDir}`,
       `--window-size=${DEFAULT_WIDTH},${DEFAULT_HEIGHT}`,
@@ -288,8 +288,9 @@ export class BrowserSessionManager {
       "--no-first-run",
       "--no-default-browser-check",
       "--disable-background-networking",
+      "--disable-background-mode",
       "--disable-component-update",
-      "--disable-features=Translate,OptimizationHints",
+      "--disable-features=Translate,OptimizationHints,msEdgeFirstRunExperience",
       "--password-store=basic",
       "about:blank",
     ], {

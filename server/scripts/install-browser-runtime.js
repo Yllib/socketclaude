@@ -83,22 +83,32 @@ function validateHeadlessLaunch(executable) {
     : os.tmpdir();
   fs.mkdirSync(profileRoot, { recursive: true });
   const profileDir = fs.mkdtempSync(path.join(profileRoot, "socketagent-browser-check-"));
+  const outputPath = path.join(profileDir, "validation-output.txt");
+  const errorPath = path.join(profileDir, "validation-error.txt");
+  const outputFd = fs.openSync(outputPath, "w");
+  const errorFd = fs.openSync(errorPath, "w");
   try {
     const result = spawnSync(executable, [
-      "--headless=new",
+      "--headless",
       "--disable-gpu",
+      "--disable-background-mode",
+      "--disable-features=msEdgeFirstRunExperience",
       "--no-first-run",
       "--no-default-browser-check",
       `--user-data-dir=${profileDir}`,
       "--dump-dom",
       "data:text/html,<title>SocketAgent</title><p>ok</p>",
     ], {
-      encoding: "utf8",
       timeout: 30_000,
       windowsHide: true,
+      stdio: ["ignore", outputFd, errorFd],
     });
-    if (result.status !== 0 || !String(result.stdout || "").includes("<p>ok</p>")) {
-      const detail = String(result.stderr || result.stdout || "Browser launch failed")
+    fs.closeSync(outputFd);
+    fs.closeSync(errorFd);
+    const output = fs.readFileSync(outputPath, "utf8");
+    const errorOutput = fs.readFileSync(errorPath, "utf8");
+    if (result.status !== 0 || !output.includes("<p>ok</p>")) {
+      const detail = String(errorOutput || output || result.error?.message || "Browser launch failed")
         .trim()
         .split(/\r?\n/)
         .slice(-4)
@@ -107,6 +117,8 @@ function validateHeadlessLaunch(executable) {
       throw new Error(`Browser runtime could not start headless. ${detail}`);
     }
   } finally {
+    try { fs.closeSync(outputFd); } catch {}
+    try { fs.closeSync(errorFd); } catch {}
     fs.rmSync(profileDir, { recursive: true, force: true });
   }
 }
