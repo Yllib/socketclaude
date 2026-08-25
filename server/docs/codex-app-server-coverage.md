@@ -1,8 +1,10 @@
 # Codex app-server coverage
 
-Last audited: 2026-07-28  
-Codex CLI/schema: `0.145.0`, generated with
-`codex app-server generate-json-schema --experimental`  
+Last audited: 2026-08-24
+
+Codex CLI/schema: `0.149.0`, checked with
+`codex app-server generate-ts --out <directory>`
+
 Primary reference: [Codex App Server](https://learn.chatgpt.com/docs/app-server.md)
 
 SocketAgent treats the app-server stream as two different surfaces:
@@ -19,7 +21,7 @@ SocketAgent treats the app-server stream as two different surfaces:
 |---|---|---|
 | `userMessage` | Native user message | Yes |
 | `hookPrompt` | Hook Context card with fragments | Yes |
-| `agentMessage` | Native streaming assistant message | Yes |
+| `agentMessage` | Native streaming assistant message with commentary/final phase retained | Yes |
 | `plan` | Native Codex plan card; final item is authoritative | Yes |
 | `reasoning` | Thinking card with duration | Yes |
 | `commandExecution` | Bash card with semantic action summary, cwd, command, streaming output, and exit state | Yes |
@@ -27,7 +29,7 @@ SocketAgent treats the app-server stream as two different surfaces:
 | `mcpToolCall` | MCP/app card with app, action, arguments, progress, and result | Yes |
 | `dynamicToolCall` | Namespaced Codex Tool card with structured arguments/results | Yes |
 | `collabAgentToolCall` | Subagent lifecycle and hierarchy in transcript plus anchored task pane | Yes |
-| `subAgentActivity` | Subagent lifecycle and hierarchy in transcript plus anchored task pane | Yes |
+| `subAgentActivity` | Started, interacted, and interrupted lifecycle updates in the anchored task pane | Yes |
 | `webSearch` | Web Search/Open Page/Find card with structured result rows | Yes |
 | `imageView` | Image card with local preview/full-screen viewer | Yes |
 | `sleep` | Interruptible wait card with duration | Yes |
@@ -62,7 +64,8 @@ The following are intentionally not chat cards:
 - token usage and rate-limit cache updates;
 - thread settings, which synchronize model, effort, collaboration mode, and
   cwd back to SocketAgent;
-- server-request resolution acknowledgements;
+- server-request resolution acknowledgements, which also retire any pending
+  question or elicitation card tied to the resolved request;
 - moderation metadata, which is internal policy telemetry rather than
   user-facing content;
 - filesystem watch, fuzzy-search, environment, marketplace, plugin, skills,
@@ -76,7 +79,7 @@ SDK event log for raw-mode inspection and future protocol audits.
 
 For each managed Codex update:
 
-1. Generate the experimental JSON schema from the installed binary.
+1. Generate the TypeScript schema from the installed binary.
 2. Diff the `ServerNotification`, `ServerRequest`, and `ThreadItem` unions
    against this matrix.
 3. Count observed methods and item types in

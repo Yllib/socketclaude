@@ -1,6 +1,22 @@
 # Claude Agent SDK Audit — SocketAgent
 
-*Audited against [official SDK docs](https://platform.claude.com/docs/en/agent-sdk/typescript), [changelog](https://github.com/anthropics/claude-agent-sdk-typescript/blob/main/CHANGELOG.md). Installed version: 0.2.76. Date: 2026-03-17.*
+*Originally audited against SDK 0.2.76 on 2026-03-17. Rechecked against installed SDK 0.3.220 on 2026-08-24.*
+
+## 0.3.220 re-audit delta
+
+- [x] Ignore replayed user echoes. SocketAgent assigns the UUID before sending
+  the prompt and no longer mutates the most recent unrelated user entry.
+- [x] Apply refusal-fallback retractions to live UI state, SQLite history, and
+  transcript search without rewriting the full session.
+- [x] Handle `conversation_reset` as a session identity remap while preserving
+  SocketAgent metadata and durable session memory.
+- [x] Read `retry_delay_ms` and forward the SDK's actual delay to the app.
+- [x] Preserve `task_id`, heartbeat, subagent type, and subagent retry details
+  from `tool_progress`.
+- [x] Enable `includeHookEvents` for the hook lifecycle handlers below.
+- [ ] Surface live `permission_denied` and informational stop notices before
+  the terminal result arrives.
+- [ ] Replace full JSONL UUID backfill with indexed incremental reconciliation.
 
 ## Status Legend
 - [ ] Not started
@@ -58,7 +74,7 @@
 - **Issue:** SDK emits `SDKTaskProgressMessage` periodically with `usage`, `last_tool_name`, `summary`. Never forwarded to app.
 
 ### 10. `system/api_retry` — not handled (new in v0.2.77)
-- **Status:** [x] Done (defensive handler, needs SDK upgrade)
+- **Status:** [x] Done
 - **Issue:** SDK emits retry messages with attempt count, max retries, delay, error status on transient API errors. Could show "retrying..." banner.
 
 ### 11. `system/local_command_output` — not handled

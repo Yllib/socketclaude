@@ -302,6 +302,10 @@ function authoritativeTurnIdFromSteerError(error: unknown): string | null {
   return match?.[1]?.trim() || null;
 }
 
+export function codexAgentMessagePhase(value: unknown): "commentary" | "final_answer" | undefined {
+  return value === "commentary" || value === "final_answer" ? value : undefined;
+}
+
 interface PendingQuestion {
   questionId: string;
   resolve: (answers: Record<string, string>) => void;
@@ -522,6 +526,7 @@ export class CodexSession {
   private appServerFileChangePaths = new Map<string, string[]>();
   private appServerSeenUserMessageItems = new Set<string>();
   private appServerStreamParents = new Map<string, string>();
+  private appServerAgentPhases = new Map<string, "commentary" | "final_answer">();
   private codexSubagents = new Map<string, CodexSubagentState>();
   private lastSubagentSnapshotFingerprint: string | null = null;
   private _isCompacting = false;
@@ -567,6 +572,7 @@ export class CodexSession {
   private _queuedPrompts: QueuedPrompt[] = [];
   private _pendingAppServerSteers: PendingAppServerSteer[] = [];
   private pendingQuestions = new Map<string, PendingQuestion>();
+  private appServerQuestionByRequestId = new Map<string, string>();
   private connectedAppApprovals = new Set<string>();
   private clientSockets = new Set<WebSocket>();
   private sessionEventDelivery = new SessionEventDelivery((message) => {
@@ -845,6 +851,7 @@ export class CodexSession {
         answers[String(question.question)] = confirmations[index]!.approveLabel;
       });
       this.pendingQuestions.delete(questionId);
+      this.clearAppServerQuestionMapping(questionId);
       pending.resolve(answers);
       const sid = this.sessionId || this._resumeSessionId || "";
       if (sid) markQuestionAnswered(sid, questionId, answers);
@@ -1253,10 +1260,31 @@ export class CodexSession {
     const pending = this.pendingQuestions.get(questionId);
     if (!pending) return false;
     this.pendingQuestions.delete(questionId);
+    this.clearAppServerQuestionMapping(questionId);
     pending.resolve(answers);
     const sid = this.sessionId || this._resumeSessionId;
     if (sid) markQuestionAnswered(sid, questionId, answers);
     return true;
+  }
+
+  private clearAppServerQuestionMapping(questionId: string): void {
+    for (const [requestId, mappedQuestionId] of this.appServerQuestionByRequestId) {
+      if (mappedQuestionId === questionId) this.appServerQuestionByRequestId.delete(requestId);
+    }
+  }
+
+  private resolveAppServerRequest(requestId: unknown): void {
+    const key = String(requestId ?? "");
+    const questionId = this.appServerQuestionByRequestId.get(key);
+    if (!questionId) return;
+    this.appServerQuestionByRequestId.delete(key);
+    const pending = this.pendingQuestions.get(questionId);
+    if (!pending) return;
+    this.pendingQuestions.delete(questionId);
+    pending.resolve({});
+    const sid = this.sessionId || this._resumeSessionId || "";
+    if (sid) markQuestionAnswered(sid, questionId, {});
+    this.send({ type: "question_answered", questionId, sessionId: sid, answers: {} } as any);
   }
   submitAuthCode(_code: string): void {}
   interrupt(): void { this.abort(); }
@@ -2165,6 +2193,7 @@ export class CodexSession {
     this.appServerStreamParents.clear();
     this.appServerReasoningParents.clear();
     this.appServerReasoningStartedAt.clear();
+    this.appServerAgentPhases.clear();
     this.appServerToolOutput.clear();
 
     const resumeTarget = resumeSessionId || this._resumeSessionId;
@@ -2174,11 +2203,12 @@ export class CodexSession {
       this._sessionInfoSaved = true;
     }
 
+    const clientUserMessageId = this._currentClientMessageId || crypto.randomUUID();
     this._pendingUserPrompt = {
       text: prompt,
       // Reuse the app's stable submission ID as the transcript UUID. This
       // makes a retried prompt recognizable even after the server restarts.
-      uuid: this._currentClientMessageId || crypto.randomUUID(),
+      uuid: clientUserMessageId,
       ...(this._currentClientMessageId ? { messageId: this._currentClientMessageId } : {}),
     };
     // Existing sessions already have a stable SocketAgent/thread identity.
@@ -2250,6 +2280,7 @@ export class CodexSession {
       const collaborationMode = this.codexCollaborationMode();
       const turn = await this.appServer!.startTurn({
         threadId: this.threadId,
+        clientUserMessageId,
         cwd: this.cwd,
         input: this.buildAppServerTurnInput(nativePrompt),
         model: turnModel,
@@ -2369,7 +2400,7 @@ export class CodexSession {
         this._stderrBuffer.push(chunk);
       });
       this.appServer.on("serverRequest", (
-        request: { method?: string; params?: unknown },
+        request: { id?: string | number; method?: string; params?: unknown },
         respond: CodexAppServerRequestResponder,
       ) => {
         void this.handleAppServerRequest(request, respond);
@@ -2979,6 +3010,7 @@ export class CodexSession {
     console.log(`[codex app-server] steering message mid-turn (thread=${this.threadId}, turn=${turnId}, priority=${pending.priority}, messageId=${pending.messageId || ""})`);
     this.appServer.steerTurn({
       threadId: this.threadId,
+      clientUserMessageId: pending.uuid,
       expectedTurnId: turnId,
       input: this.buildAppServerTurnInput(pending.text),
     })
@@ -3033,7 +3065,7 @@ export class CodexSession {
   }
 
   private async handleAppServerRequest(
-    request: { method?: string; params?: unknown },
+    request: { id?: string | number; method?: string; params?: unknown },
     respond: CodexAppServerRequestResponder,
   ): Promise<void> {
     const method = request.method || "unknown";
@@ -3067,7 +3099,7 @@ export class CodexSession {
         }
 
         case "item/tool/requestUserInput": {
-          await this.handleAppServerUserInput(params, respond);
+          await this.handleAppServerUserInput(params, respond, request.id);
           return;
         }
 
@@ -3092,7 +3124,7 @@ export class CodexSession {
         }
 
         case "mcpServer/elicitation/request": {
-          await this.handleMcpServerElicitation(params, respond);
+          await this.handleMcpServerElicitation(params, respond, request.id);
           return;
         }
 
@@ -3119,6 +3151,7 @@ export class CodexSession {
   private async handleMcpServerElicitation(
     params: Record<string, any>,
     respond: CodexAppServerRequestResponder,
+    requestId?: string | number,
   ): Promise<void> {
     const prepared = prepareCodexMcpElicitation(params);
     const serverName = prepared.serverName;
@@ -3155,6 +3188,9 @@ export class CodexSession {
 
     const sessionId = this.sessionId || this._resumeSessionId || String(params.threadId || "");
     const questionId = createInteractiveRequestId("codex_elicit");
+    if (requestId !== undefined) {
+      this.appServerQuestionByRequestId.set(String(requestId), questionId);
+    }
 
     if (prepared.mode === "url" && prepared.url) {
       const message: ServerMessage = {
@@ -3180,6 +3216,7 @@ export class CodexSession {
       const answers = await new Promise<Record<string, string>>((resolve) => {
         this.pendingQuestions.set(questionId, { questionId, resolve, questionData: message });
       });
+      this.clearAppServerQuestionMapping(questionId);
       const answer = String(Object.values(answers)[0] || "");
       const accepted = !/\b(?:cancel|decline|reject)\b/i.test(answer);
       respond({
@@ -3215,6 +3252,7 @@ export class CodexSession {
     const answers = await new Promise<Record<string, string>>((resolve) => {
       this.pendingQuestions.set(questionId, { questionId, resolve, questionData: questionMessage });
     });
+    this.clearAppServerQuestionMapping(questionId);
     if (confirmation && fallbackQuestion) {
       const answer = String(answers[fallbackQuestion.question] || "");
       if (answer.includes(confirmation.sessionLabel)) {
@@ -3232,6 +3270,7 @@ export class CodexSession {
   private async handleAppServerUserInput(
     params: Record<string, any>,
     respond: CodexAppServerRequestResponder,
+    requestId?: string | number,
   ): Promise<void> {
     const rawQuestions = Array.isArray(params.questions) ? params.questions : [];
     const secretQuestion = rawQuestions.find((question: any) => question?.isSecret === true);
@@ -3247,6 +3286,9 @@ export class CodexSession {
 
     const sessionId = this.sessionId || this._resumeSessionId || String(params.threadId || "");
     const questionId = createInteractiveRequestId("codex_input");
+    if (requestId !== undefined) {
+      this.appServerQuestionByRequestId.set(String(requestId), questionId);
+    }
     const questionIds = new Map<string, string>();
     const confirmations = new Map<string, ConnectedAppConfirmation>();
     const automaticAnswers: Record<string, { answers: string[] }> = {};
@@ -3285,6 +3327,7 @@ export class CodexSession {
       }];
     });
     if (questions.length === 0) {
+      this.clearAppServerQuestionMapping(questionId);
       respond({ result: { answers: automaticAnswers } });
       return;
     }
@@ -3320,6 +3363,7 @@ export class CodexSession {
       if (Number.isFinite(autoResolutionMs) && autoResolutionMs > 0) {
         timer = setTimeout(() => {
           if (!this.pendingQuestions.delete(questionId)) return;
+          this.clearAppServerQuestionMapping(questionId);
           if (sessionId) markQuestionAnswered(sessionId, questionId, {});
           this.send({ type: "question_answered", questionId, sessionId, answers: {} } as any);
           resolve({});
@@ -3327,6 +3371,7 @@ export class CodexSession {
         timer.unref?.();
       }
     });
+    this.clearAppServerQuestionMapping(questionId);
 
     const responseAnswers: Record<string, { answers: string[] }> = {
       ...automaticAnswers,
@@ -3570,6 +3615,10 @@ export class CodexSession {
         return;
       }
 
+      case "serverRequest/resolved":
+        this.resolveAppServerRequest(p?.requestId);
+        return;
+
       case "item/agentMessage/delta": {
         const sid = this.sessionId;
         if (!sid) return;
@@ -3578,6 +3627,7 @@ export class CodexSession {
         const accumulated = (this.appServerAgentText.get(itemId) || "") + delta;
         this.appServerAgentText.set(itemId, accumulated);
         const parentToolUseId = this.parentToolUseIdForThread(p?.threadId);
+        const messagePhase = this.appServerAgentPhases.get(itemId);
         if (parentToolUseId) this.appServerStreamParents.set(itemId, parentToolUseId);
         if (delta) {
           this.send({
@@ -3586,6 +3636,7 @@ export class CodexSession {
             sessionId: sid,
             streamId: itemId,
             snapshot: true,
+            ...(messagePhase ? { messagePhase } : {}),
             ...(parentToolUseId ? { parentToolUseId } : {}),
           } as ServerMessage);
         }
@@ -4060,6 +4111,11 @@ export class CodexSession {
                 : now(),
             });
             if (agent) this.updateCodexSubagentStatus(agent.agentId, "running");
+          } else if (item.kind === "interacted") {
+            const agent = this.registerCodexSubagent(String(item.agentThreadId || ""), {
+              agentPath: String(item.agentPath || ""),
+            });
+            if (agent) this.updateCodexSubagentStatus(agent.agentId, "running");
           } else if (item.kind === "interrupted") {
             this.updateCodexSubagentStatus(String(item.agentThreadId || ""), "interrupted");
           }
@@ -4164,6 +4220,9 @@ export class CodexSession {
     }
 
     if (item.type === "agentMessage") {
+      const messagePhase = codexAgentMessagePhase(item.phase)
+        || this.appServerAgentPhases.get(String(item.id));
+      if (messagePhase) this.appServerAgentPhases.set(String(item.id), messagePhase);
       if (method === "item/completed") {
         const text = item.text || this.appServerAgentText.get(item.id) || "";
         if (text) {
@@ -4174,6 +4233,7 @@ export class CodexSession {
             streamId: String(item.id),
             snapshot: true,
             finalSnapshot: true,
+            ...(messagePhase ? { messagePhase } : {}),
             ...(parentToolUseId ? { parentToolUseId } : {}),
           } as any);
           if (!parentToolUseId) this._lastAssistantText = text;
@@ -4181,11 +4241,13 @@ export class CodexSession {
             role: "assistant",
             content: text,
             streamId: String(item.id),
+            ...(messagePhase ? { messagePhase } : {}),
             timestamp: now(),
           });
         }
         this.appServerAgentText.delete(item.id);
         this.appServerStreamParents.delete(item.id);
+        this.appServerAgentPhases.delete(String(item.id));
       }
       return;
     }

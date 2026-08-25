@@ -110,6 +110,24 @@ export interface PrivateIntegrationAuthRequestMessage {
   integration: "outlook-auth" | "ibs-auth";
 }
 
+export interface BrowserFrameRequestMessage {
+  type: "browser_frame_request";
+  profile: string;
+}
+
+export interface BrowserSessionInputMessage {
+  type: "browser_session_input";
+  profile: string;
+  action: "tap" | "text" | "key" | "scroll" | "navigate" | "reload" | "back" | "forward";
+  x?: number;
+  y?: number;
+  text?: string;
+  key?: string;
+  deltaX?: number;
+  deltaY?: number;
+  url?: string;
+}
+
 export interface SecureInputResponseMessage {
   type: "secure_input_response";
   requestId: string;
@@ -1055,6 +1073,8 @@ export type ClientMessage =
   | RetractQueuedPromptMessage
   | AnswerMessage
   | PrivateIntegrationAuthRequestMessage
+  | BrowserFrameRequestMessage
+  | BrowserSessionInputMessage
   | SecureInputResponseMessage
   | SecureInputStoreMessage
   | SecretInventoryRequestMessage
@@ -1216,6 +1236,8 @@ export interface TextServerMessage {
   replay?: boolean;
   snapshot?: boolean;
   finalSnapshot?: boolean;
+  /** Codex Responses API message phase when supplied by app-server. */
+  messagePhase?: "commentary" | "final_answer";
   deliveryId?: string;
   entryId?: string;
   sessionSeq?: number;
@@ -1758,6 +1780,8 @@ export interface HistoryEntry {
   // Subagent hierarchy and message tracking
   parentToolUseId?: string | null;
   uuid?: string;
+  /** Codex Responses API message phase when supplied by app-server. */
+  messagePhase?: "commentary" | "final_answer";
   // Tool summary fields
   toolSummary?: boolean;
   precedingToolUseIds?: string[];
@@ -2402,6 +2426,33 @@ export interface ApiRetryServerMessage {
   sessionId: string;
 }
 
+export interface ToolProgressServerMessage {
+  type: "tool_progress";
+  toolUseId: string;
+  toolName: string;
+  elapsedSeconds: number;
+  sessionId: string;
+  parentToolUseId?: string | null;
+  uuid?: string;
+  taskId?: string;
+  heartbeat?: boolean;
+  subagentType?: string;
+  subagentRetry?: {
+    agentId: string;
+    attempt: number;
+    maxRetries: number;
+    retryDelayMs: number;
+    errorStatus?: number;
+    errorCategory: string;
+  };
+}
+
+export interface HistoryRetractedServerMessage {
+  type: "history_retracted";
+  sessionId: string;
+  uuids: string[];
+}
+
 export interface LocalCommandOutputServerMessage {
   type: "local_command_output";
   content: string;
@@ -2597,6 +2648,33 @@ export interface SessionMemoryErrorServerMessage {
   message: string;
 }
 
+export interface BrowserSessionOpenServerMessage {
+  type: "browser_session_open";
+  profile: string;
+  label: string;
+  url: string;
+  width: number;
+  height: number;
+  sessionId?: string;
+}
+
+export interface BrowserFrameServerMessage {
+  type: "browser_frame";
+  profile: string;
+  imageBase64: string;
+  mimeType: "image/jpeg";
+  width: number;
+  height: number;
+  url: string;
+  title: string;
+}
+
+export interface BrowserSessionErrorServerMessage {
+  type: "browser_session_error";
+  profile: string;
+  message: string;
+}
+
 export type ServerMessage =
   | TextServerMessage
   | ToolCallServerMessage
@@ -2605,6 +2683,9 @@ export type ServerMessage =
   | QuestionAnsweredServerMessage
   | SecureInputRequestServerMessage
   | SecureInputSavedServerMessage
+  | BrowserSessionOpenServerMessage
+  | BrowserFrameServerMessage
+  | BrowserSessionErrorServerMessage
   | SecretInventoryServerMessage
   | SecretOperationResultServerMessage
   | HtmlPlanServerMessage
@@ -2673,6 +2754,8 @@ export type ServerMessage =
   | BackgroundTasksChangedServerMessage
   | WorkflowStateServerMessage
   | ApiRetryServerMessage
+  | ToolProgressServerMessage
+  | HistoryRetractedServerMessage
   | LocalCommandOutputServerMessage
   | PromptSuggestionServerMessage
   | SessionLifecycleServerMessage

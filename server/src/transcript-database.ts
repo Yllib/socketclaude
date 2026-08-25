@@ -746,6 +746,41 @@ export class TranscriptDatabase {
     }
   }
 
+  /** Remove SDK-retracted messages without hydrating or rewriting the transcript. */
+  deleteByUuids(sessionId: string, uuids: readonly string[]): number {
+    const uniqueUuids = [...new Set(uuids.map((uuid) => uuid.trim()).filter(Boolean))];
+    if (uniqueUuids.length === 0) return 0;
+
+    const placeholders = uniqueUuids.map(() => "?").join(",");
+    const rows = this.db.prepare(`
+      SELECT rowid, entry_id FROM transcript_entries
+      WHERE session_id = ?
+        AND json_extract(entry_json, '$.uuid') IN (${placeholders})
+    `).all(sessionId, ...uniqueUuids) as unknown as Array<{
+      rowid: number;
+      entry_id: string;
+    }>;
+    if (rows.length === 0) return 0;
+
+    const deleteEntry = this.db.prepare(
+      "DELETE FROM transcript_entries WHERE session_id = ? AND entry_id = ?",
+    );
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      for (const row of rows) {
+        if (this.ftsEnabled) this.deleteSearchEntry.run(Number(row.rowid));
+        else this.deleteSearchEntry.run(sessionId, row.entry_id);
+        deleteEntry.run(sessionId, row.entry_id);
+      }
+      this.recomputeSummary(sessionId);
+      this.db.exec("COMMIT");
+      return rows.length;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
   deleteSession(sessionId: string): void {
     this.db.exec("BEGIN IMMEDIATE");
     try {

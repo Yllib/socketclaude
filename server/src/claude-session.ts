@@ -17,12 +17,13 @@ import {
   Backend,
   WorkflowStatePayload,
 } from "./protocol";
-import { saveSession, getSession, updateSessionActivity, updateSessionContextUsage, updateSessionAgentSettings, appendHistory, saveTodos, getTodos, remapSession, markQuestionAnswered, appendSdkEvent, assignUserUuid, cacheToolImage, positionSessionMessage, clearSessionPendingHandoffContext } from "./session-store";
+import { saveSession, getSession, updateSessionActivity, updateSessionContextUsage, updateSessionAgentSettings, appendHistory, saveTodos, getTodos, remapSession, markQuestionAnswered, appendSdkEvent, cacheToolImage, positionSessionMessage, clearSessionPendingHandoffContext, removeHistoryEntriesByUuids } from "./session-store";
 import { saveScheduledTask, ScheduledTask, RecurrenceConfig } from "./scheduled-task-store";
 import { SocketAgentPlugin, SessionContext } from "./plugin-api";
 import {
   AppToolContext,
   handleAgentSessionTool,
+  handleBrowserSessionTool,
   handleHtmlPlanTool,
   handleMonitorTool,
   handleNotifyUserTool,
@@ -49,6 +50,7 @@ import { getCachedModelCatalog, modelCatalogIsFresh, saveCachedModelCatalog } fr
 import { LatestSnapshotDispatcher } from "./latest-snapshot-dispatcher";
 import { maybeSendAgentAttentionPush } from "./push-notifications";
 import { createInteractiveRequestId } from "./interactive-request-id";
+import { remapSessionMemory } from "./session-memory-store";
 import {
   buildClaudeRateLimitEvent,
   buildClaudeUsageRateLimitEvents,
@@ -770,6 +772,19 @@ export function createClaudeContinuationMessages(
   }));
 }
 
+export function isLiveClaudeUserEcho(message: unknown): boolean {
+  const candidate = message as any;
+  return candidate?.type === "user"
+    && candidate.isReplay !== true
+    && candidate.isSynthetic !== true
+    && candidate.tool_use_result == null;
+}
+
+export function claudeApiRetryDelayMs(message: unknown): number {
+  const delay = Number((message as any)?.retry_delay_ms);
+  return Number.isFinite(delay) && delay >= 0 ? delay : 0;
+}
+
 class ClaudeInputQueue implements AsyncIterable<ClaudeQueuedUserMessage> {
   private messages: ClaudeQueuedUserMessage[] = [];
   private waiters: Array<(result: IteratorResult<ClaudeQueuedUserMessage>) => void> = [];
@@ -888,6 +903,7 @@ export class ClaudeSession {
   });
   public onActivity?: () => void;
   public onClose?: () => void;
+  public onSessionIdChanged?: (previousSessionId: string, nextSessionId: string) => void;
   public onMonitorOutput?: (text: string) => void;
   public onAgentSessionRequest?: AgentSessionToolExecutor;
   // When set, this fresh session replaces an old cleared session — remap the ID in the store
@@ -1542,6 +1558,51 @@ export class ClaudeSession {
   private _leaveWarmIdle(): void {
     this._clearWarmIdleTimer();
     this._isWarmIdle = false;
+  }
+
+  private _retractClaudeMessages(rawUuids: unknown): void {
+    if (!Array.isArray(rawUuids)) return;
+    const uuids = [...new Set(rawUuids.map((uuid) => String(uuid || "").trim()).filter(Boolean))];
+    if (uuids.length === 0) return;
+    const retracted = new Set(uuids);
+    for (const [streamId, stream] of this._streamingText) {
+      if (stream.uuid && retracted.has(stream.uuid)) this._streamingText.delete(streamId);
+    }
+    for (const [streamId, stream] of this._streamingThinking) {
+      if (stream.uuid && retracted.has(stream.uuid)) this._streamingThinking.delete(streamId);
+    }
+    const sessionId = this.sessionId || "";
+    if (sessionId) {
+      try {
+        removeHistoryEntriesByUuids(sessionId, uuids);
+      } catch (error) {
+        console.error(`[SDK] Failed to retract superseded history: ${String(error)}`);
+      }
+      this.send({ type: "history_retracted", sessionId, uuids });
+    }
+  }
+
+  private _handleClaudeConversationReset(message: any): void {
+    const previousSessionId = this.sessionId || String(message?.session_id || "");
+    const nextSessionId = String(message?.new_conversation_id || "").trim();
+    if (!previousSessionId || !nextSessionId || previousSessionId === nextSessionId) return;
+    const previous = getSession(previousSessionId);
+    remapSession(previousSessionId, nextSessionId);
+    remapSessionMemory(previousSessionId, nextSessionId);
+    this.sessionId = nextSessionId;
+    this._resumeSessionId = nextSessionId;
+    this._streamingText.clear();
+    this._streamingThinking.clear();
+    this._thinkingProgress = null;
+    this.onSessionIdChanged?.(previousSessionId, nextSessionId);
+    this.send({
+      type: "session_created",
+      sessionId: nextSessionId,
+      replacesSessionId: previousSessionId,
+      cwd: previous?.cwd || this.cwd,
+      title: previous?.title,
+      backend: "claude",
+    });
   }
 
   get sessionModel(): string | null {
@@ -2984,6 +3045,21 @@ export class ClaudeSession {
             async (args) => handleWorkReviewTool(appToolContext, args as any)
           ),
           tool(
+            "BrowserSession",
+            "Open and control a persistent isolated browser profile. Normal HTTP and HTTPS redirects are allowed across domains. Use snapshots and refs for non-sensitive interaction. Never type passwords, recovery codes, tokens, or MFA values with this tool; ask the user to enter them in the protected phone browser. Device-bound passkeys may require the site's alternate sign-in method. Use clear only when the user explicitly asks to delete a saved browser profile.",
+            {
+              action: z.enum(["open", "list", "status", "snapshot", "navigate", "click", "type", "key", "scroll", "close", "clear"]),
+              profile: z.string().optional().describe("Stable isolated profile name, for example google-play-william"),
+              url: z.string().optional().describe("HTTP or HTTPS URL for open or navigate"),
+              label: z.string().optional().describe("User-facing profile label used when opening"),
+              ref: z.string().optional().describe("Element ref returned by snapshot"),
+              text: z.string().optional().describe("Non-sensitive text to enter. Never pass a secret here."),
+              key: z.string().optional().describe("Enter, Tab, Backspace, Escape, or Ctrl+A"),
+              delta_y: z.number().optional().describe("Vertical scroll distance in CSS pixels"),
+            },
+            async (args) => handleBrowserSessionTool(appToolContext, args)
+          ),
+          tool(
             "Speak",
             "Speak text aloud to the user via text-to-speech. Use this to provide a concise spoken summary of your response. Keep it natural and conversational — no markdown, no code, no formatting. Summarize rather than reading everything verbatim. Only call this once per response. Avoid starting with a very short sentence — lead with a substantial opening sentence so audio playback begins with meaningful content.",
             { text: z.string().describe("The text to speak aloud to the user") },
@@ -3395,6 +3471,7 @@ export class ClaudeSession {
         toolNames: [
           "HtmlPlan",
           "WorkReview",
+          "BrowserSession",
           "SendFile",
           "RequestSecureInput",
           "Speak",
@@ -3474,6 +3551,7 @@ export class ClaudeSession {
           permissionMode: initialPermissionMode as any,
           allowDangerouslySkipPermissions: initialPermissionMode === "bypassPermissions",
           includePartialMessages: true,
+          includeHookEvents: true,
           // Complete subagent messages carry parent_tool_use_id. Forward their
           // text/thinking so the app can render the nested transcript instead
           // of receiving only otherwise-contextless child tool cards.
@@ -4103,6 +4181,16 @@ export class ClaudeSession {
           console.log(`[SDK msg] type=${msgType} subtype=${subtype}`);
         }
 
+        if (message.type === "assistant") {
+          this._retractClaudeMessages((message as any).supersedes);
+        }
+        if (message.type === "system" && (message as any).subtype === "model_refusal_fallback") {
+          this._retractClaudeMessages((message as any).retracted_message_uuids);
+        }
+        if (message.type === "conversation_reset") {
+          this._handleClaudeConversationReset(message);
+        }
+
         // Forward raw SDK event to app for debug mode + persist to JSONL
         try {
           const sdkPayload: any = { type: "sdk_event", sdkType: msgType };
@@ -4229,6 +4317,8 @@ export class ClaudeSession {
           if (replacesSessionId) {
             // Context was cleared — remap old session ID to this new one
             remapSession(replacesSessionId, message.session_id);
+            remapSessionMemory(replacesSessionId, message.session_id);
+            this.onSessionIdChanged?.(replacesSessionId, message.session_id);
             this.replacesSessionId = undefined;
           } else if (!resumeSessionId) {
             const title = prompt.slice(0, 50) + (prompt.length > 50 ? "..." : "");
@@ -4381,7 +4471,20 @@ export class ClaudeSession {
             sessionId: this.sessionId || "",
             parentToolUseId: tp.parent_tool_use_id || null,
             uuid: tp.uuid || undefined,
-          } as any);
+            taskId: tp.task_id || undefined,
+            heartbeat: tp.heartbeat === true || undefined,
+            subagentType: tp.subagent_type || undefined,
+            ...(tp.subagent_retry ? {
+              subagentRetry: {
+                agentId: String(tp.subagent_retry.agent_id || ""),
+                attempt: Number(tp.subagent_retry.attempt || 0),
+                maxRetries: Number(tp.subagent_retry.max_retries || 0),
+                retryDelayMs: Number(tp.subagent_retry.retry_delay_ms || 0),
+                errorStatus: tp.subagent_retry.error_status ?? undefined,
+                errorCategory: String(tp.subagent_retry.error_category || ""),
+              },
+            } : {}),
+          });
         }
 
         // Forward files_persisted events — tells the app which files were written
@@ -4710,12 +4813,13 @@ export class ClaudeSession {
         // Forward API retry events (#10 — defensive, needs SDK v0.2.77+)
         if (message.type === "system" && (message as any).subtype === "api_retry") {
           const ar = message as any;
-          console.log(`[SDK] API retry: attempt=${ar.attempt}/${ar.max_retries} delay=${ar.delay_ms}ms`);
+          const delayMs = claudeApiRetryDelayMs(ar);
+          console.log(`[SDK] API retry: attempt=${ar.attempt}/${ar.max_retries} delay=${delayMs}ms`);
           this.send({
             type: "api_retry",
             attempt: ar.attempt || 0,
             maxRetries: ar.max_retries || 0,
-            delayMs: ar.delay_ms || 0,
+            delayMs,
             errorStatus: ar.error_status || undefined,
             sessionId: this.sessionId || "",
           } as any);
@@ -5236,17 +5340,12 @@ export class ClaudeSession {
           // Forward user message UUID to app for rewind support
           // Only for real user prompts, not synthetic tool result messages
           const userMsgUuid = (message as any).uuid || undefined;
-          const isSynthetic = (message as any).isSynthetic || (message as any).tool_use_result != null;
-          if (userMsgUuid && !isSynthetic) {
+          if (userMsgUuid && isLiveClaudeUserEcho(message)) {
             this.send({
               type: "user_message_uuid",
               uuid: userMsgUuid,
               sessionId: this.sessionId || "",
             } as any);
-            // Store UUID directly on the user history entry (not as a separate entry)
-            if (this.sessionId) {
-              assignUserUuid(this.sessionId, userMsgUuid);
-            }
           }
           const apiMessage = (message as any).message;
           if (apiMessage?.content && Array.isArray(apiMessage.content)) {

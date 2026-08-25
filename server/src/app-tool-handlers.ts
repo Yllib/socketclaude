@@ -52,6 +52,7 @@ import {
   SessionMemoryKind,
   upsertSessionMemoryEntry,
 } from "./session-memory-store";
+import { browserSessionManager } from "./browser-session-manager";
 
 export interface AppToolContext {
   getSessionId(): string;
@@ -87,6 +88,90 @@ export interface McpTextResult {
   [key: string]: unknown;
   content: Array<{ type: "text"; text: string }>;
   isError?: boolean;
+}
+
+export interface BrowserSessionToolArgs {
+  action: "open" | "list" | "status" | "snapshot" | "navigate" | "click" | "type" | "key" | "scroll" | "close" | "clear";
+  profile?: string;
+  url?: string;
+  label?: string;
+  ref?: string;
+  text?: string;
+  key?: string;
+  delta_y?: number;
+}
+
+export async function handleBrowserSessionTool(
+  ctx: AppToolContext,
+  args: BrowserSessionToolArgs,
+): Promise<McpTextResult> {
+  try {
+    if (args.action === "list") {
+      return { content: [{ type: "text", text: JSON.stringify(browserSessionManager.list(), null, 2) }] };
+    }
+
+    const profile = String(args.profile || "").trim();
+    if (!profile) throw new Error("BrowserSession requires a profile for this action.");
+
+    switch (args.action) {
+      case "open": {
+        if (!args.url) throw new Error("BrowserSession open requires a URL.");
+        const session = await browserSessionManager.open(profile, args.url, args.label);
+        ctx.send({
+          type: "browser_session_open",
+          profile: session.profile,
+          label: session.label,
+          url: session.url || args.url,
+          width: 430,
+          height: 860,
+          sessionId: ctx.getSessionId(),
+        });
+        return {
+          content: [{
+            type: "text",
+            text: `Browser profile ${session.profile} is open at ${session.url || args.url}. A protected remote browser card was sent to the phone. The user must enter passwords and MFA there. Device-bound passkeys may require the site's alternate sign-in method.`,
+          }],
+        };
+      }
+      case "status":
+        return { content: [{ type: "text", text: JSON.stringify(await browserSessionManager.status(profile), null, 2) }] };
+      case "snapshot":
+        return { content: [{ type: "text", text: JSON.stringify(await browserSessionManager.snapshot(profile), null, 2) }] };
+      case "navigate":
+        if (!args.url) throw new Error("BrowserSession navigate requires a URL.");
+        await browserSessionManager.navigate(profile, args.url);
+        break;
+      case "click":
+        if (!args.ref) throw new Error("BrowserSession click requires an element ref from snapshot.");
+        await browserSessionManager.click(profile, args.ref);
+        break;
+      case "type":
+        if (!args.ref) throw new Error("BrowserSession type requires an element ref from snapshot.");
+        if (typeof args.text !== "string") throw new Error("BrowserSession type requires text.");
+        await browserSessionManager.type(profile, args.ref, args.text);
+        break;
+      case "key":
+        if (!args.key) throw new Error("BrowserSession key requires a supported key.");
+        await browserSessionManager.key(profile, args.key);
+        break;
+      case "scroll":
+        await browserSessionManager.scroll(profile, Number(args.delta_y || 0));
+        break;
+      case "close":
+        await browserSessionManager.close(profile);
+        return { content: [{ type: "text", text: `Browser profile ${profile} was closed. Its signed-in state remains saved.` }] };
+      case "clear":
+        await browserSessionManager.clear(profile);
+        return { content: [{ type: "text", text: `Browser profile ${profile} and its saved browsing state were deleted.` }] };
+    }
+
+    return { content: [{ type: "text", text: `Browser profile ${profile} accepted ${args.action}.` }] };
+  } catch (error) {
+    return {
+      content: [{ type: "text", text: error instanceof Error ? error.message : "Browser session operation failed." }],
+      isError: true,
+    };
+  }
 }
 
 export async function handlePrivateIntegrationAuthTool(

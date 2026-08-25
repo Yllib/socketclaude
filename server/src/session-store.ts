@@ -1746,6 +1746,20 @@ export function assignUserUuid(sessionId: string, uuid: string): void {
   } catch {}
 }
 
+/** Remove messages superseded by an SDK refusal fallback. */
+export function removeHistoryEntriesByUuids(sessionId: string, uuids: readonly string[]): number {
+  if (!sessionId || uuids.length === 0) return 0;
+  const removed = historyDatabase().deleteByUuids(sessionId, uuids);
+  if (removed === 0) return 0;
+  const cached = historyCache.get(sessionId);
+  if (cached) {
+    const retracted = new Set(uuids);
+    cached.entries = cached.entries.filter((entry) => !entry.uuid || !retracted.has(entry.uuid));
+  }
+  updateSessionHistoryMetadataFromDatabase(sessionId);
+  return removed;
+}
+
 /** Persist the terminal state of a user-visible interaction.
  *
  * Answers are intentionally supported only for ordinary question/elicitation

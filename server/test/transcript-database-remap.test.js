@@ -64,4 +64,48 @@ for (const disableFts of [false, true]) {
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  test(`deletes SDK-retracted UUIDs without rewriting the transcript${disableFts ? " without FTS5" : ""}`, () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "socketagent-retraction-"));
+    const database = new TranscriptDatabase(
+      path.join(dir, "transcripts.sqlite"),
+      { disableFts },
+    );
+    try {
+      database.replace("session", [
+        {
+          entry: {
+            entryId: "entry-1",
+            sessionSeq: 1,
+            revision: 1,
+            role: "assistant",
+            content: "refused partial",
+            uuid: "remove-me",
+          },
+          positionKey: "assistant:1",
+        },
+        {
+          entry: {
+            entryId: "entry-2",
+            sessionSeq: 2,
+            revision: 1,
+            role: "assistant",
+            content: "replacement",
+            uuid: "keep-me",
+          },
+          positionKey: "assistant:2",
+        },
+      ]);
+
+      assert.equal(database.deleteByUuids("session", ["remove-me"]), 1);
+      assert.equal(database.count("session"), 1);
+      assert.equal(database.getBySessionSeq("session", 1), undefined);
+      assert.equal(database.getBySessionSeq("session", 2).uuid, "keep-me");
+      assert.equal(database.search("session", { query: "refused" }).length, 0);
+      assert.equal(database.search("session", { query: "replacement" }).length, 1);
+    } finally {
+      database.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
 }

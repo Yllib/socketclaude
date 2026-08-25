@@ -44,6 +44,9 @@ export function buildSocketAgentIntegrationInstructions(options: {
     "- Explicit user request for a Work Review -> WorkReview. Do not initiate a Work Review unless the user specifically asks for one; report ordinary task completion in your normal response.",
     "- User asks to send/share/transfer a file to their phone -> SendFile with an absolute file_path.",
     "- Credential, password, key, token, cookie, or other secret needed -> RequestSecureInput. Never request secrets in normal chat. The result contains metadata and a local secret-file path, not the value.",
+    ...(options.toolNames.includes("BrowserSession")
+      ? ["- Complex website, SSO, or MFA workflow -> BrowserSession. Open a persistent isolated profile and let the user enter sensitive values in the protected phone browser. The agent may inspect and operate ordinary page controls, but must never read, request, or type passwords, recovery codes, tokens, cookies, or MFA values. Device-bound passkeys may require the site's alternate sign-in method."]
+      : []),
     "- Important immediate phone notification -> NotifyUser.",
     "- Device reminder -> ScheduleReminder.",
     "- Deferred or recurring agent work -> ScheduleTask.",

@@ -48,6 +48,34 @@ test("thread resume excludes the native turn transcript by default", async () =>
   }
 });
 
+test("sends stable client user message IDs on turns and steers", async () => {
+  const client = new CodexAppServerClient({
+    cwd: process.cwd(),
+    command: process.execPath,
+    args: ["-e", echoServer],
+    requestTimeoutMs: 1000,
+  });
+  try {
+    const turn = await client.startTurn({
+      threadId: "thread-1",
+      clientUserMessageId: "phone-message-1",
+      input: [{ type: "text", text: "hello" }],
+      model: "test-model",
+    });
+    assert.equal(turn.params.clientUserMessageId, "phone-message-1");
+
+    const steer = await client.steerTurn({
+      threadId: "thread-1",
+      expectedTurnId: "turn-1",
+      clientUserMessageId: "phone-message-2",
+      input: [{ type: "text", text: "more context" }],
+    });
+    assert.equal(steer.params.clientUserMessageId, "phone-message-2");
+  } finally {
+    await client.stop();
+  }
+});
+
 test("request timeouts retain the RPC method for poisoned-client cleanup", async () => {
   const client = new CodexAppServerClient({
     cwd: process.cwd(),

@@ -98,6 +98,7 @@ export interface CodexAppServerThreadResumeParams {
 
 export interface CodexAppServerTurnStartParams {
   threadId: string;
+  clientUserMessageId?: string | null;
   input: CodexAppServerUserInput[];
   model: string;
   cwd?: string;
@@ -107,6 +108,7 @@ export interface CodexAppServerTurnStartParams {
 
 export interface CodexAppServerTurnSteerParams {
   threadId: string;
+  clientUserMessageId?: string | null;
   expectedTurnId: string;
   input: CodexAppServerUserInput[];
   responsesapiClientMetadata?: Record<string, unknown> | null;

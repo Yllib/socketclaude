@@ -6,6 +6,7 @@ import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import {
   AppToolContext,
+  handleBrowserSessionTool,
   handleHtmlPlanTool,
   handleAgentSessionTool,
   handleMonitorTool,
@@ -57,6 +58,10 @@ export const SOCKETAGENT_APP_TOOLS: SocketAgentAppToolManifest[] = [
   {
     name: "PrivateIntegrationAuth",
     description: "Open a protected, plugin-owned sign-in card for an installed private integration.",
+  },
+  {
+    name: "BrowserSession",
+    description: "Open and control a persistent remote browser while sensitive input stays on the user's phone.",
   },
   {
     name: "Speak",
@@ -215,6 +220,25 @@ function createServer(context: AppToolContext): McpServer {
       },
     },
     async ({ integration }) => handlePrivateIntegrationAuthTool(context, integration),
+  );
+
+  server.registerTool(
+    "BrowserSession",
+    {
+      title: "Remote Browser Session",
+      description: "Open and control a persistent isolated browser profile. Normal HTTP and HTTPS redirects are allowed across domains. Use snapshots and refs for non-sensitive interaction. Never type passwords, recovery codes, tokens, or MFA values with this tool; ask the user to enter them in the protected phone browser. Device-bound passkeys may require the site's alternate sign-in method. Use clear only when the user explicitly asks to delete a saved browser profile.",
+      inputSchema: {
+        action: z.enum(["open", "list", "status", "snapshot", "navigate", "click", "type", "key", "scroll", "close", "clear"]),
+        profile: z.string().optional().describe("Stable isolated profile name, for example google-play-william"),
+        url: z.string().optional().describe("HTTP or HTTPS URL for open or navigate"),
+        label: z.string().optional().describe("User-facing profile label used when opening"),
+        ref: z.string().optional().describe("Element ref returned by snapshot"),
+        text: z.string().optional().describe("Non-sensitive text to enter. Never pass a secret here."),
+        key: z.string().optional().describe("Enter, Tab, Backspace, Escape, or Ctrl+A"),
+        delta_y: z.number().optional().describe("Vertical scroll distance in CSS pixels"),
+      },
+    },
+    async (args) => handleBrowserSessionTool(context, args),
   );
 
   server.registerTool(
@@ -425,12 +449,12 @@ function createServer(context: AppToolContext): McpServer {
       inputSchema: {
         action: z.enum(["list", "upsert", "delete"]),
         entry_id: z.string().optional().describe("Existing memory entry ID for update or delete"),
-        kind: z.enum(["active_work", "decision", "constraint", "preference", "project_fact", "open_question"]).optional(),
-        text: z.string().max(20000).optional().describe("Concise confirmed memory text for upsert"),
+        kind: z.enum(["active_work", "decision", "constraint", "preference", "project_fact", "open_question"]).optional().describe("Required for upsert"),
+        text: z.string().max(20000).optional().describe("Concise confirmed memory text. Required for upsert"),
         pinned: z.boolean().optional().describe("Keep this item at the top of rollover context"),
         status: z.enum(["active", "superseded"]).optional(),
-        source_session_seq: z.number().int().positive().optional(),
-        source_entry_id: z.string().optional(),
+        source_session_seq: z.number().int().positive().optional().describe("Optional supporting transcript sequence"),
+        source_entry_id: z.string().optional().describe("Optional supporting transcript entry ID"),
       },
     },
     async (args) => handleSessionMemoryTool(context, args as any),

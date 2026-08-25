@@ -1,12 +1,12 @@
 # Codex App Server Event Card Audit
 
-Audited against `codex app-server generate-ts` from `codex-cli 0.133.0` and
+Audited against `codex app-server generate-ts` from `codex-cli 0.149.0` and
 SocketAgent's current app/server mappings.
 
 ## Handled
 
-- `item/agentMessage/delta` -> assistant text stream.
-- `item/completed` with `agentMessage` -> persisted assistant message.
+- `item/agentMessage/delta` -> assistant text stream with phase retained.
+- `item/completed` with `agentMessage` -> persisted assistant message with phase retained.
 - `item/started` / `item/completed` with `userMessage` -> steer acknowledgement.
 - `item/reasoning/textDelta` and `item/reasoning/summaryTextDelta` -> thinking cards.
 - `item/started` / `item/completed` with `commandExecution` -> existing Bash cards.
@@ -32,15 +32,10 @@ SocketAgent's current app/server mappings.
 - `guardianWarning`, `deprecationNotice`, `windows/worldWritableWarning` -> visible error/warning card.
 - `mcpServer/startupStatus/updated` -> visible error card when startup reports an error.
 - `turn/completed` -> result/end-of-turn.
+- `serverRequest/resolved` -> retires a pending question or elicitation card.
 - `warning`, `configWarning`, `error` -> app error message.
 
 ## Still Missing Or Partial
-
-### Codex Plans
-
-- `turn/plan/updated` is handled.
-- `item/plan/delta` and `ThreadItem: plan` are still ignored.
-- The current app card is chat-local and does not persist into SocketAgent history. Codex rollout/app-server history may still contain the underlying plan data, but SocketAgent's own history restore will not recreate this card yet.
 
 ### Image Cards
 
@@ -65,7 +60,7 @@ SocketAgent's current app/server mappings.
 
 - `model/rerouted` is visible.
 - `model/verification` is still ignored.
-- `item/autoApprovalReview/started`, `item/autoApprovalReview/completed`, and `serverRequest/resolved` are not mapped to tool-card progress.
+- `item/autoApprovalReview/started` and `item/autoApprovalReview/completed` are mapped to approval-review state. `serverRequest/resolved` retires pending input UI without creating a chat card.
 
 ### Permission And Approval Surface
 
@@ -98,6 +93,5 @@ Current SocketAgent App Server mode runs with `approvalPolicy: "never"`, so most
 ## Recommended Next Pass
 
 1. Add immediate refresh hooks for session/archive/skills/account events.
-2. Persist Codex plan cards into SocketAgent history if we want them visible after resume.
-3. Add Codex MCP status sync to the existing MCP settings UI.
-4. Build approval/request UI only if we stop using `approvalPolicy: "never"` or support non-owner installs.
+2. Add Codex MCP status sync to the existing MCP settings UI.
+3. Build more approval detail only if we stop using `approvalPolicy: "never"` or support non-owner installs.

@@ -6,6 +6,9 @@ const os = require("node:os");
 const path = require("node:path");
 require("./test-data-dir");
 
+const testDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "socketagent-send-file-data-"));
+process.env.SOCKET_AGENT_DATA_DIR = testDataDir;
+
 const {
   appendHistory,
   deleteSessionArtifacts,
@@ -13,6 +16,10 @@ const {
   normalizeSendFileHistoryEntries,
 } = require("../dist/session-store");
 const { handleSendFileTool } = require("../dist/app-tool-handlers");
+
+test.after(() => {
+  fs.rmSync(testDataDir, { recursive: true, force: true });
+});
 
 test("collapses the handler-generated SendFile pair into the canonical pair", () => {
   const normalized = normalizeSendFileHistoryEntries([

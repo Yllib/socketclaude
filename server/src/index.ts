@@ -45,6 +45,7 @@ import {
   supportsMonitorOutputAcknowledgement,
 } from "./protocol";
 import { BINARY_FILE_DOWNLOAD_VERSION, BinaryFileDownloadChunkMetadata, encodeBinaryFileDownloadChunk, fileTransferPeerId, fileTransferVersion, resolveFileResumeOffset, supportsBinaryFileDownload } from "./file-transfer-wire";
+import { isSendFileDeliveryPath } from "./send-file-store";
 import { SocketAgentPlugin, PluginContext } from "./plugin-api";
 import { createPluginAnswerAcknowledgement } from "./plugin-answer";
 import { RelayClient, RelayStatus } from "./relay-client";
@@ -78,6 +79,7 @@ import { SessionEventDelivery } from "./session-event-delivery";
 import { routeMonitorOutputToSession } from "./monitor-output-route";
 import { SERVER_RELEASE_VERSION } from "./server-build-info";
 import { startPrivateIntegrationAuthorization } from "./private-integration-auth";
+import { browserSessionManager, BrowserPhoneInput } from "./browser-session-manager";
 import {
   discardSessionTransfer,
   exportSessionTransfer,
@@ -749,7 +751,7 @@ function resolveAllowedDownloadFile(inputPath: string): { resolvedPath: string; 
   if (!inputPath) throw new Error("Missing path");
   const roots = getFileManagerRoots(getDefaultCwd());
   const resolvedPath = resolveFileManagerPath(inputPath, getDefaultCwd());
-  if (!isSessionTransferPath(resolvedPath)) {
+  if (!isSessionTransferPath(resolvedPath) && !isSendFileDeliveryPath(resolvedPath)) {
     assertFileManagerPathAllowed(resolvedPath, roots);
   }
   if (!fs.existsSync(resolvedPath)) throw new Error(`File not found: ${resolvedPath}`);
@@ -5177,6 +5179,57 @@ function createConnectionHandler(
           cwd: getDefaultCwd(),
           send: (message) => sendJson(message),
         });
+        break;
+      }
+
+      case "browser_frame_request": {
+        void browserSessionManager.frame(msg.profile)
+          .then((frame) => sendJson({ type: "browser_frame", ...frame }))
+          .catch((error) => sendJson({
+            type: "browser_session_error",
+            profile: msg.profile,
+            message: error instanceof Error ? error.message : "Browser frame request failed.",
+          }));
+        break;
+      }
+
+      case "browser_session_input": {
+        void (async () => {
+          try {
+            let input: BrowserPhoneInput;
+            switch (msg.action) {
+              case "tap":
+                input = { action: "tap", x: Number(msg.x), y: Number(msg.y) };
+                break;
+              case "text":
+                input = { action: "text", text: String(msg.text || "") };
+                break;
+              case "key":
+                input = { action: "key", key: String(msg.key || "") };
+                break;
+              case "scroll":
+                input = { action: "scroll", deltaX: Number(msg.deltaX || 0), deltaY: Number(msg.deltaY || 0) };
+                break;
+              case "navigate":
+                input = { action: "navigate", url: String(msg.url || "") };
+                break;
+              case "reload":
+              case "back":
+              case "forward":
+                input = { action: msg.action };
+                break;
+            }
+            await browserSessionManager.phoneInput(msg.profile, input);
+            await new Promise<void>((resolve) => setTimeout(resolve, 180));
+            sendJson({ type: "browser_frame", ...await browserSessionManager.frame(msg.profile) });
+          } catch (error) {
+            sendJson({
+              type: "browser_session_error",
+              profile: msg.profile,
+              message: error instanceof Error ? error.message : "Browser input failed.",
+            });
+          }
+        })();
         break;
       }
 
@@ -11387,6 +11440,7 @@ for (const sig of ["SIGTERM", "SIGINT"] as const) {
         try { await plugin.cleanup(); } catch {}
       }
     }
+    await browserSessionManager.closeAll();
     process.exit(0);
   });
 }
