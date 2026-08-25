@@ -52,7 +52,11 @@ import {
   SessionMemoryKind,
   upsertSessionMemoryEntry,
 } from "./session-memory-store";
-import { browserSessionManager } from "./browser-session-manager";
+import {
+  browserSessionManager,
+  normalizeBrowserProfile,
+  normalizeBrowserUrl,
+} from "./browser-session-manager";
 
 export interface AppToolContext {
   getSessionId(): string;
@@ -167,8 +171,24 @@ export async function handleBrowserSessionTool(
 
     return { content: [{ type: "text", text: `Browser profile ${profile} accepted ${args.action}.` }] };
   } catch (error) {
+    const message = error instanceof Error ? error.message : "Browser session operation failed.";
+    if (args.action === "open"
+      && args.url
+      && /No supported Chrome, Chromium, or Edge installation was found/.test(message)) {
+      const profile = normalizeBrowserProfile(String(args.profile || ""));
+      ctx.send({
+        type: "browser_session_open",
+        profile,
+        label: String(args.label || profile).trim().slice(0, 80) || profile,
+        url: normalizeBrowserUrl(args.url),
+        width: 430,
+        height: 860,
+        sessionId: ctx.getSessionId(),
+        runtimeRequired: true,
+      });
+    }
     return {
-      content: [{ type: "text", text: error instanceof Error ? error.message : "Browser session operation failed." }],
+      content: [{ type: "text", text: message }],
       isError: true,
     };
   }

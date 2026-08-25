@@ -278,19 +278,6 @@ function Install-ServerDependenciesAndBuild {
     }
 }
 
-function Install-BrowserRuntime {
-    Write-Host "  Validating the browser runtime with a headless launch..."
-    $browserScript = Join-Path (Join-Path $SERVER_DIR "scripts") "install-browser-runtime.js"
-    $browserResult = Invoke-NativeCapture { node $browserScript }
-    $browserResult.Output | ForEach-Object { Write-Host "    $_" }
-    if ($browserResult.ExitCode -eq 0) {
-        Write-Ok "Browser runtime ready"
-    } else {
-        Write-Fail "Browser runtime installation failed."
-        throw "BrowserSession requires a working Chrome, Chromium, or Edge runtime"
-    }
-}
-
 function Show-QrCode($payload) {
     $qrScript = "const q=require('qrcode-terminal');q.generate(process.argv[1],{small:true},c=>{c.split('\n').forEach(l=>console.log('  '+l))})"
     Push-Location $SERVER_DIR
@@ -584,7 +571,6 @@ Add-DirectoryToPath $NPM_BIN_DIR $true
 Write-Phase "Phase 4: Install Dependencies & Build"
 
 Install-ServerDependenciesAndBuild
-Install-BrowserRuntime
 
 # ══════════════════════════════════════════════
 #  Phase 5: Generate Configuration
@@ -710,7 +696,6 @@ if exist "%ProgramFiles%\nodejs\npx.cmd" set "NPX_CMD=%ProgramFiles%\nodejs\npx.
 call :arm_recovery
 call :preflight >> "%LOG_FILE%" 2>&1
 if errorlevel 1 echo [startup] Preflight update failed; launching existing build. >> "%LOG_FILE%" 2>&1
-call :browser_runtime >> "%LOG_FILE%" 2>&1
 cd /d "%SERVER_DIR%"
 "%NODE_EXE%" "%SERVER_SCRIPT%" >> "%LOG_FILE%" 2>&1
 echo Server exited (%ERRORLEVEL%), restarting in 5s... >> "%LOG_FILE%" 2>&1
@@ -750,12 +735,6 @@ if errorlevel 1 exit /b 1
 call "%NPX_CMD%" tsc
 if errorlevel 1 exit /b 1
 > "%REPO_ROOT%\.last-auto-update-hash" echo %REMOTE_HASH%
-exit /b 0
-
-:browser_runtime
-cd /d "%SERVER_DIR%"
-"%NODE_EXE%" scripts\install-browser-runtime.js
-if errorlevel 1 echo [startup] Browser runtime is unavailable; BrowserSession will remain disabled.
 exit /b 0
 
 :verify_update

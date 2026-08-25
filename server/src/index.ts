@@ -79,7 +79,12 @@ import { SessionEventDelivery } from "./session-event-delivery";
 import { routeMonitorOutputToSession } from "./monitor-output-route";
 import { SERVER_RELEASE_VERSION } from "./server-build-info";
 import { startPrivateIntegrationAuthorization } from "./private-integration-auth";
-import { browserSessionManager, BrowserPhoneInput } from "./browser-session-manager";
+import {
+  browserSessionManager,
+  BrowserPhoneInput,
+  normalizeBrowserProfile,
+  normalizeBrowserUrl,
+} from "./browser-session-manager";
 import {
   discardSessionTransfer,
   exportSessionTransfer,
@@ -149,6 +154,45 @@ import {
   buildWorkReviewResultPrompt,
   deliverWorkReviewToSession,
 } from "./work-review-result-route";
+
+let browserRuntimeInstallPromise: Promise<void> | null = null;
+
+function runBrowserRuntimeInstaller(): Promise<void> {
+  const scriptPath = path.join(__dirname, "..", "scripts", "install-browser-runtime.js");
+  return new Promise<void>((resolve, reject) => {
+    const child = spawn(process.execPath, [scriptPath], {
+      cwd: path.dirname(scriptPath),
+      env: process.env,
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let output = "";
+    const capture = (chunk: Buffer): void => {
+      output = `${output}${chunk.toString("utf8")}`.slice(-4096);
+    };
+    child.stdout?.on("data", capture);
+    child.stderr?.on("data", capture);
+    child.once("error", reject);
+    child.once("close", (code) => {
+      if (code === 0) {
+        resolve();
+        return;
+      }
+      reject(new Error(output.trim() || `Browser component installer exited with code ${code ?? "unknown"}.`));
+    });
+  });
+}
+
+async function ensureBrowserRuntimeInstalled(): Promise<void> {
+  if (browserRuntimeInstallPromise) return browserRuntimeInstallPromise;
+  const pending = runBrowserRuntimeInstaller();
+  browserRuntimeInstallPromise = pending;
+  try {
+    await pending;
+  } finally {
+    if (browserRuntimeInstallPromise === pending) browserRuntimeInstallPromise = null;
+  }
+}
 
 process.on("uncaughtException", (err) => {
   console.error("[fatal-guard] Uncaught exception:", err);
@@ -5179,6 +5223,43 @@ function createConnectionHandler(
           cwd: getDefaultCwd(),
           send: (message) => sendJson(message),
         });
+        break;
+      }
+
+      case "browser_runtime_install": {
+        void (async () => {
+          let profile = String(msg.profile || "");
+          try {
+            profile = normalizeBrowserProfile(profile);
+            const url = normalizeBrowserUrl(msg.url);
+            const label = String(msg.label || profile).trim().slice(0, 80) || profile;
+            sendJson({
+              type: "browser_runtime_install_progress",
+              profile,
+              status: "running",
+              message: "Installing browser component...",
+            });
+            await ensureBrowserRuntimeInstalled();
+            await browserSessionManager.open(profile, url, label);
+            sendJson({
+              type: "browser_runtime_install_progress",
+              profile,
+              status: "ready",
+              message: "Browser component installed.",
+            });
+          } catch (error) {
+            const detail = error instanceof Error ? error.message : "Browser component installation failed.";
+            const message = process.platform === "linux"
+              ? "Install Chrome or Chromium on this computer, then try again. Linux browser packages require administrator access and are not installed from the app."
+              : detail;
+            sendJson({
+              type: "browser_runtime_install_progress",
+              profile,
+              status: "failed",
+              message,
+            });
+          }
+        })();
         break;
       }
 

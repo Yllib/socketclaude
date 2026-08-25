@@ -128,6 +128,13 @@ export interface BrowserSessionInputMessage {
   url?: string;
 }
 
+export interface BrowserRuntimeInstallMessage {
+  type: "browser_runtime_install";
+  profile: string;
+  url: string;
+  label?: string;
+}
+
 export interface SecureInputResponseMessage {
   type: "secure_input_response";
   requestId: string;
@@ -1075,6 +1082,7 @@ export type ClientMessage =
   | PrivateIntegrationAuthRequestMessage
   | BrowserFrameRequestMessage
   | BrowserSessionInputMessage
+  | BrowserRuntimeInstallMessage
   | SecureInputResponseMessage
   | SecureInputStoreMessage
   | SecretInventoryRequestMessage
@@ -2656,6 +2664,14 @@ export interface BrowserSessionOpenServerMessage {
   width: number;
   height: number;
   sessionId?: string;
+  runtimeRequired?: boolean;
+}
+
+export interface BrowserRuntimeInstallProgressServerMessage {
+  type: "browser_runtime_install_progress";
+  profile: string;
+  status: "running" | "ready" | "failed";
+  message: string;
 }
 
 export interface BrowserFrameServerMessage {
@@ -2684,6 +2700,7 @@ export type ServerMessage =
   | SecureInputRequestServerMessage
   | SecureInputSavedServerMessage
   | BrowserSessionOpenServerMessage
+  | BrowserRuntimeInstallProgressServerMessage
   | BrowserFrameServerMessage
   | BrowserSessionErrorServerMessage
   | SecretInventoryServerMessage
