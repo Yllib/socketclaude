@@ -6,6 +6,7 @@ require("./test-data-dir");
 const {
   ClaudeSession,
   claudeApiRetryDelayMs,
+  formatClaudeQueryError,
   isLiveClaudeUserEcho,
 } = require("../dist/claude-session");
 const {
@@ -35,6 +36,31 @@ test("ignores replayed Claude user echoes and uses the SDK retry delay", () => {
   assert.equal(isLiveClaudeUserEcho({ type: "user", isSynthetic: true }), false);
   assert.equal(claudeApiRetryDelayMs({ retry_delay_ms: 2750 }), 2750);
   assert.equal(claudeApiRetryDelayMs({ delay_ms: 9999 }), 0);
+});
+
+test("reports useful Claude spawn details without exposing raw arguments", () => {
+  const error = Object.assign(new Error("spawn EIO"), {
+    code: "EIO",
+    errno: -5,
+    syscall: "spawn /usr/bin/node",
+    path: "/usr/bin/node",
+    spawnargs: ["/opt/socketagent/cli.js", "--mcp-config", "private-token"],
+  });
+  const message = formatClaudeQueryError(
+    error,
+    "Unknown error starting query",
+    "/mnt/c/Users/test/project",
+    { path: "/opt/socketagent/cli.js", source: "sdk" },
+  );
+
+  assert.match(message, /Claude process failed to start: spawn EIO/);
+  assert.match(message, /code=EIO/);
+  assert.match(message, /syscall=spawn \/usr\/bin\/node/);
+  assert.match(message, /executable=\/usr\/bin\/node/);
+  assert.match(message, /claudeCli=\/opt\/socketagent\/cli\.js/);
+  assert.match(message, /cwd=\/mnt\/c\/Users\/test\/project/);
+  assert.match(message, /argumentCount=3/);
+  assert.doesNotMatch(message, /private-token/);
 });
 
 test("retracts superseded Claude messages from durable and live history", () => {

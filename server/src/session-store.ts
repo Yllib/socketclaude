@@ -1670,15 +1670,10 @@ export function backfillUserUuids(sessionId: string): void {
   _backfilledSessions.add(sessionId);
   if (getSession(sessionId)?.backend !== "claude") return;
 
-  let entries: HistoryEntry[];
-  try { entries = readHistoryEntries(sessionId, { backfillUserUuids: false }); } catch { return; }
-  if (entries.length === 0) return;
-
-  const missingIdx: number[] = [];
-  for (let i = 0; i < entries.length; i++) {
-    if (entries[i].role === "user" && !entries[i].uuid) missingIdx.push(i);
-  }
-  if (missingIdx.length === 0) return;
+  ensureHistoryDatabaseSession(sessionId);
+  const database = historyDatabase();
+  const missingEntries = database.getUsersMissingUuid(sessionId);
+  if (missingEntries.length === 0) return;
 
   const jsonlPath = findJsonlForSession(sessionId);
   if (!jsonlPath) return;
@@ -1701,32 +1696,29 @@ export function backfillUserUuids(sessionId: string): void {
   if (jsonlUsers.length === 0) return;
 
   // Don't reuse UUIDs that other history entries already claim.
-  const usedUuids = new Set<string>();
-  for (const e of entries) {
-    if (e.role === "user" && e.uuid) usedUuids.add(e.uuid);
-  }
+  const usedUuids = new Set(database.getUserUuids(sessionId));
   const available = jsonlUsers.filter(j => !usedUuids.has(j.uuid));
 
   // Match in order, but a missing entry that can't be found doesn't stop the
   // rest of the run. The cursor only advances when we consume an entry.
   let cursor = 0;
   const changedEntries: HistoryEntry[] = [];
-  for (const idx of missingIdx) {
-    const histText = entries[idx].content || "";
+  for (const entry of missingEntries) {
+    const histText = entry.content || "";
     let found = -1;
     for (let j = cursor; j < available.length; j++) {
       if (available[j].text === histText) { found = j; break; }
     }
     if (found >= 0) {
-      entries[idx].uuid = available[found].uuid;
+      entry.uuid = available[found].uuid;
       cursor = found + 1;
-      changedEntries.push(entries[idx]);
+      changedEntries.push(entry);
     }
   }
 
   if (changedEntries.length > 0) {
     appendHistoryBulk(sessionId, changedEntries);
-    console.log(`[Backfill] Restored UUIDs for ${sessionId} (${missingIdx.length} candidate entries)`);
+    console.log(`[Backfill] Restored UUIDs for ${sessionId} (${missingEntries.length} candidate entries)`);
   }
 }
 
@@ -1876,6 +1868,17 @@ export function getHistoryCount(sessionId: string): number {
   return historyDatabase().count(sessionId);
 }
 
+export function getHistorySince(sessionId: string, timestamp: string): HistoryEntry[] {
+  ensureHistoryDatabaseSession(sessionId);
+  return hydrateHistoryEntries(historyDatabase().getSinceTimestamp(sessionId, timestamp));
+}
+
+export function getRunBoundary(sessionId: string, runId: string): HistoryEntry | undefined {
+  ensureHistoryDatabaseSession(sessionId);
+  const entry = historyDatabase().getRunBoundary(sessionId, runId);
+  return entry ? hydrateHistoryEntry(entry) : undefined;
+}
+
 /** Count persisted Codex compaction boundaries without hydrating transcript rows. */
 export function getSessionCompactionCount(sessionId: string): number {
   ensureHistoryDatabaseSession(sessionId);
@@ -1963,13 +1966,13 @@ export function rememberRecentRuns(
  * Returns the suggestion string, or undefined if none exists.
  */
 export function getLastPromptSuggestion(sessionId: string): string | undefined {
-  const all = readHistoryEntries(sessionId);
-  for (let i = all.length - 1; i >= 0; i--) {
-    if (all[i].role === "prompt_suggestion") {
-      return all[i].content;
-    }
-  }
-  return undefined;
+  ensureHistoryDatabaseSession(sessionId);
+  return historyDatabase().getLatestByRole(sessionId, "prompt_suggestion")?.content;
+}
+
+export function getLastPermissionMode(sessionId: string): string | undefined {
+  ensureHistoryDatabaseSession(sessionId);
+  return historyDatabase().getLatestByRole(sessionId, "permission_mode")?.permissionMode;
 }
 
 /**
@@ -2375,12 +2378,17 @@ export function backfillClaudeTasksFromHistory(sessionId: string): any[] {
   const current = getTodos(sessionId);
   if (CLAUDE_TASK_BACKFILL_SCANNED.has(sessionId)) return current;
   CLAUDE_TASK_BACKFILL_SCANNED.add(sessionId);
-  let entries: HistoryEntry[];
-  try {
-    entries = readHistoryEntries(sessionId, { backfillUserUuids: false });
-  } catch {
-    return current;
-  }
+  ensureHistoryDatabaseSession(sessionId);
+  const database = historyDatabase();
+  const toolCalls = database.getByToolNames(sessionId, ["TaskCreate", "TaskUpdate"])
+    .filter((entry) => entry.role === "tool_call");
+  const createToolUseIds = toolCalls
+    .filter((entry) => entry.toolName === "TaskCreate" && entry.toolUseId)
+    .map((entry) => entry.toolUseId!);
+  const entries = [
+    ...toolCalls,
+    ...database.getToolResultsByUseIds(sessionId, createToolUseIds),
+  ].sort((left, right) => Number(left.sessionSeq || 0) - Number(right.sessionSeq || 0));
   const derived = deriveClaudeTasksFromHistoryEntries(entries);
 
   const existingIds = new Set(
@@ -2418,12 +2426,8 @@ export function backfillClaudeTasksFromHistory(sessionId: string): any[] {
  * Claude background work can legitimately outlive that turn.
  */
 export function settleStaleRuntimeTaskStates(sessionId: string): number {
-  let entries: HistoryEntry[];
-  try {
-    entries = readHistoryEntries(sessionId, { backfillUserUuids: false });
-  } catch {
-    return 0;
-  }
+  ensureHistoryDatabaseSession(sessionId);
+  const entries = historyDatabase().getByRole(sessionId, "task_state");
   let settled = 0;
   const changedEntries: HistoryEntry[] = [];
   const timestamp = new Date().toISOString();
@@ -2474,8 +2478,8 @@ export function getJsonlPath(sessionId: string, cwd: string): string {
 
 /** Get the timestamp of the last entry in a session's history */
 export function getLastHistoryTimestamp(sessionId: string): string {
-  const history = readHistoryEntries(sessionId);
-  return history.length > 0 ? history[history.length - 1].timestamp : "";
+  ensureHistoryDatabaseSession(sessionId);
+  return historyDatabase().summary(sessionId)?.latestTimestamp || "";
 }
 
 /**
@@ -3259,7 +3263,7 @@ const CODEX_THREAD_LIST_SOURCE_KINDS = ["cli", "vscode", "appServer", "unknown"]
 const CODEX_THREAD_LOOKUP_SOURCE_KINDS = ["cli", "exec", "vscode", "appServer", "unknown"];
 const CODEX_THREAD_LIST_LIMIT = 500;
 const SDK_SESSION_DISCOVERY_LIMIT = 2000;
-const CLAUDE_NATIVE_CWD_LIMIT = 20;
+export const CLAUDE_NATIVE_CWD_LIMIT = 100;
 const CLAUDE_NATIVE_SESSIONS_PER_CWD = 75;
 const CODEX_NATIVE_LIST_CACHE_MS = 300_000;
 
@@ -3602,7 +3606,7 @@ function claudeNativeCwdCandidates(): string[] {
     }
   } catch {}
   add(getDefaultProcessCwd());
-  return [...seen].slice(0, Math.max(CLAUDE_NATIVE_CWD_LIMIT, 2000));
+  return [...seen].slice(0, CLAUDE_NATIVE_CWD_LIMIT);
 }
 
 function mergeClaudeNativeSession(existing: SessionInfo, nativeSession: SessionInfo): SessionInfo {

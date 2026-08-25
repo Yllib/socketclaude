@@ -226,31 +226,22 @@ select_node_runtime() {
 
 select_node_runtime
 
-# Inject a message into a session's history file
+# Ask the running server to append through its in-process sequence allocator.
 # Usage: inject_history SESSION_ID ROLE CONTENT
 inject_history() {
   local session_id="$1"
   local role="$2"
   local content="$3"
-  local history_file="$HISTORY_DIR/${session_id}.json"
-  local timestamp
-  timestamp=$(date -u +"%Y-%m-%dT%H:%M:%S.000Z")
-
-  # Use node for safe JSON manipulation
-  node -e "
-    const fs = require('fs');
-    const file = '${history_file}';
-    let entries = [];
-    if (fs.existsSync(file)) {
-      try { entries = JSON.parse(fs.readFileSync(file, 'utf-8')); } catch {}
-    }
-    entries.push({
-      role: $(printf '%s' "$role" | node -e "process.stdin.resume(); let d=''; process.stdin.on('data',c=>d+=c); process.stdin.on('end',()=>process.stdout.write(JSON.stringify(d)))"),
-      content: $(printf '%s' "$content" | node -e "process.stdin.resume(); let d=''; process.stdin.on('data',c=>d+=c); process.stdin.on('end',()=>process.stdout.write(JSON.stringify(d)))"),
-      timestamp: '${timestamp}'
-    });
-    fs.writeFileSync(file, JSON.stringify(entries, null, 2), 'utf-8');
-  "
+  local payload
+  payload="$(node -e '
+    const [sessionId, role, content] = process.argv.slice(1);
+    process.stdout.write(JSON.stringify({ sessionId, role, content }));
+  ' "$session_id" "$role" "$content")"
+  curl --fail --silent --show-error --max-time 5 \
+    -H "Authorization: Bearer $AUTH_TOKEN" \
+    -H "Content-Type: application/json" \
+    --data-binary "$payload" \
+    "http://127.0.0.1:${PORT}/internal/session-history" >/dev/null
 }
 
 # Query the running server for actively running session IDs
@@ -333,8 +324,11 @@ echo ""
 echo "[1/5] Writing restart notification to history..."
 echo "$ALL_SESSIONS" | while read -r sid; do
   [[ -z "$sid" ]] && continue
-  inject_history "$sid" "assistant" "[Server restart initiated — compiling and restarting service...]"
-  echo "  Wrote to session $sid"
+  if inject_history "$sid" "assistant" "[Server restart initiated — compiling and restarting service...]"; then
+    echo "  Wrote to session $sid"
+  else
+    echo "  Warning: could not write restart notification to session $sid"
+  fi
 done
 
 # Step 2: Compile if requested
@@ -348,7 +342,7 @@ if $COMPILE; then
     echo "  Compilation failed!"
     echo "$ALL_SESSIONS" | while read -r sid; do
       [[ -z "$sid" ]] && continue
-      inject_history "$sid" "assistant" "[Server restart FAILED — TypeScript compilation error. Server was NOT restarted.]"
+      inject_history "$sid" "assistant" "[Server restart FAILED — TypeScript compilation error. Server was NOT restarted.]" || true
     done
     exit 1
   fi
@@ -373,7 +367,7 @@ if [[ -x "$RECOVERY_SCRIPT" ]]; then
     echo "  Failed to arm recovery guard; restart aborted"
     echo "$ALL_SESSIONS" | while read -r sid; do
       [[ -z "$sid" ]] && continue
-      inject_history "$sid" "assistant" "[Server restart FAILED — recovery guard could not be armed. Server was NOT restarted.]"
+      inject_history "$sid" "assistant" "[Server restart FAILED — recovery guard could not be armed. Server was NOT restarted.]" || true
     done
     exit 1
   fi
@@ -386,15 +380,6 @@ exec > "$RESTART_LOG" 2>&1
 "$SERVICE_CONTROL" restart
 echo "  Restart command sent"
 
-# Write success to history immediately after systemctl returns.
-# systemd has forked the new process but Node.js hasn't opened the port yet,
-# so this lands in history before the app reconnects and requests it.
-echo "$ALL_SESSIONS" | while read -r sid; do
-  [[ -z "$sid" ]] && continue
-  inject_history "$sid" "assistant" "[Server restart complete.]"
-  echo "  Wrote success to session $sid"
-done
-
 # Step 4: Verify server actually came back up
 echo ""
 echo "[4/5] Verifying server is up..."
@@ -405,10 +390,6 @@ while ! check_server 2>/dev/null; do
   WAITED=$((WAITED + 1))
   if [[ $WAITED -ge $MAX_WAIT ]]; then
     echo "  Server did not start within ${MAX_WAIT}s"
-    echo "$ALL_SESSIONS" | while read -r sid; do
-      [[ -z "$sid" ]] && continue
-      inject_history "$sid" "assistant" "[Server restart FAILED — service did not come back up within ${MAX_WAIT} seconds.]"
-    done
     echo ""
     echo "Check logs: socketagent logs"
     exit 1
@@ -417,6 +398,18 @@ while ! check_server 2>/dev/null; do
 done
 
 echo "  Server is up! (took ${WAITED}s)"
+
+# The new server now owns the allocator, so completion cards cannot collide
+# with transcript positions reserved by the process that was restarted.
+echo "$ALL_SESSIONS" | while read -r sid; do
+  [[ -z "$sid" ]] && continue
+  if inject_history "$sid" "assistant" "[Server restart complete.]"; then
+    echo "  Wrote success to session $sid"
+  else
+    echo "  Warning: could not write restart completion to session $sid"
+  fi
+done
+
 if [[ -n "$RECOVERY_ID" && -x "$RECOVERY_SCRIPT" ]]; then
   "$RECOVERY_SCRIPT" cancel "$RECOVERY_ID" || true
 fi

@@ -528,6 +528,62 @@ export function getClaudeExecutableInfo(): ClaudeExecutableInfo {
   return { ...CLAUDE_EXECUTABLE_INFO };
 }
 
+function errorRecord(error: unknown): Record<string, unknown> | undefined {
+  return typeof error === "object" && error !== null
+    ? error as Record<string, unknown>
+    : undefined;
+}
+
+function errorString(record: Record<string, unknown> | undefined, key: string): string | undefined {
+  const value = record?.[key];
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+/**
+ * Preserve the OS launch details that Node attaches to spawn failures. Raw
+ * arguments stay hidden because they may contain prompts or private MCP URLs.
+ */
+export function formatClaudeQueryError(
+  error: unknown,
+  fallback: string,
+  cwd: string,
+  executableInfo: ClaudeExecutableInfo = getClaudeExecutableInfo(),
+): string {
+  const record = errorRecord(error);
+  const message = error instanceof Error
+    ? error.message
+    : errorString(record, "message") || fallback;
+  const syscall = errorString(record, "syscall");
+  const spawnedExecutable = errorString(record, "path");
+  const explicitCode = errorString(record, "code");
+  const messageCode = message.match(/\b(E[A-Z0-9]+)\b/)?.[1];
+  const code = explicitCode || messageCode;
+  const isSpawnFailure = syscall?.startsWith("spawn")
+    || /^spawn\b/i.test(message)
+    || (spawnedExecutable !== undefined && code !== undefined);
+  if (!isSpawnFailure) return message;
+
+  const cliPath = executableInfo.path;
+  const runtimePath = spawnedExecutable
+    || (cliPath && isJavaScriptRuntimeFile(cliPath) ? process.execPath : cliPath);
+  const spawnArgs = record?.spawnargs;
+  const argumentCount = Array.isArray(spawnArgs) ? spawnArgs.length : undefined;
+  const details = [
+    code ? `code=${code}` : undefined,
+    syscall ? `syscall=${syscall}` : undefined,
+    runtimePath ? `executable=${runtimePath}` : undefined,
+    cliPath && cliPath !== runtimePath ? `claudeCli=${cliPath}` : undefined,
+    `source=${executableInfo.source}`,
+    `cwd=${cwd}`,
+    argumentCount !== undefined ? `argumentCount=${argumentCount}` : undefined,
+  ].filter((value): value is string => Boolean(value));
+  const explanation = code === "EIO"
+    ? "The operating system returned an input/output error while launching Claude."
+    : "The operating system could not launch Claude.";
+
+  return `Claude process failed to start: ${message}. ${explanation} Launch details: ${details.join("; ")}.`;
+}
+
 export function buildClaudeExecutableSpawn(
   args: string[],
   info: ClaudeExecutableInfo = CLAUDE_EXECUTABLE_INFO
@@ -5768,10 +5824,10 @@ export class ClaudeSession {
           sawMainAssistantText = false;
         }
       }
-    } catch (err: any) {
-      const errMsg = err.message || "Unknown error during query";
+    } catch (err: unknown) {
+      const errMsg = formatClaudeQueryError(err, "Unknown error during query", this.cwd);
       console.error("Query error:", errMsg);
-      if (err.stack) console.error(err.stack);
+      if (err instanceof Error && err.stack) console.error(err.stack);
       this._rejectPendingTurns(new Error(errMsg));
 
       // Skip if we already sent a login URL for this auth failure
@@ -5809,10 +5865,10 @@ export class ClaudeSession {
       };
       void consumeQuery();
       return initialTurnPromise;
-    } catch (err: any) {
-      const errMsg = err.message || "Unknown error starting query";
+    } catch (err: unknown) {
+      const errMsg = formatClaudeQueryError(err, "Unknown error starting query", this.cwd);
       console.error("Query setup error:", errMsg);
-      if (err.stack) console.error(err.stack);
+      if (err instanceof Error && err.stack) console.error(err.stack);
       this._leaveWarmIdle();
       this._isRunning = false;
       this._isWarmIdle = false;

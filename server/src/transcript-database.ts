@@ -478,6 +478,78 @@ export class TranscriptDatabase {
     `).all(sessionId, role) as unknown as StoredTranscriptRow[]).map(parseEntry);
   }
 
+  getLatestByRole(sessionId: string, role: string): HistoryEntry | undefined {
+    const row = this.db.prepare(`
+      SELECT * FROM transcript_entries
+      WHERE session_id = ? AND role = ?
+      ORDER BY session_seq DESC LIMIT 1
+    `).get(sessionId, role) as unknown as StoredTranscriptRow | undefined;
+    return row ? parseEntry(row) : undefined;
+  }
+
+  getByToolNames(sessionId: string, toolNames: string[]): HistoryEntry[] {
+    if (toolNames.length === 0) return [];
+    const placeholders = toolNames.map(() => "?").join(", ");
+    return (this.db.prepare(`
+      SELECT * FROM transcript_entries
+      WHERE session_id = ? AND tool_name IN (${placeholders})
+      ORDER BY session_seq
+    `).all(sessionId, ...toolNames) as unknown as StoredTranscriptRow[]).map(parseEntry);
+  }
+
+  getToolResultsByUseIds(sessionId: string, toolUseIds: string[]): HistoryEntry[] {
+    if (toolUseIds.length === 0) return [];
+    const results: HistoryEntry[] = [];
+    for (let offset = 0; offset < toolUseIds.length; offset += 500) {
+      const chunk = toolUseIds.slice(offset, offset + 500);
+      const placeholders = chunk.map(() => "?").join(", ");
+      const rows = this.db.prepare(`
+        SELECT * FROM transcript_entries
+        WHERE session_id = ? AND role = 'tool_result'
+          AND tool_use_id IN (${placeholders})
+        ORDER BY session_seq
+      `).all(sessionId, ...chunk) as unknown as StoredTranscriptRow[];
+      results.push(...rows.map(parseEntry));
+    }
+    return results.sort((left, right) => Number(left.sessionSeq || 0) - Number(right.sessionSeq || 0));
+  }
+
+  getUsersMissingUuid(sessionId: string): HistoryEntry[] {
+    return (this.db.prepare(`
+      SELECT * FROM transcript_entries
+      WHERE session_id = ? AND role = 'user'
+        AND COALESCE(json_extract(entry_json, '$.uuid'), '') = ''
+      ORDER BY session_seq
+    `).all(sessionId) as unknown as StoredTranscriptRow[]).map(parseEntry);
+  }
+
+  getUserUuids(sessionId: string): string[] {
+    return (this.db.prepare(`
+      SELECT json_extract(entry_json, '$.uuid') AS uuid
+      FROM transcript_entries
+      WHERE session_id = ? AND role = 'user'
+        AND COALESCE(json_extract(entry_json, '$.uuid'), '') != ''
+    `).all(sessionId) as unknown as Array<{ uuid: string }>).map((row) => row.uuid);
+  }
+
+  getSinceTimestamp(sessionId: string, timestamp: string): HistoryEntry[] {
+    return (this.db.prepare(`
+      SELECT * FROM transcript_entries
+      WHERE session_id = ? AND timestamp >= ?
+      ORDER BY session_seq
+    `).all(sessionId, timestamp) as unknown as StoredTranscriptRow[]).map(parseEntry);
+  }
+
+  getRunBoundary(sessionId: string, runId: string): HistoryEntry | undefined {
+    const row = this.db.prepare(`
+      SELECT * FROM transcript_entries
+      WHERE session_id = ? AND role = 'run_boundary'
+        AND json_extract(entry_json, '$.runId') = ?
+      ORDER BY session_seq DESC LIMIT 1
+    `).get(sessionId, runId) as unknown as StoredTranscriptRow | undefined;
+    return row ? parseEntry(row) : undefined;
+  }
+
   countThroughSessionSeq(sessionId: string, sessionSeq: number): number {
     const row = this.db.prepare(`
       SELECT COUNT(*) AS value FROM transcript_entries

@@ -26,7 +26,7 @@ import { execFile, execFileSync, spawn } from "child_process";
 import { WebSocketServer, WebSocket } from "ws";
 import { ClaudeSession, refreshClaudeExecutableInfo } from "./claude-session";
 import { CODEX_NATIVE_SLASH_COMMANDS, CodexSession, archiveCodexAppServerThread, clearCodexAppServerGoal, compactCodexAppServerThread, createSession, getCodexAppServerGoal, rollbackCodexAppServerThread, Session, setCodexAppServerGoal, detectAvailableBackends, getCodexAvailability, invalidateCodexAvailabilityCache, isCodexAuthError, unarchiveCodexAppServerThread } from "./codex-session";
-import { listSessions as listStoredSessions, listSessionsWithNativeBackends, getSession, saveSession, getHistory, getHistoryCount, getHistoryPage, getHistoryPageToLastPrompt, getResumeHistoryPage, deleteSession, deleteSessionArtifacts, clearSessionContext, cleanupPendingToolCalls, compactHistoryStorage, getTodos, getTaskStates, backfillClaudeTasksFromHistory, settleStaleRuntimeTaskStates, getMissedMessages, appendHistory, appendHistoryBulk, appendNativeHistorySuffix, updateSessionActivity, updateSessionAgentSettings, getSdkEvents, getSdkEventCount, markQuestionAnswered, getPersistedSecureInputRequest, markSecureInputRequestResolved, getLastHistoryTimestamp, listSdkSessions, listCodexSessions, listCodexNativeSdkSessions, readCodexRolloutHistory, readCodexRolloutAgentSettings, readCodexAppServerThreadHistory, getRecentCwds, addRecentCwd, removeRecentCwd, truncateHistoryAtMessage, getLastPromptSuggestion, listArchivesWithNativeCodex, getArchiveHistory, restoreArchive, restoreCodexNativeArchive, deleteArchive, isCodexThreadArchived, isCodexNativeArchiveTs, getCodexNativeThreadSessionInfo, getClaudeNativeSessionInfo, markSessionArchived, renameCodexNativeThread, invalidateCodexNativeListCache, findCodexRolloutFile, getJsonlPath, removeHtmlPlanHistoryEntries, updateHtmlPlanHistoryEntry, repairStoredTranscriptIdentitiesOnce } from "./session-store";
+import { listSessions as listStoredSessions, listSessionsWithNativeBackends, getSession, saveSession, getHistory, getHistoryCount, getHistorySince, getRunBoundary, getHistoryPage, getHistoryPageToLastPrompt, getResumeHistoryPage, deleteSession, deleteSessionArtifacts, clearSessionContext, cleanupPendingToolCalls, compactHistoryStorage, getTodos, getTaskStates, backfillClaudeTasksFromHistory, settleStaleRuntimeTaskStates, getMissedMessages, appendHistory, appendHistoryBulk, appendNativeHistorySuffix, updateSessionActivity, updateSessionAgentSettings, getSdkEvents, getSdkEventCount, markQuestionAnswered, getPersistedSecureInputRequest, markSecureInputRequestResolved, getLastHistoryTimestamp, listSdkSessions, listCodexSessions, listCodexNativeSdkSessions, readCodexRolloutHistory, readCodexRolloutAgentSettings, readCodexAppServerThreadHistory, getRecentCwds, addRecentCwd, removeRecentCwd, truncateHistoryAtMessage, getLastPromptSuggestion, getLastPermissionMode, listArchivesWithNativeCodex, getArchiveHistory, restoreArchive, restoreCodexNativeArchive, deleteArchive, isCodexThreadArchived, isCodexNativeArchiveTs, getCodexNativeThreadSessionInfo, getClaudeNativeSessionInfo, markSessionArchived, renameCodexNativeThread, invalidateCodexNativeListCache, findCodexRolloutFile, getJsonlPath, removeHtmlPlanHistoryEntries, updateHtmlPlanHistoryEntry, repairStoredTranscriptIdentitiesOnce } from "./session-store";
 import { listScheduledTasks, getScheduledTask, saveScheduledTask, deleteScheduledTask, getDueTasks, getNextRunTime, getScheduledTaskSessionIds, getScheduledTaskRevision, reconcileInterruptedScheduledTasks, scheduledTaskCanArchive, scheduledTaskDisplayName, scheduledTaskPriorRunContext, scheduledTaskUsesAutomaticNotifications, setScheduledTaskArchiveState, setScheduledTaskReadState, ScheduledTask } from "./scheduled-task-store";
 import {
   AgentEffort,
@@ -1348,7 +1348,6 @@ function beginLogicalRun(
   const sessionId = session.getSessionId() || fallbackSessionId;
   if (sessionId && getSession(sessionId)) {
     const startedAt = new Date().toISOString();
-    backfillSessionRunStats(sessionId, listDelegatedAgents(sessionId));
     const current = getSessionRunStats(sessionId)?.current;
     if (
       current
@@ -1356,7 +1355,7 @@ function beginLogicalRun(
       && !delegatedWorkOutstanding(sessionId, current.startedAt)
     ) {
       const repaired = inferStaleRunCompletion(
-        getHistory(sessionId),
+        getHistorySince(sessionId, current.startedAt),
         current.startedAt,
       );
       finishLogicalRunNow(
@@ -1402,9 +1401,7 @@ function finishLogicalRunNow(
   const runStats = finishSessionRun(sessionId, outcome, options.finishedAt);
   logicalRunSessionIds.delete(sessionId);
   if (!runId || !runStats) return;
-  const boundary = [...getHistory(sessionId)].reverse().find((entry) =>
-    entry.role === "run_boundary" && entry.runId === runId,
-  );
+  const boundary = getRunBoundary(sessionId, runId);
   if (!boundary) return;
   broadcastHeadlessSessionMessage(JSON.stringify({
     type: "session_run_completed",
@@ -1491,11 +1488,30 @@ interface SessionClient {
   setActiveSession: (s: Session) => void;
 }
 const sessionClients = new Map<string, SessionClient>();
+let lastNativeSessionSnapshot: SessionInfo[] | null = null;
+let nativeSessionRefreshPromise: Promise<void> | null = null;
 
-/** Enrich stored/native sessions with live data from active sessions */
-async function getEnrichedSessions(): Promise<SessionInfo[]> {
-  const sessions = await listSessionsWithNativeBackends();
-  const byId = new Map(sessions.map((s) => [s.id, s]));
+function immediateSessionListBase(): SessionInfo[] {
+  const stored = listStoredSessions();
+  if (!lastNativeSessionSnapshot) return stored;
+  const byId = new Map(lastNativeSessionSnapshot.map((session) => [session.id, { ...session }]));
+  for (const session of stored) {
+    const native = byId.get(session.id);
+    byId.set(session.id, native ? {
+      ...native,
+      ...session,
+      title: session.title && session.title !== "Untitled" ? session.title : native.title,
+      messagePreview: session.messagePreview || native.messagePreview,
+    } : session);
+  }
+  return [...byId.values()].sort(
+    (left, right) => new Date(right.lastActive).getTime() - new Date(left.lastActive).getTime(),
+  );
+}
+
+/** Enrich stored/native sessions with live data from active sessions. */
+function enrichSessions(sessions: SessionInfo[]): SessionInfo[] {
+  const byId = new Map(sessions.map((session) => [session.id, { ...session }]));
   for (const sid of activeSessions.keys()) {
     if (!byId.has(sid)) {
       const stored = getSession(sid);
@@ -1559,28 +1575,48 @@ async function getEnrichedSessions(): Promise<SessionInfo[]> {
     });
 }
 
+function immediateEnrichedSessions(): SessionInfo[] {
+  return enrichSessions(immediateSessionListBase());
+}
+
+function sendSessionListBroadcast(enriched: SessionInfo[], reason: string, startedAt = Date.now()): void {
+  const stringifyStartedAt = Date.now();
+  const msg = JSON.stringify({ type: "session_list", sessions: enriched });
+  logSlowWs("ws_send_session_list_stringify", stringifyStartedAt, {
+    reason,
+    count: enriched.length,
+    bytes: Buffer.byteLength(msg),
+  });
+  for (const client of connectedClients) {
+    if (client.readyState === WebSocket.OPEN) client.send(msg);
+  }
+  if (relayConnectionHandler) relayConnectionHandler.sendRaw(msg);
+  logSlowWs("ws_send_session_list", startedAt, { reason, count: enriched.length });
+}
+
+function refreshNativeSessionListInBackground(reason: string): void {
+  if (nativeSessionRefreshPromise) return;
+  nativeSessionRefreshPromise = listSessionsWithNativeBackends()
+    .then((sessions) => {
+      lastNativeSessionSnapshot = sessions.map((session) => ({ ...session }));
+      sendSessionListBroadcast(enrichSessions(sessions), `${reason}:native`);
+    })
+    .catch((error: unknown) => {
+      console.warn(
+        `[Sessions] native refresh failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    })
+    .finally(() => {
+      nativeSessionRefreshPromise = null;
+    });
+}
+
 /** Broadcast current session list to all connected clients immediately. */
 async function broadcastSessionListNow(reason = "manual"): Promise<void> {
   const startedAt = Date.now();
   try {
-    const enriched = await getEnrichedSessions();
-    const stringifyStartedAt = Date.now();
-    const msg = JSON.stringify({ type: "session_list", sessions: enriched });
-    logSlowWs("ws_send_session_list_stringify", stringifyStartedAt, {
-      reason,
-      count: enriched.length,
-      bytes: Buffer.byteLength(msg),
-    });
-    for (const client of connectedClients) {
-      if (client.readyState === WebSocket.OPEN) {
-        client.send(msg);
-      }
-    }
-    // Also send to relay client if paired
-    if (relayConnectionHandler) {
-      relayConnectionHandler.sendRaw(msg);
-    }
-    logSlowWs("ws_send_session_list", startedAt, { reason, count: enriched.length });
+    sendSessionListBroadcast(immediateEnrichedSessions(), reason, startedAt);
+    refreshNativeSessionListInBackground(reason);
   } catch (err: any) {
     console.warn(`[Sessions] failed to broadcast session list: ${err?.message || err}`);
   }
@@ -3351,11 +3387,8 @@ function normalizeCodexPermissionMode(mode: unknown): string | null {
 
 async function restorePersistedPermissionMode(session: Session, sessionInfo?: SessionInfo): Promise<void> {
   if (sessionInfo?.backend !== "codex") return;
-  const historyMode = sessionInfo.id
-    ? [...getHistory(sessionInfo.id)]
-        .reverse()
-        .find((entry) => entry.role === "permission_mode")
-        ?.permissionMode
+  const historyMode = sessionInfo.id && !sessionInfo.permissionMode
+    ? getLastPermissionMode(sessionInfo.id)
     : undefined;
   const mode = normalizeCodexPermissionMode(sessionInfo.permissionMode || historyMode);
   if (mode) {
@@ -4547,12 +4580,6 @@ function createConnectionHandler(
           }
           backfillClaudeTasksFromHistory(msg.sessionId);
         }
-        if (getHistoryCount(msg.sessionId) > 0) {
-          backfillSessionRunStats(
-            msg.sessionId,
-            listDelegatedAgents(msg.sessionId),
-          );
-        }
         const rawKnownSeq = Number((msg as any).knownSessionSeq);
         const rawKnownOffset = Number((msg as any).knownHistoryOffset);
         const rawKnownEntryCount = Number((msg as any).knownHistoryEntryCount);
@@ -5317,8 +5344,9 @@ function createConnectionHandler(
       case "list_sessions": {
         sendJson({
           type: "session_list",
-          sessions: await getEnrichedSessions(),
+          sessions: immediateEnrichedSessions(),
         });
+        refreshNativeSessionListInBackground("list_sessions");
         break;
       }
 
@@ -8816,6 +8844,69 @@ const httpServer = http.createServer((req, res) => {
           error: { code: -32603, message: "Internal MCP server error" },
           id: null,
         }));
+      }
+    });
+    return;
+  }
+
+  // Restart lifecycle cards must be appended by the live server process.
+  // A second process has its own transcript sequence allocator and can race a
+  // live agent event for the same SQLite primary key.
+  if (req.method === "POST" && req.url?.startsWith("/internal/session-history")) {
+    const remoteAddress = req.socket.remoteAddress || "";
+    const isLoopback = remoteAddress === "127.0.0.1"
+      || remoteAddress === "::1"
+      || remoteAddress === "::ffff:127.0.0.1";
+    const url = new URL(req.url, `http://localhost:${PORT}`);
+    const token = getBearerToken(req) || url.searchParams.get("token");
+    if (!isLoopback || token !== AUTH_TOKEN) {
+      res.writeHead(401);
+      res.end("Unauthorized");
+      return;
+    }
+
+    let body = "";
+    let bodyTooLarge = false;
+    req.on("data", (chunk: Buffer) => {
+      if (bodyTooLarge) return;
+      body += chunk.toString();
+      if (Buffer.byteLength(body) > 16 * 1024) bodyTooLarge = true;
+    });
+    req.on("end", () => {
+      try {
+        if (bodyTooLarge) {
+          res.writeHead(413);
+          res.end("Request too large");
+          return;
+        }
+        const parsed = JSON.parse(body || "{}");
+        const sessionId = typeof parsed.sessionId === "string" ? parsed.sessionId.trim() : "";
+        const content = typeof parsed.content === "string" ? parsed.content.trim() : "";
+        if (!sessionId || parsed.role !== "assistant" || !content || content.length > 4096) {
+          res.writeHead(400);
+          res.end("Invalid session history event");
+          return;
+        }
+        if (!getSession(sessionId)) {
+          res.writeHead(404);
+          res.end("Session not found");
+          return;
+        }
+        const entry = appendHistory(sessionId, {
+          role: "assistant",
+          content,
+          timestamp: new Date().toISOString(),
+        });
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          ok: true,
+          entryId: entry.entryId,
+          sessionSeq: entry.sessionSeq,
+          revision: entry.revision,
+        }));
+      } catch (error: unknown) {
+        res.writeHead(400);
+        res.end(error instanceof Error ? error.message : "Invalid request");
       }
     });
     return;
