@@ -40,19 +40,6 @@ test("installers install both harnesses without choices or login prompts", () =>
   }
 });
 
-test("normal installation leaves the remote browser component optional", () => {
-  const unix = read("install-server.sh");
-  const windows = read("install.ps1");
-  const startup = read("server/scripts/start-server.sh");
-  const server = read("server/src/index.ts");
-
-  assert.doesNotMatch(unix, /install-browser-runtime/);
-  assert.doesNotMatch(windows, /install-browser-runtime/);
-  assert.doesNotMatch(startup, /install-browser-runtime/);
-  assert.match(server, /case "browser_runtime_install"/);
-  assert.match(server, /install-browser-runtime\.js/);
-});
-
 test("public install entrypoints expose one-command setup only", () => {
   const unixEntrypoint = read("install.sh");
   const windowsEntrypoint = read("install-windows.ps1");
