@@ -26,7 +26,7 @@ import { execFile, execFileSync, spawn } from "child_process";
 import { WebSocketServer, WebSocket } from "ws";
 import { ClaudeSession, refreshClaudeExecutableInfo } from "./claude-session";
 import { CODEX_NATIVE_SLASH_COMMANDS, CodexSession, archiveCodexAppServerThread, clearCodexAppServerGoal, compactCodexAppServerThread, createSession, getCodexAppServerGoal, rollbackCodexAppServerThread, Session, setCodexAppServerGoal, detectAvailableBackends, getCodexAvailability, invalidateCodexAvailabilityCache, isCodexAuthError, unarchiveCodexAppServerThread } from "./codex-session";
-import { listSessions as listStoredSessions, listSessionsWithNativeBackends, getSession, saveSession, getHistory, getHistoryCount, getHistorySince, getRunBoundary, getHistoryPage, getHistoryPageToLastPrompt, getResumeHistoryPage, deleteSession, deleteSessionArtifacts, clearSessionContext, cleanupPendingToolCalls, compactHistoryStorage, getTodos, getTaskStates, backfillClaudeTasksFromHistory, settleStaleRuntimeTaskStates, getMissedMessages, appendHistory, appendHistoryBulk, appendNativeHistorySuffix, updateSessionActivity, updateSessionAgentSettings, getSdkEvents, getSdkEventCount, markQuestionAnswered, getPersistedSecureInputRequest, markSecureInputRequestResolved, getLastHistoryTimestamp, listSdkSessions, listCodexSessions, listCodexNativeSdkSessions, readCodexRolloutHistory, readCodexRolloutAgentSettings, readCodexAppServerThreadHistory, getRecentCwds, addRecentCwd, removeRecentCwd, truncateHistoryAtMessage, getLastPromptSuggestion, getLastPermissionMode, listArchivesWithNativeCodex, getArchiveHistory, restoreArchive, restoreCodexNativeArchive, deleteArchive, isCodexThreadArchived, isCodexNativeArchiveTs, getCodexNativeThreadSessionInfo, getClaudeNativeSessionInfo, markSessionArchived, renameCodexNativeThread, invalidateCodexNativeListCache, findCodexRolloutFile, getJsonlPath, removeHtmlPlanHistoryEntries, updateHtmlPlanHistoryEntry, repairStoredTranscriptIdentitiesOnce } from "./session-store";
+import { listSessions as listStoredSessions, listSessionsWithNativeBackends, getSession, saveSession, getHistory, getHistoryCount, getLastHistorySessionSeq, getHistorySince, getRunBoundary, getHistoryPage, getHistoryPageToLastPrompt, getResumeHistoryPage, getCompletionTranscriptTarget, getHistoryEntryByToolUseId, getWorkReviewHistoryEntry, hasPersistedUserContentPrefix, hasPersistedUserMessage, rememberListHistory, deleteSession, deleteSessionArtifacts, clearSessionContext, cleanupPendingToolCalls, compactHistoryStorage, getTodos, getTaskStates, backfillClaudeTasksFromHistory, settleStaleRuntimeTaskStates, getMissedMessages, appendHistory, appendHistoryBulk, appendNativeHistorySuffix, updateSessionActivity, updateSessionAgentSettings, getSdkEvents, getSdkEventCount, markQuestionAnswered, getPersistedSecureInputRequest, markSecureInputRequestResolved, getLastHistoryTimestamp, listSdkSessions, listCodexSessions, listCodexNativeSdkSessions, readCodexRolloutHistory, readCodexRolloutAgentSettings, readCodexAppServerThreadHistory, getRecentCwds, addRecentCwd, removeRecentCwd, truncateHistoryAtMessage, getLastPromptSuggestion, getLastPermissionMode, listArchivesWithNativeCodex, getArchiveHistory, restoreArchive, restoreCodexNativeArchive, deleteArchive, isCodexThreadArchived, isCodexNativeArchiveTs, getCodexNativeThreadSessionInfo, getClaudeNativeSessionInfo, markSessionArchived, renameCodexNativeThread, invalidateCodexNativeListCache, findCodexRolloutFile, getJsonlPath, removeHtmlPlanHistoryEntries, updateHtmlPlanHistoryEntry, repairStoredTranscriptIdentitiesOnce } from "./session-store";
 import { listScheduledTasks, getScheduledTask, saveScheduledTask, deleteScheduledTask, getDueTasks, getNextRunTime, getScheduledTaskSessionIds, getScheduledTaskRevision, reconcileInterruptedScheduledTasks, scheduledTaskCanArchive, scheduledTaskDisplayName, scheduledTaskPriorRunContext, scheduledTaskUsesAutomaticNotifications, setScheduledTaskArchiveState, setScheduledTaskReadState, ScheduledTask } from "./scheduled-task-store";
 import {
   AgentEffort,
@@ -54,7 +54,7 @@ import { listSkills, getSkill, saveSkill, deleteSkill, listMarketplacePlugins, r
 import { handleCodexAppMcpRequest, isCodexAppMcpRequest } from "./codex-app-mcp";
 import { clearBackendHealthOverride, getAdvertisedServerSettings, getClaudeAutoCompactWindow, getDefaultCwd, getServerSystemPrompt, invalidateBackendHealthCache, invalidateCodexDriverAvailabilityCache, isServerSystemPromptInitialized, markBackendAuthRequired, normalizeClaudeAutoCompactWindow, setClaudeAutoCompactWindow, setDefaultCwd, setServerSystemPrompt } from "./server-settings";
 import { isPushConfigured, isPushTokenRegistered, registerPushToken, sendPushNotification, shouldSendForwardedPush, unregisterPushToken } from "./push-notifications";
-import { completionTranscriptTarget, SessionPushRunTracker, sessionPushEventId } from "./session-push-state";
+import { SessionPushRunTracker, sessionPushEventId } from "./session-push-state";
 import { assertFileManagerPathAllowed, getFileManagerRoots, listFileManagerDirectory, readDirectoryEntries, resolveFileManagerPath, statFileManagerPath, writeFileManagerText } from "./file-manager";
 import { checkMacosFileAccess, isMacosProtectedUserPath, macosPrivacyErrorDetails, performMacosPermissionAction } from "./macos-permissions";
 import { readProtectedFiles, removeMatchingProtection, setProtectedFile, writeProtectedFiles } from "./protected-files";
@@ -1114,9 +1114,7 @@ function rememberAcceptedPromptSubmission(messageId: string, sessionId: string):
 function persistedPromptSubmission(sessionId: string, messageId: string): boolean {
   if (!sessionId || !messageId) return false;
   try {
-    return getHistory(sessionId).some(
-      (entry) => entry.role === "user" && entry.uuid === messageId,
-    );
+    return hasPersistedUserMessage(sessionId, messageId);
   } catch (error: any) {
     console.warn(
       `[Prompt] Could not check persisted submission ${messageId} for ${sessionId}:`
@@ -1848,7 +1846,7 @@ function sessionCompletionTranscriptData(
   sessionId: string,
   notBefore?: string,
 ): Record<string, string | number> {
-  return completionTranscriptTarget(getHistory(sessionId), notBefore);
+  return getCompletionTranscriptTarget(sessionId, notBefore);
 }
 
 const sessionPushRuns = new SessionPushRunTracker<Session>();
@@ -2086,9 +2084,9 @@ function workReviewClientPayload(
   requestId?: string,
 ): Record<string, any> {
   const { currentDraft, ...review } = snapshot;
-  const cardEntry = getHistory(String(snapshot.originSessionId || "")).find(
-    (entry) => entry.role === "work_review"
-      && String(entry.reviewId || "") === String(snapshot.reviewId || ""),
+  const cardEntry = getWorkReviewHistoryEntry(
+    String(snapshot.originSessionId || ""),
+    String(snapshot.reviewId || ""),
   );
   return {
     type: "work_review_snapshot",
@@ -2429,11 +2427,8 @@ function isDelegatedAgentFinalReply(entry: ReturnType<typeof getHistory>[number]
 }
 
 function delegatedAgentResult(sessionId: string, startedAt: string): string {
-  const entries = getHistory(sessionId);
-  const started = new Date(startedAt).getTime();
-  const reply = [...entries].reverse().find((entry) =>
+  const reply = getHistorySince(sessionId, startedAt).reverse().find((entry) =>
     isDelegatedAgentFinalReply(entry)
-    && new Date(entry.timestamp).getTime() >= started,
   );
   const result = reply?.content.trim() || getSession(sessionId)?.messagePreview?.trim() || "";
   if (!result) return "The delegated turn completed without a final text response.";
@@ -2498,8 +2493,10 @@ function delegatedReportPrompt(record: DelegatedAgentRecord, run: DelegatedAgent
     ? fullResult
     : `${fullResult.slice(0, 5_970)}\n[preview clipped]`;
   const resultToolUseId = delegatedAgentResultToolUseId(record, run);
-  const resultEntry = getHistory(record.supervisorSessionId).find((entry) =>
-    entry.role === "tool_result" && entry.toolUseId === resultToolUseId,
+  const resultEntry = getHistoryEntryByToolUseId(
+    record.supervisorSessionId,
+    "tool_result",
+    resultToolUseId,
   );
   return [
     `<socketagent_delegation_report delegation_id="${record.delegationId}" run_id="${run.runId}">`,
@@ -2517,9 +2514,7 @@ function delegatedReportPrompt(record: DelegatedAgentRecord, run: DelegatedAgent
 
 function delegatedReportAlreadyPersisted(record: DelegatedAgentRecord, run: DelegatedAgentRun): boolean {
   const marker = `<socketagent_delegation_report delegation_id="${record.delegationId}" run_id="${run.runId}">`;
-  return getHistory(record.supervisorSessionId).some((entry) =>
-    entry.role === "user" && entry.content.startsWith(marker),
-  );
+  return hasPersistedUserContentPrefix(record.supervisorSessionId, marker);
 }
 
 function publishDelegatedAgentResultCard(
@@ -2528,14 +2523,15 @@ function publishDelegatedAgentResultCard(
 ): void {
   const sessionId = record.supervisorSessionId;
   const toolUseId = delegatedAgentResultToolUseId(record, run);
-  const existing = getHistory(sessionId);
-  const existingCall = existing.find((entry) =>
-    entry.role === "tool_call"
-    && entry.toolUseId === toolUseId
-    && entry.toolName === "DelegatedAgentResult",
+  const existingCall = getHistoryEntryByToolUseId(
+    sessionId,
+    "tool_call",
+    toolUseId,
   );
-  const existingResult = existing.find((entry) =>
-    entry.role === "tool_result" && entry.toolUseId === toolUseId,
+  const existingResult = getHistoryEntryByToolUseId(
+    sessionId,
+    "tool_result",
+    toolUseId,
   );
   if (existingCall && existingResult) return;
 
@@ -3010,18 +3006,13 @@ function delegatedAgentTail(
     throw new Error("limit must be a positive integer");
   }
   const limit = Math.min(requestedLimit, 50);
-  const history = getHistory(sessionId)
-    .filter((entry) =>
-      Number.isSafeInteger(entry.sessionSeq) && Number(entry.sessionSeq) > 0,
-    )
-    .sort((left, right) => Number(left.sessionSeq) - Number(right.sessionSeq));
-  const latestSessionSeq = Number(history.at(-1)?.sessionSeq || 0);
-  const candidates = after === undefined
-    ? history.slice(-limit)
-    : history.filter((entry) => Number(entry.sessionSeq) > after);
-  const selected = after === undefined
-    ? candidates
-    : candidates.slice(0, limit);
+  const latestSessionSeq = getLastHistorySessionSeq(sessionId);
+  const selected = rememberListHistory(sessionId, {
+    ...(after !== undefined ? { sessionSeq: after, direction: "after" } : {}),
+    limit,
+  }).filter((entry) =>
+    Number.isSafeInteger(entry.sessionSeq) && Number(entry.sessionSeq) > 0,
+  );
   const entries = selected.map(delegatedTailEntry);
   const nextSessionSeq = entries.at(-1)?.session_seq
     ?? after
@@ -3261,9 +3252,8 @@ async function syncCodexNativeHistory(sessionInfo: SessionInfo): Promise<any[]> 
   if (sessionInfo.backend !== "codex") return [];
   const rolloutAdded = syncCodexRolloutHistory(sessionInfo);
   if (rolloutAdded.length > 0) return rolloutAdded;
-  const localHistory = getHistory(sessionInfo.id);
   let appServerHistory: any[] = [];
-  if (localHistory.length === 0) {
+  if (getHistoryCount(sessionInfo.id) === 0) {
     appServerHistory = await readCodexAppServerThreadHistory(sessionInfo.id);
   }
   const added = appendNativeHistorySuffix(sessionInfo.id, appServerHistory);

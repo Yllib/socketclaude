@@ -11,10 +11,58 @@ const {
   deleteSessionArtifacts,
   getBoundedHistoryDelta,
   getBoundedHistoryTail,
+  getCompletionTranscriptTarget,
   getHistory,
+  getHistoryPageToLastPrompt,
   getResumeHistoryPage,
+  hasPersistedUserMessage,
   positionSessionMessage,
 } = require("../dist/session-store");
+
+test("uses indexed transcript lookups for prompt deduplication and completion targets", () => {
+  const sessionId = `test-transcript-targets-${randomUUID()}`;
+  try {
+    const first = appendHistory(sessionId, {
+      role: "user",
+      content: "first prompt",
+      uuid: "message-uuid",
+      timestamp: "2026-08-25T10:00:00.000Z",
+    });
+    appendHistory(sessionId, {
+      role: "assistant",
+      content: "old answer",
+      timestamp: "2026-08-25T10:00:30.000Z",
+    });
+    const latest = appendHistory(sessionId, {
+      role: "assistant",
+      content: "new answer",
+      timestamp: "2026-08-25T10:01:30.000Z",
+    });
+
+    assert.equal(hasPersistedUserMessage(sessionId, "message-uuid"), true);
+    assert.equal(hasPersistedUserMessage(sessionId, "missing"), false);
+    assert.deepEqual(
+      getCompletionTranscriptTarget(sessionId, "2026-08-25T10:01:00.000Z"),
+      {
+        targetEntryId: latest.entryId,
+        targetSessionSeq: latest.sessionSeq,
+      },
+    );
+    assert.deepEqual(
+      getCompletionTranscriptTarget(sessionId, "2026-08-25T10:02:00.000Z"),
+      {},
+    );
+
+    const page = getHistoryPageToLastPrompt(sessionId, 1);
+    assert.equal(page.offset, Number(first.sessionSeq) - 1);
+    assert.deepEqual(
+      page.entries.map((entry) => entry.content),
+      ["first prompt", "old answer", "new answer"],
+    );
+  } finally {
+    deleteSessionArtifacts(sessionId);
+  }
+});
 
 test("corrupt retained JSON cannot roll durable SQLite history backward", () => {
   const sessionId = `test-history-recovery-${randomUUID()}`;

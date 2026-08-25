@@ -14,6 +14,7 @@ import { remapHtmlPlans } from "./html-plan-store";
 import { createInteractiveRequestId } from "./interactive-request-id";
 import { repairTranscriptIdentityCollisions, sameLogicalTranscriptEntry } from "./transcript-repair";
 import { deleteSendFileDelivery } from "./send-file-store";
+import { ByteBoundedLru } from "./byte-bounded-lru";
 import {
   TranscriptDatabase,
   type TranscriptLegacyFingerprint,
@@ -31,9 +32,19 @@ const TRANSCRIPT_IDENTITY_REPAIR_MARKER = path.join(STORE_DIR, ".transcript-iden
 const HISTORY_IO_WARN_MS = Number(process.env.SOCKETAGENT_HISTORY_IO_WARN_MS || 500);
 const HISTORY_PAGE_WARN_MS = Number(process.env.SOCKETAGENT_HISTORY_PAGE_WARN_MS || 250);
 const SESSION_LIST_WARN_MS = Number(process.env.SOCKETAGENT_SESSION_LIST_WARN_MS || 500);
+const configuredSessionStoreFlushMs = Number(process.env.SOCKETAGENT_SESSION_STORE_FLUSH_MS);
+const SESSION_STORE_FLUSH_MS = Number.isFinite(configuredSessionStoreFlushMs)
+  && configuredSessionStoreFlushMs >= 0
+  ? configuredSessionStoreFlushMs
+  : 100;
 const TOOL_OUTPUT_BLOB_THRESHOLD = Number(process.env.SOCKETAGENT_TOOL_OUTPUT_BLOB_THRESHOLD || 8 * 1024);
 const TOOL_OUTPUT_PREVIEW_CHARS = Number(process.env.SOCKETAGENT_TOOL_OUTPUT_PREVIEW_CHARS || 1024);
 const HISTORY_COMPACT_MIN_BYTES = Number(process.env.SOCKETAGENT_HISTORY_COMPACT_MIN_BYTES || 8 * 1024 * 1024);
+const configuredHistoryCacheMaxBytes = Number(process.env.SOCKETAGENT_HISTORY_CACHE_MAX_BYTES);
+const HISTORY_CACHE_MAX_BYTES = Number.isFinite(configuredHistoryCacheMaxBytes)
+  && configuredHistoryCacheMaxBytes >= 0
+  ? configuredHistoryCacheMaxBytes
+  : 64 * 1024 * 1024;
 const configuredToolImageCacheTtl = Number(process.env.SOCKETAGENT_TOOL_IMAGE_CACHE_TTL_MS);
 const TOOL_IMAGE_CACHE_TTL_MS = Math.max(
   30 * 60 * 1000,
@@ -124,19 +135,99 @@ function ensureStoreDir(): void {
   }
 }
 
-function readStore(): SessionInfo[] {
-  ensureStoreDir();
-  if (!fs.existsSync(STORE_FILE)) {
-    return [];
-  }
-  const raw = fs.readFileSync(STORE_FILE, "utf-8");
-  return JSON.parse(raw) as SessionInfo[];
+let sessionStoreCache: SessionInfo[] | undefined;
+let pendingSessionStoreSnapshot: SessionInfo[] | undefined;
+let sessionStoreFlushTimer: ReturnType<typeof setTimeout> | undefined;
+
+function cloneSessions(sessions: SessionInfo[]): SessionInfo[] {
+  return structuredClone(sessions);
 }
 
-function writeStore(sessions: SessionInfo[]): void {
+function loadSessionStore(): SessionInfo[] {
+  if (sessionStoreCache) return sessionStoreCache;
   ensureStoreDir();
-  fs.writeFileSync(STORE_FILE, JSON.stringify(sessions, null, 2), "utf-8");
+  if (!fs.existsSync(STORE_FILE)) {
+    sessionStoreCache = [];
+    return sessionStoreCache;
+  }
+  const raw = fs.readFileSync(STORE_FILE, "utf-8");
+  sessionStoreCache = JSON.parse(raw) as SessionInfo[];
+  return sessionStoreCache;
 }
+
+function readStore(): SessionInfo[] {
+  return cloneSessions(loadSessionStore());
+}
+
+export function flushSessionStore(): void {
+  if (!pendingSessionStoreSnapshot) return;
+  ensureStoreDir();
+  const snapshot = pendingSessionStoreSnapshot;
+  const serialized = JSON.stringify(snapshot, null, 2);
+  if (process.platform === "win32") {
+    fs.writeFileSync(STORE_FILE, serialized, { encoding: "utf8", mode: 0o600 });
+  } else {
+    const temporary = `${STORE_FILE}.${process.pid}.tmp`;
+    fs.writeFileSync(temporary, serialized, { encoding: "utf8", mode: 0o600 });
+    fs.renameSync(temporary, STORE_FILE);
+  }
+  pendingSessionStoreSnapshot = undefined;
+}
+
+function scheduleSessionStoreFlush(delayMs = SESSION_STORE_FLUSH_MS): void {
+  if (sessionStoreFlushTimer) return;
+  sessionStoreFlushTimer = setTimeout(() => {
+    sessionStoreFlushTimer = undefined;
+    try {
+      flushSessionStore();
+    } catch (error) {
+      console.error(`[SessionStore] Deferred metadata flush failed: ${error}`);
+      scheduleSessionStoreFlush(1_000);
+    }
+  }, delayMs);
+  sessionStoreFlushTimer.unref?.();
+}
+
+function writeStore(
+  sessions: SessionInfo[],
+  mode: "immediate" | "coalesced" = "immediate",
+): void {
+  sessionStoreCache = cloneSessions(sessions);
+  pendingSessionStoreSnapshot = sessionStoreCache;
+  if (mode === "coalesced") {
+    scheduleSessionStoreFlush();
+    return;
+  }
+  if (sessionStoreFlushTimer) {
+    clearTimeout(sessionStoreFlushTimer);
+    sessionStoreFlushTimer = undefined;
+  }
+  flushSessionStore();
+}
+
+function mutateSessionStore(
+  sessionId: string,
+  mutate: (session: SessionInfo) => void,
+  mode: "immediate" | "coalesced" = "immediate",
+): boolean {
+  const sessions = loadSessionStore();
+  const session = sessions.find((entry) => entry.id === sessionId);
+  if (!session) return false;
+  mutate(session);
+  pendingSessionStoreSnapshot = sessions;
+  if (mode === "coalesced") {
+    scheduleSessionStoreFlush();
+  } else {
+    if (sessionStoreFlushTimer) {
+      clearTimeout(sessionStoreFlushTimer);
+      sessionStoreFlushTimer = undefined;
+    }
+    flushSessionStore();
+  }
+  return true;
+}
+
+process.on("exit", flushSessionStore);
 
 export function listSessions(): SessionInfo[] {
   return readStore().sort(
@@ -156,7 +247,8 @@ export function saveSession(session: SessionInfo): void {
 }
 
 export function getSession(id: string): SessionInfo | undefined {
-  return readStore().find((s) => s.id === id);
+  const session = loadSessionStore().find((entry) => entry.id === id);
+  return session ? structuredClone(session) : undefined;
 }
 
 export function updateSessionAgentSettings(id: string, patch: Partial<AgentSessionSettings>): void {
@@ -452,26 +544,20 @@ export function updateSessionActivity(
   messagePreview: string,
   lastUsage?: any
 ): void {
-  const sessions = readStore();
-  const session = sessions.find((s) => s.id === id);
-  if (session) {
+  mutateSessionStore(id, (session) => {
     session.lastActive = new Date().toISOString();
     session.messagePreview = cleanPreviewText(messagePreview);
     session.turnCount = normalizedTurnCount(session.turnCount) ?? 0;
     if (lastUsage) {
       (session as any).lastUsage = lastUsage;
     }
-    writeStore(sessions);
-  }
+  }, "coalesced");
 }
 
 export function updateSessionContextUsage(id: string, contextUsage: any): void {
-  const sessions = readStore();
-  const session = sessions.find((s) => s.id === id);
-  if (session) {
+  mutateSessionStore(id, (session) => {
     (session as any).lastContextUsage = contextUsage;
-    writeStore(sessions);
-  }
+  }, "coalesced");
 }
 
 // ── Message history per session ──
@@ -640,7 +726,10 @@ type HistoryCacheEntry = {
   entries: HistoryEntry[];
 };
 
-const historyCache = new Map<string, HistoryCacheEntry>();
+const historyCache = new ByteBoundedLru<string, HistoryCacheEntry>(
+  HISTORY_CACHE_MAX_BYTES,
+  (entry) => Buffer.byteLength(JSON.stringify(entry.entries), "utf8"),
+);
 
 function historyDatabase(): TranscriptDatabase {
   ensureHistoryDir();
@@ -1302,20 +1391,18 @@ function updateSessionHistoryMetadata(sessionId: string, entries: HistoryEntry[]
 function updateSessionHistoryMetadataFromDatabase(sessionId: string): void {
   const summary = historyDatabase().summary(sessionId);
   if (!summary) return;
-  const sessions = readStore();
-  const session = sessions.find((entry) => entry.id === sessionId);
-  if (!session) return;
-  if (summary.messagePreview) session.messagePreview = summary.messagePreview;
-  session.turnCount = summary.userPromptCount;
-  (session as any).historyCount = summary.entryCount;
-  if (summary.latestTimestamp) {
-    const currentMs = Date.parse(session.lastActive);
-    const latestMs = Date.parse(summary.latestTimestamp);
-    if (!Number.isFinite(currentMs) || (Number.isFinite(latestMs) && latestMs > currentMs)) {
-      session.lastActive = summary.latestTimestamp;
+  mutateSessionStore(sessionId, (session) => {
+    if (summary.messagePreview) session.messagePreview = summary.messagePreview;
+    session.turnCount = summary.userPromptCount;
+    (session as any).historyCount = summary.entryCount;
+    if (summary.latestTimestamp) {
+      const currentMs = Date.parse(session.lastActive);
+      const latestMs = Date.parse(summary.latestTimestamp);
+      if (!Number.isFinite(currentMs) || (Number.isFinite(latestMs) && latestMs > currentMs)) {
+        session.lastActive = summary.latestTimestamp;
+      }
     }
-  }
-  writeStore(sessions);
+  }, "coalesced");
 }
 
 function normalizedTurnCount(value: unknown): number | undefined {
@@ -1400,6 +1487,7 @@ export function appendHistory(sessionId: string, entry: HistoryEntry): HistoryEn
       cached.entries.push(safeEntry);
       cached.entries.sort((left, right) => Number(left.sessionSeq || 0) - Number(right.sessionSeq || 0));
     }
+    historyCache.refresh(sessionId);
   }
   updateSessionHistoryMetadataFromDatabase(sessionId);
   return safeEntry;
@@ -1504,6 +1592,7 @@ export function appendHistoryBulk(sessionId: string, newEntries: HistoryEntry[])
       else cached.entries[index] = entry;
     }
     cached.entries.sort((left, right) => Number(left.sessionSeq || 0) - Number(right.sessionSeq || 0));
+    historyCache.refresh(sessionId);
   }
   updateSessionHistoryMetadataFromDatabase(sessionId);
 }
@@ -1747,6 +1836,7 @@ export function removeHistoryEntriesByUuids(sessionId: string, uuids: readonly s
   if (cached) {
     const retracted = new Set(uuids);
     cached.entries = cached.entries.filter((entry) => !entry.uuid || !retracted.has(entry.uuid));
+    historyCache.refresh(sessionId);
   }
   updateSessionHistoryMetadataFromDatabase(sessionId);
   return removed;
@@ -1868,9 +1958,78 @@ export function getHistoryCount(sessionId: string): number {
   return historyDatabase().count(sessionId);
 }
 
+export function getLastHistorySessionSeq(sessionId: string): number {
+  ensureHistoryDatabaseSession(sessionId);
+  return historyDatabase().maxSessionSeq(sessionId);
+}
+
 export function getHistorySince(sessionId: string, timestamp: string): HistoryEntry[] {
   ensureHistoryDatabaseSession(sessionId);
   return hydrateHistoryEntries(historyDatabase().getSinceTimestamp(sessionId, timestamp));
+}
+
+export function hasPersistedUserMessage(sessionId: string, uuid: string): boolean {
+  if (!sessionId || !uuid) return false;
+  ensureHistoryDatabaseSession(sessionId);
+  backfillUserUuids(sessionId);
+  return historyDatabase().hasUserUuid(sessionId, uuid);
+}
+
+export function getHistoryEntryByToolUseId(
+  sessionId: string,
+  role: string,
+  toolUseId: string,
+): HistoryEntry | undefined {
+  if (!sessionId || !role || !toolUseId) return undefined;
+  ensureHistoryDatabaseSession(sessionId);
+  const entry = historyDatabase().getByToolUseId(sessionId, role, toolUseId);
+  return entry ? hydrateHistoryEntry(entry) : undefined;
+}
+
+export function getWorkReviewHistoryEntry(
+  sessionId: string,
+  reviewId: string,
+): HistoryEntry | undefined {
+  if (!sessionId || !reviewId) return undefined;
+  ensureHistoryDatabaseSession(sessionId);
+  const entry = historyDatabase().getWorkReview(sessionId, reviewId);
+  return entry ? hydrateHistoryEntry(entry) : undefined;
+}
+
+export function hasPersistedUserContentPrefix(sessionId: string, prefix: string): boolean {
+  if (!sessionId || !prefix) return false;
+  ensureHistoryDatabaseSession(sessionId);
+  return historyDatabase().hasUserContentPrefix(sessionId, prefix);
+}
+
+export function getLatestHistoryEntryByRoleSince(
+  sessionId: string,
+  role: string,
+  since?: string,
+): HistoryEntry | undefined {
+  ensureHistoryDatabaseSession(sessionId);
+  const normalizedSince = since && Number.isFinite(Date.parse(since))
+    ? since
+    : undefined;
+  const entry = historyDatabase().getLatestByRoleSince(sessionId, role, normalizedSince);
+  return entry ? hydrateHistoryEntry(entry) : undefined;
+}
+
+export function getCompletionTranscriptTarget(
+  sessionId: string,
+  notBefore?: string,
+): { targetEntryId?: string; targetSessionSeq?: number } {
+  const entry = getLatestHistoryEntryByRoleSince(sessionId, "assistant", notBefore);
+  if (!entry) return {};
+  const entryId = typeof entry.entryId === "string" ? entry.entryId.trim() : "";
+  const rawSessionSeq = Number(entry.sessionSeq);
+  const sessionSeq = Number.isSafeInteger(rawSessionSeq) && rawSessionSeq > 0
+    ? rawSessionSeq
+    : undefined;
+  return {
+    ...(entryId ? { targetEntryId: entryId } : {}),
+    ...(sessionSeq !== undefined ? { targetSessionSeq: sessionSeq } : {}),
+  };
 }
 
 export function getRunBoundary(sessionId: string, runId: string): HistoryEntry | undefined {
@@ -2222,8 +2381,10 @@ export function getHistoryPageToLastPrompt(
   minEntries: number = 50
 ): { entries: HistoryEntry[]; total: number; offset: number } {
   const startedAt = Date.now();
-  const all = readHistoryEntries(sessionId, { backfillUserUuids: true });
-  const total = all.length;
+  ensureHistoryDatabaseSession(sessionId);
+  backfillUserUuids(sessionId);
+  const database = historyDatabase();
+  const total = database.count(sessionId);
   if (total === 0) {
     warnIfSlow("history_page_to_prompt", startedAt, { sessionId, total, minEntries });
     return { entries: [], total: 0, offset: 0 };
@@ -2231,17 +2392,15 @@ export function getHistoryPageToLastPrompt(
 
   // Default start: last minEntries
   let start = Math.max(0, total - minEntries);
-
-  // Find the last user message and ensure we include it
-  for (let i = total - 1; i >= 0; i--) {
-    if (all[i].role === "user") {
-      start = Math.min(start, i);
-      break;
-    }
-  }
+  const promptOffset = database.recentUserPromptOffset(sessionId, 1);
+  if (promptOffset !== undefined) start = Math.min(start, promptOffset);
 
   warnIfSlow("history_page_to_prompt", startedAt, { sessionId, total, minEntries, offset: start });
-  return { entries: hydrateHistoryEntries(all.slice(start)), total, offset: start };
+  return {
+    entries: hydrateHistoryEntries(database.getPage(sessionId, start, total - start)),
+    total,
+    offset: start,
+  };
 }
 
 /**

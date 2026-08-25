@@ -75,6 +75,13 @@ interface StoredSummaryRow {
   updated_at: string;
 }
 
+interface EntrySummaryState {
+  sessionSeq: number;
+  role: string;
+  timestamp?: string;
+  content?: string;
+}
+
 function cleanPreview(value: unknown, limit = 200): string {
   return String(value ?? "").replace(/\s+/g, " ").trim().slice(0, limit);
 }
@@ -199,6 +206,12 @@ export class TranscriptDatabase {
         ON transcript_entries(session_id, role, session_seq);
       CREATE INDEX IF NOT EXISTS transcript_entries_timestamp
         ON transcript_entries(session_id, timestamp);
+      CREATE INDEX IF NOT EXISTS transcript_entries_user_uuid
+        ON transcript_entries(session_id, json_extract(entry_json, '$.uuid'))
+        WHERE role = 'user';
+      CREATE INDEX IF NOT EXISTS transcript_entries_work_review_id
+        ON transcript_entries(session_id, json_extract(entry_json, '$.reviewId'))
+        WHERE role = 'work_review';
     `);
     const schemaVersion = Number((this.db.prepare("PRAGMA user_version").get() as unknown as {
       user_version: number;
@@ -487,6 +500,66 @@ export class TranscriptDatabase {
     return row ? parseEntry(row) : undefined;
   }
 
+  getLatestByRoleSince(
+    sessionId: string,
+    role: string,
+    since?: string,
+  ): HistoryEntry | undefined {
+    const row = since
+      ? this.db.prepare(`
+          SELECT * FROM transcript_entries
+          WHERE session_id = ? AND role = ? AND timestamp >= ?
+          ORDER BY session_seq DESC LIMIT 1
+        `).get(sessionId, role, since)
+      : this.db.prepare(`
+          SELECT * FROM transcript_entries
+          WHERE session_id = ? AND role = ?
+          ORDER BY session_seq DESC LIMIT 1
+        `).get(sessionId, role);
+    return row ? parseEntry(row as unknown as StoredTranscriptRow) : undefined;
+  }
+
+  hasUserUuid(sessionId: string, uuid: string): boolean {
+    return !!this.db.prepare(`
+      SELECT 1 FROM transcript_entries
+      WHERE session_id = ? AND role = 'user'
+        AND json_extract(entry_json, '$.uuid') = ?
+      LIMIT 1
+    `).get(sessionId, uuid);
+  }
+
+  getByToolUseId(
+    sessionId: string,
+    role: string,
+    toolUseId: string,
+  ): HistoryEntry | undefined {
+    const row = this.db.prepare(`
+      SELECT * FROM transcript_entries
+      WHERE session_id = ? AND tool_use_id = ? AND role = ?
+      ORDER BY session_seq DESC LIMIT 1
+    `).get(sessionId, toolUseId, role) as unknown as StoredTranscriptRow | undefined;
+    return row ? parseEntry(row) : undefined;
+  }
+
+  getWorkReview(sessionId: string, reviewId: string): HistoryEntry | undefined {
+    const row = this.db.prepare(`
+      SELECT * FROM transcript_entries
+      WHERE session_id = ? AND role = 'work_review'
+        AND json_extract(entry_json, '$.reviewId') = ?
+      ORDER BY session_seq DESC LIMIT 1
+    `).get(sessionId, reviewId) as unknown as StoredTranscriptRow | undefined;
+    return row ? parseEntry(row) : undefined;
+  }
+
+  hasUserContentPrefix(sessionId: string, prefix: string): boolean {
+    return !!this.db.prepare(`
+      SELECT 1 FROM transcript_entries
+      WHERE session_id = ? AND role = 'user'
+        AND substr(json_extract(entry_json, '$.content'), 1, length(?)) = ?
+      LIMIT 1
+    `).get(sessionId, prefix, prefix);
+  }
+
   getByToolNames(sessionId: string, toolNames: string[]): HistoryEntry[] {
     if (toolNames.length === 0) return [];
     const placeholders = toolNames.map(() => "?").join(", ");
@@ -665,12 +738,147 @@ export class TranscriptDatabase {
     );
   }
 
+  private entrySummaryState(sessionId: string, entryId: string): EntrySummaryState | undefined {
+    const row = this.db.prepare(`
+      SELECT session_seq, role, timestamp, entry_json
+      FROM transcript_entries WHERE session_id = ? AND entry_id = ?
+    `).get(sessionId, entryId) as unknown as Pick<
+      StoredTranscriptRow,
+      "session_seq" | "role" | "timestamp" | "entry_json"
+    > | undefined;
+    if (!row) return undefined;
+    const entry = JSON.parse(row.entry_json) as HistoryEntry;
+    return {
+      sessionSeq: Number(row.session_seq),
+      role: row.role,
+      ...(row.timestamp ? { timestamp: row.timestamp } : {}),
+      ...(entry.content ? { content: String(entry.content) } : {}),
+    };
+  }
+
+  private latestConversationState(sessionId: string): EntrySummaryState | undefined {
+    const row = this.db.prepare(`
+      SELECT session_seq, role, timestamp, entry_json
+      FROM transcript_entries
+      WHERE session_id = ? AND role IN ('user', 'assistant')
+      ORDER BY session_seq DESC LIMIT 1
+    `).get(sessionId) as unknown as Pick<
+      StoredTranscriptRow,
+      "session_seq" | "role" | "timestamp" | "entry_json"
+    > | undefined;
+    if (!row) return undefined;
+    const entry = JSON.parse(row.entry_json) as HistoryEntry;
+    return {
+      sessionSeq: Number(row.session_seq),
+      role: row.role,
+      ...(row.timestamp ? { timestamp: row.timestamp } : {}),
+      ...(entry.content ? { content: String(entry.content) } : {}),
+    };
+  }
+
+  private updateSummaryAfterWrites(
+    sessionId: string,
+    changes: Array<{ before?: EntrySummaryState; after: HistoryEntry }>,
+  ): void {
+    const current = this.summary(sessionId);
+    if (!current) throw new Error(`Transcript summary is missing for ${sessionId}`);
+
+    let entryCount = current.entryCount;
+    let userPromptCount = current.userPromptCount;
+    let latestTimestamp = current.latestTimestamp;
+    let timestampNeedsRefresh = false;
+    let conversationNeedsRefresh = false;
+    let conversationCandidate: { sessionSeq: number; preview: string } | undefined;
+
+    for (const { before, after } of changes) {
+      if (!before) entryCount++;
+      const beforeUser = before?.role === "user" ? 1 : 0;
+      const afterUser = after.role === "user" ? 1 : 0;
+      userPromptCount += afterUser - beforeUser;
+
+      const afterTimestamp = after.timestamp || undefined;
+      if (
+        before?.timestamp
+        && before.timestamp === current.latestTimestamp
+        && before.timestamp !== afterTimestamp
+      ) {
+        timestampNeedsRefresh = true;
+      }
+      if (afterTimestamp && (!latestTimestamp || afterTimestamp > latestTimestamp)) {
+        latestTimestamp = afterTimestamp;
+      }
+
+      const beforeConversation = before?.role === "user" || before?.role === "assistant";
+      const afterConversation = after.role === "user" || after.role === "assistant";
+      const afterSessionSeq = Number(after.sessionSeq || 0);
+      if (
+        beforeConversation
+        && before?.sessionSeq === current.latestConversationSeq
+        && (!afterConversation || afterSessionSeq !== before.sessionSeq)
+      ) {
+        conversationNeedsRefresh = true;
+      }
+      if (
+        afterConversation
+        && Number.isSafeInteger(afterSessionSeq)
+        && afterSessionSeq > 0
+        && (!conversationCandidate || afterSessionSeq >= conversationCandidate.sessionSeq)
+      ) {
+        conversationCandidate = {
+          sessionSeq: afterSessionSeq,
+          preview: cleanPreview(after.content),
+        };
+      }
+    }
+
+    if (timestampNeedsRefresh) {
+      const row = this.db.prepare(`
+        SELECT MAX(timestamp) AS latest_timestamp
+        FROM transcript_entries WHERE session_id = ?
+      `).get(sessionId) as unknown as { latest_timestamp: string | null };
+      latestTimestamp = row.latest_timestamp || undefined;
+    }
+
+    let latestConversationSeq = current.latestConversationSeq;
+    let messagePreview = current.messagePreview || "";
+    if (conversationNeedsRefresh) {
+      const latest = this.latestConversationState(sessionId);
+      latestConversationSeq = latest?.sessionSeq;
+      messagePreview = cleanPreview(latest?.content);
+    } else if (
+      conversationCandidate
+      && (
+        latestConversationSeq === undefined
+        || conversationCandidate.sessionSeq >= latestConversationSeq
+      )
+    ) {
+      latestConversationSeq = conversationCandidate.sessionSeq;
+      messagePreview = conversationCandidate.preview;
+    }
+
+    this.db.prepare(`
+      UPDATE transcript_sessions SET
+        entry_count = ?, user_prompt_count = ?, latest_timestamp = ?,
+        message_preview = ?, latest_conversation_seq = ?, updated_at = ?
+      WHERE session_id = ?
+    `).run(
+      entryCount,
+      Math.max(0, userPromptCount),
+      latestTimestamp || null,
+      messagePreview || null,
+      latestConversationSeq ?? null,
+      new Date().toISOString(),
+      sessionId,
+    );
+  }
+
   upsert(sessionId: string, entry: HistoryEntry, positionKey: string | null): void {
     this.db.exec("BEGIN IMMEDIATE");
     try {
       this.ensureSessionRow(sessionId);
+      const before = this.entrySummaryState(sessionId, String(entry.entryId || ""));
       this.writeEntry(sessionId, entry, positionKey);
-      this.recomputeSummary(sessionId);
+      this.updateSummaryAfterWrites(sessionId, [{ before, after: entry }]);
       this.db.exec("COMMIT");
     } catch (error) {
       this.db.exec("ROLLBACK");
@@ -686,8 +894,21 @@ export class TranscriptDatabase {
     this.db.exec("BEGIN IMMEDIATE");
     try {
       this.ensureSessionRow(sessionId);
-      for (const item of entries) this.writeEntry(sessionId, item.entry, item.positionKey);
-      this.recomputeSummary(sessionId);
+      const changes = new Map<
+        string,
+        { before?: EntrySummaryState; after: HistoryEntry }
+      >();
+      for (const item of entries) {
+        const entryId = String(item.entry.entryId || "");
+        const before = this.entrySummaryState(sessionId, entryId);
+        this.writeEntry(sessionId, item.entry, item.positionKey);
+        const pending = changes.get(entryId);
+        changes.set(entryId, {
+          before: pending ? pending.before : before,
+          after: item.entry,
+        });
+      }
+      this.updateSummaryAfterWrites(sessionId, [...changes.values()]);
       this.db.exec("COMMIT");
     } catch (error) {
       this.db.exec("ROLLBACK");
