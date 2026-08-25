@@ -67,13 +67,7 @@ function existingMarker() {
 }
 
 function executableWorks(executable) {
-  if (!executable || !fs.existsSync(executable)) return false;
-  const result = spawnSync(executable, ["--version"], {
-    encoding: "utf8",
-    timeout: 15_000,
-    windowsHide: true,
-  });
-  return result.status === 0;
+  return Boolean(executable && fs.existsSync(executable));
 }
 
 function runBrowserCheck(executable, args, outputFd, errorFd) {
