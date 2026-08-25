@@ -66,6 +66,7 @@ import { managedNpmPrefix, socketAgentDataPath } from "./socket-agent-paths";
 import { createClaudeAuthRequest, exchangeClaudeAuthCode, ClaudeAuthRequest } from "./claude-auth";
 import { deleteHtmlPlan, deleteHtmlPlansForSession, diffHtmlPlanRevisions, getHtmlPlanRevision, listHtmlPlanRevisions, listHtmlPlans, renameHtmlPlan, rollbackHtmlPlan } from "./html-plan-store";
 import { HardAbortCoordinator } from "./hard-abort";
+import { ControlMessageScheduler, controlMessageQueueScope } from "./control-message-scheduler";
 import { SessionInstanceRegistry } from "./session-instance-registry";
 import { SessionAutomationLockedError, SessionAutomationLockStore } from "./session-automation-lock";
 import { backendsForManagedBackendSpecs, MANAGED_BACKEND_PACKAGES, managedBackendSpecsNeedingUpdate, parseNpmVersionOutput } from "./managed-backend-update";
@@ -9528,7 +9529,7 @@ httpServer.on("upgrade", (req, socket, head) => {
 // Relay client (initialized after server starts if RELAY_URL is set)
 let relayClient: RelayClient | null = null;
 let relayConnectionHandler: ReturnType<typeof createConnectionHandler> | null = null;
-let relayMessageQueue = Promise.resolve();
+const relayControlMessageScheduler = new ControlMessageScheduler();
 let relayBulkClient: RelayClient | null = null;
 let relayBulkConnectionHandler: ReturnType<typeof createConnectionHandler> | null = null;
 let relayBulkMessageQueue = Promise.resolve();
@@ -10197,7 +10198,8 @@ wss.on("connection", (ws: WebSocket, req: http.IncomingMessage) => {
   }
 
   const handler = createConnectionHandler(transport, transportLane);
-  let messageQueue = Promise.resolve();
+  const controlMessageScheduler = new ControlMessageScheduler();
+  let bulkMessageQueue = Promise.resolve();
 
   ws.on("message", (data: Buffer, isBinary: boolean) => {
     let msg: ClientMessage;
@@ -10300,37 +10302,48 @@ wss.on("connection", (ws: WebSocket, req: http.IncomingMessage) => {
         });
       return;
     }
-    messageQueue = messageQueue
-      .then(async () => {
-        const startedAt = Date.now();
-        logSlowWs("ws_queue_wait", receivedAt, { type: msgType });
-        try {
-          if (transportLane === "bulk" && !isBulkLaneClientMessage(msg)) {
-            throw new Error(`Message type ${msgType} is not allowed on the bulk transport lane`);
-          }
-          await handler.handleMessage(msg);
-        } finally {
-          logSlowWs("ws_handler", startedAt, { type: msgType });
+    const runHandler = async (): Promise<void> => {
+      const startedAt = Date.now();
+      const scope = transportLane === "control"
+        ? controlMessageQueueScope(msg).kind
+        : "bulk";
+      if (scope !== "concurrent") {
+        logSlowWs(`ws_${scope}_queue_wait`, receivedAt, { type: msgType });
+      }
+      try {
+        if (transportLane === "bulk" && !isBulkLaneClientMessage(msg)) {
+          throw new Error(`Message type ${msgType} is not allowed on the bulk transport lane`);
         }
-      })
-      .catch((err: any) => {
-        if (msgType === "prompt") {
-          transport.send(JSON.stringify({
-            type: "prompt_failed",
-            messageId: String((msg as any)?.messageId || ""),
-            sessionId: String((msg as any)?.sessionId || ""),
-            message: err.message || "Prompt could not be started",
-          }));
-        }
-        if (msgType !== "prompt") {
-          transport.send(
-            JSON.stringify({
-              type: "error",
-              message: err.message || "Server error",
-            })
-          );
-        }
-      });
+        await handler.handleMessage(msg);
+      } finally {
+        logSlowWs("ws_handler", startedAt, { type: msgType, scope });
+      }
+    };
+    let scheduled: Promise<void>;
+    if (transportLane === "control") {
+      scheduled = controlMessageScheduler.run(msg, runHandler);
+    } else {
+      scheduled = bulkMessageQueue.then(runHandler);
+      bulkMessageQueue = scheduled.catch(() => undefined);
+    }
+    void scheduled.catch((err: any) => {
+      if (msgType === "prompt") {
+        transport.send(JSON.stringify({
+          type: "prompt_failed",
+          messageId: String((msg as any)?.messageId || ""),
+          sessionId: String((msg as any)?.sessionId || ""),
+          message: err.message || "Prompt could not be started",
+        }));
+      }
+      if (msgType !== "prompt") {
+        transport.send(
+          JSON.stringify({
+            type: "error",
+            message: err.message || "Server error",
+          })
+        );
+      }
+    });
   });
 
   ws.on("close", () => {
@@ -10414,33 +10427,34 @@ function startRelayClient(): void {
           });
         return;
       }
-      relayMessageQueue = relayMessageQueue
-        .then(async () => {
-          const startedAt = Date.now();
-          logSlowWs("relay_queue_wait", receivedAt, { type: msgType });
-          try {
-            await handler.handleMessage(msg);
-          } finally {
-            logSlowWs("relay_handler", startedAt, { type: msgType });
-          }
-        })
-        .catch((err: any) => {
-          console.error(`[Relay] Message handler error: ${err.message}`);
-          if (msgType === "prompt") {
-            handler.sendJson({
-              type: "prompt_failed",
-              messageId: String((msg as any)?.messageId || ""),
-              sessionId: String((msg as any)?.sessionId || ""),
-              message: err.message || "Prompt could not be started",
-            });
-          }
-          if (msgType !== "prompt") {
-            handler.sendJson({
-              type: "error",
-              message: err.message || "Server error",
-            });
-          }
-        });
+      const scope = controlMessageQueueScope(msg).kind;
+      void relayControlMessageScheduler.run(msg, async () => {
+        const startedAt = Date.now();
+        if (scope !== "concurrent") {
+          logSlowWs(`relay_${scope}_queue_wait`, receivedAt, { type: msgType });
+        }
+        try {
+          await handler.handleMessage(msg);
+        } finally {
+          logSlowWs("relay_handler", startedAt, { type: msgType, scope });
+        }
+      }).catch((err: any) => {
+        console.error(`[Relay] Message handler error: ${err.message}`);
+        if (msgType === "prompt") {
+          handler.sendJson({
+            type: "prompt_failed",
+            messageId: String((msg as any)?.messageId || ""),
+            sessionId: String((msg as any)?.sessionId || ""),
+            message: err.message || "Prompt could not be started",
+          });
+        }
+        if (msgType !== "prompt") {
+          handler.sendJson({
+            type: "error",
+            message: err.message || "Server error",
+          });
+        }
+      });
     },
     onStatusChange: (status: RelayStatus) => {
       console.log(`[Relay] Status: ${status}`);
@@ -10448,13 +10462,13 @@ function startRelayClient(): void {
         // Reset handler when phone reconnects so it gets a fresh state
         relayConnectionHandler?.close();
         relayConnectionHandler = createConnectionHandler(relayClient!.getVirtualSocket() as any);
-        relayMessageQueue = Promise.resolve();
+        relayControlMessageScheduler.reset();
         console.log(`[Relay] Phone paired — ready for messages`);
       }
       if (status === "waiting_for_peer" || status === "disconnected") {
         relayConnectionHandler?.close();
         relayConnectionHandler = null;
-        relayMessageQueue = Promise.resolve();
+        relayControlMessageScheduler.reset();
       }
     },
   });
