@@ -34,7 +34,6 @@ function systemCandidates() {
     for (const root of [process.env.PROGRAMFILES, process.env["PROGRAMFILES(X86)"], process.env.LOCALAPPDATA]) {
       if (!root) continue;
       candidates.push(
-        path.join(root, "Microsoft", "Edge", "Application", "msedge.exe"),
         path.join(root, "Google", "Chrome", "Application", "chrome.exe"),
       );
     }
