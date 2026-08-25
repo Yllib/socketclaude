@@ -7,6 +7,7 @@ interface StoredPushToken {
   token: string;
   platform: string;
   appServerId?: string;
+  deliveryRoute?: "relay" | "direct";
   updatedAt: string;
 }
 
@@ -18,6 +19,14 @@ export interface PushNotificationPayload {
   kind?: string;
   data?: Record<string, string | number | boolean | null | undefined>;
   showNotification?: boolean;
+}
+
+export type DirectFcmConfigurationIssue = "missing" | "invalid" | "unreadable";
+
+export interface PushDeliveryCapabilities {
+  directFcmConfigured: boolean;
+  directFcmIssue?: DirectFcmConfigurationIssue;
+  relayConfigured: boolean;
 }
 
 export function shouldSendForwardedPush(message: Record<string, any>): boolean {
@@ -108,6 +117,7 @@ export function registerPushToken(
   fcmToken: string,
   platform = "android",
   appServerId?: string,
+  deliveryRoute?: "relay" | "direct",
 ): void {
   const token = fcmToken.trim();
   if (!token) return;
@@ -119,6 +129,7 @@ export function registerPushToken(
       token,
       platform,
       ...(appServerId ? { appServerId } : {}),
+      ...(deliveryRoute ? { deliveryRoute } : {}),
       updatedAt: new Date().toISOString(),
     },
   ].slice(-20));
@@ -141,21 +152,83 @@ export function unregisterPushToken(
 export function isPushTokenRegistered(
   fcmToken: string,
   appServerId?: string,
+  deliveryRoute?: "relay" | "direct",
 ): boolean {
   const token = fcmToken.trim();
   if (!token) return false;
   return readStore().some((entry) => (
-    entry.token === token && (!appServerId || entry.appServerId === appServerId)
+    entry.token === token
+      && (!appServerId || entry.appServerId === appServerId)
+      && (!deliveryRoute || entry.deliveryRoute === deliveryRoute)
   ));
 }
 
-export function isPushConfigured(): boolean {
-  return Boolean(
-    process.env.FIREBASE_SERVICE_ACCOUNT_JSON
-      || process.env.FIREBASE_SERVICE_ACCOUNT_PATH
-      || process.env.GOOGLE_APPLICATION_CREDENTIALS
-      || (process.env.RELAY_URL && process.env.PAIRING_TOKEN)
+function hasRequiredServiceAccountFields(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const credentials = value as Record<string, unknown>;
+  const hasProject = typeof credentials.project_id === "string"
+    && credentials.project_id.trim().length > 0;
+  const hasExplicitProject = Boolean(
+    process.env.FIREBASE_PROJECT_ID
+      || process.env.GOOGLE_CLOUD_PROJECT
+      || process.env.GCLOUD_PROJECT,
   );
+  return typeof credentials.client_email === "string"
+    && credentials.client_email.trim().length > 0
+    && typeof credentials.private_key === "string"
+    && credentials.private_key.trim().length > 0
+    && (hasProject || hasExplicitProject);
+}
+
+function directFcmConfiguration(): Pick<
+  PushDeliveryCapabilities,
+  "directFcmConfigured" | "directFcmIssue"
+> {
+  const rawJson = String(process.env.FIREBASE_SERVICE_ACCOUNT_JSON || "").trim();
+  if (rawJson) {
+    try {
+      return hasRequiredServiceAccountFields(JSON.parse(rawJson))
+        ? { directFcmConfigured: true }
+        : { directFcmConfigured: false, directFcmIssue: "invalid" };
+    } catch {
+      return { directFcmConfigured: false, directFcmIssue: "invalid" };
+    }
+  }
+
+  const credentialsPath = String(
+    process.env.FIREBASE_SERVICE_ACCOUNT_PATH
+      || process.env.GOOGLE_APPLICATION_CREDENTIALS
+      || "",
+  ).trim();
+  if (!credentialsPath) {
+    return { directFcmConfigured: false, directFcmIssue: "missing" };
+  }
+  try {
+    const credentials = JSON.parse(fs.readFileSync(credentialsPath, "utf-8"));
+    return hasRequiredServiceAccountFields(credentials)
+      ? { directFcmConfigured: true }
+      : { directFcmConfigured: false, directFcmIssue: "invalid" };
+  } catch (error: unknown) {
+    const hasFileErrorCode = error !== null
+      && typeof error === "object"
+      && "code" in error;
+    return {
+      directFcmConfigured: false,
+      directFcmIssue: hasFileErrorCode ? "unreadable" : "invalid",
+    };
+  }
+}
+
+export function getPushDeliveryCapabilities(): PushDeliveryCapabilities {
+  return {
+    ...directFcmConfiguration(),
+    relayConfigured: relayPushEndpoint() !== null,
+  };
+}
+
+export function isPushConfigured(): boolean {
+  const capabilities = getPushDeliveryCapabilities();
+  return capabilities.directFcmConfigured || capabilities.relayConfigured;
 }
 
 function relayPushEndpoint(): string | null {
@@ -336,22 +409,56 @@ async function sendFcmHttpV1(
 export async function sendPushNotification(
   payload: PushNotificationPayload,
 ): Promise<{ sent: number; attempted: number }> {
+  const entries = readStore();
   const endpoint = relayPushEndpoint();
   const pairingToken = String(process.env.PAIRING_TOKEN || "").trim();
-  if (endpoint && pairingToken) {
-    return sendPushViaRelay(endpoint, pairingToken, payload);
+  const relayEntries = entries.filter(
+    (entry) => entry.deliveryRoute !== "direct",
+  );
+  let relayResult: { sent: number; attempted: number } | null = null;
+  if (
+    endpoint &&
+    pairingToken &&
+    (entries.length === 0 || relayEntries.length > 0)
+  ) {
+    try {
+      relayResult = await sendPushViaRelay(endpoint, pairingToken, payload);
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn(
+        `[Push] Relay delivery failed, checking direct Firebase fallback: ${message}`,
+      );
+    }
   }
 
-  const entries = readStore();
-  const tokens = entries.map((entry) => entry.token).filter(Boolean);
-  if (tokens.length === 0) return { sent: 0, attempted: 0 };
+  if (entries.length === 0) {
+    return relayResult ?? { sent: 0, attempted: 0 };
+  }
+
+  const directEntries = relayResult && relayResult.attempted > 0
+    ? entries.filter((entry) => entry.deliveryRoute === "direct")
+    : entries;
+  const tokens = directEntries.map((entry) => entry.token).filter(Boolean);
+  if (tokens.length === 0) {
+    return relayResult ?? { sent: 0, attempted: 0 };
+  }
   const auth = getFcmAuth();
-  if (!auth) return { sent: 0, attempted: tokens.length };
+  if (!auth) {
+    return {
+      sent: relayResult?.sent ?? 0,
+      attempted: (relayResult?.attempted ?? 0) + tokens.length,
+    };
+  }
   const projectId = await getFcmProjectId(auth);
-  if (!projectId) return { sent: 0, attempted: tokens.length };
+  if (!projectId) {
+    return {
+      sent: relayResult?.sent ?? 0,
+      attempted: (relayResult?.attempted ?? 0) + tokens.length,
+    };
+  }
 
   const groups = new Map<string, StoredPushToken[]>();
-  for (const entry of entries) {
+  for (const entry of directEntries) {
     const key = entry.appServerId || "";
     groups.set(key, [...(groups.get(key) || []), entry]);
   }
@@ -387,5 +494,8 @@ export async function sendPushNotification(
     }
   }
   removeTokens(invalid);
-  return { sent, attempted: tokens.length };
+  return {
+    sent: sent + (relayResult?.sent ?? 0),
+    attempted: tokens.length + (relayResult?.attempted ?? 0),
+  };
 }

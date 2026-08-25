@@ -827,6 +827,7 @@ export interface RegisterPushTokenMessage {
   fcmToken: string;
   platform?: string;
   appServerId?: string;
+  deliveryRoute?: "relay" | "direct";
 }
 
 export interface UnregisterPushTokenMessage {
@@ -839,6 +840,7 @@ export interface GetPushRegistrationMessage {
   type: "get_push_registration";
   fcmToken: string;
   appServerId?: string;
+  deliveryRoute?: "relay" | "direct";
 }
 
 export interface SetEffortMessage {
@@ -1621,6 +1623,7 @@ export interface BackendAuthRequiredServerMessage {
 export interface PushTokenRegisteredServerMessage {
   type: "push_token_registered";
   appServerId?: string;
+  deliveryRoute?: "relay" | "direct";
 }
 
 export interface PushTokenUnregisteredServerMessage {
@@ -1632,6 +1635,7 @@ export interface PushRegistrationStatusServerMessage {
   type: "push_registration_status";
   appServerId?: string;
   registered: boolean;
+  reason?: "missing" | "invalid" | "unreadable" | "relay_unavailable";
 }
 
 export interface ServerCapabilitiesMessage {
@@ -1677,6 +1681,18 @@ export interface ServerCapabilitiesMessage {
     relayUrl: string;
     pairingToken: string;
     serverPubkey: string;
+  };
+  pushNotifications?: {
+    version?: number;
+    /** The server build supports direct Firebase delivery when configured. */
+    directFcm?: boolean;
+    /** At least one server-side delivery path has configuration present. */
+    configured?: boolean;
+    /** The configured Firebase service account passed local validation. */
+    directFcmConfigured?: boolean;
+    directFcmIssue?: "missing" | "invalid" | "unreadable";
+    /** The server has a relay URL and pairing token for push delivery. */
+    relayConfigured?: boolean;
   };
 }
 

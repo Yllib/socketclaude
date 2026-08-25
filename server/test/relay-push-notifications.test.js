@@ -1,12 +1,42 @@
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
 const http = require("node:http");
+const os = require("node:os");
+const path = require("node:path");
 const test = require("node:test");
 
 const {
+  getPushDeliveryCapabilities,
   isPushConfigured,
   sendPushNotification,
   shouldSendForwardedPush,
 } = require("../dist/push-notifications");
+
+const pushEnvironmentKeys = [
+  "FIREBASE_SERVICE_ACCOUNT_JSON",
+  "FIREBASE_SERVICE_ACCOUNT_PATH",
+  "GOOGLE_APPLICATION_CREDENTIALS",
+  "FIREBASE_PROJECT_ID",
+  "GOOGLE_CLOUD_PROJECT",
+  "GCLOUD_PROJECT",
+  "RELAY_URL",
+  "PAIRING_TOKEN",
+];
+
+function withCleanPushEnvironment(run) {
+  const previous = Object.fromEntries(
+    pushEnvironmentKeys.map((key) => [key, process.env[key]]),
+  );
+  for (const key of pushEnvironmentKeys) delete process.env[key];
+  return Promise.resolve()
+    .then(run)
+    .finally(() => {
+      for (const [key, value] of Object.entries(previous)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    });
+}
 
 test("headless forwarding never duplicates an FCM dispatch owned by NotifyUser", () => {
   assert.equal(shouldSendForwardedPush({
@@ -16,6 +46,48 @@ test("headless forwarding never duplicates an FCM dispatch owned by NotifyUser",
   assert.equal(shouldSendForwardedPush({
     type: "scheduled_task_notification",
   }), true);
+});
+
+test("reports missing, invalid, and valid direct Firebase setup separately", async () => {
+  await withCleanPushEnvironment(async () => {
+    assert.deepEqual(getPushDeliveryCapabilities(), {
+      directFcmConfigured: false,
+      directFcmIssue: "missing",
+      relayConfigured: false,
+    });
+
+    process.env.FIREBASE_SERVICE_ACCOUNT_JSON = "not-json";
+    assert.equal(getPushDeliveryCapabilities().directFcmIssue, "invalid");
+
+    process.env.FIREBASE_SERVICE_ACCOUNT_JSON = JSON.stringify({
+      project_id: "socketagent-test",
+      client_email: "firebase@example.test",
+      private_key: "test-key",
+    });
+    assert.deepEqual(getPushDeliveryCapabilities(), {
+      directFcmConfigured: true,
+      relayConfigured: false,
+    });
+  });
+});
+
+test("reports unreadable Firebase credential files and relay availability", async () => {
+  await withCleanPushEnvironment(async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "socketagent-push-"));
+    try {
+      process.env.FIREBASE_SERVICE_ACCOUNT_PATH = path.join(directory, "missing.json");
+      process.env.RELAY_URL = "wss://relay.example.test";
+      process.env.PAIRING_TOKEN = "pairing-secret";
+      assert.deepEqual(getPushDeliveryCapabilities(), {
+        directFcmConfigured: false,
+        directFcmIssue: "unreadable",
+        relayConfigured: true,
+      });
+      assert.equal(isPushConfigured(), true);
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
 });
 
 test("routes authoritative FCM payloads through the configured relay", async () => {

@@ -53,7 +53,7 @@ import { KeyPair, EncryptedEnvelope, encrypt, decrypt, encryptBinary, decryptBin
 import { listSkills, getSkill, saveSkill, deleteSkill, listMarketplacePlugins, runPluginCommand, listMarketplaces, addMarketplace, updateMarketplace, removeMarketplace } from "./skills-manager";
 import { handleCodexAppMcpRequest, isCodexAppMcpRequest } from "./codex-app-mcp";
 import { clearBackendHealthOverride, getAdvertisedServerSettings, getClaudeAutoCompactWindow, getDefaultCwd, getServerSystemPrompt, invalidateBackendHealthCache, invalidateCodexDriverAvailabilityCache, isServerSystemPromptInitialized, markBackendAuthRequired, normalizeClaudeAutoCompactWindow, setClaudeAutoCompactWindow, setDefaultCwd, setServerSystemPrompt } from "./server-settings";
-import { isPushConfigured, isPushTokenRegistered, registerPushToken, sendPushNotification, shouldSendForwardedPush, unregisterPushToken } from "./push-notifications";
+import { getPushDeliveryCapabilities, isPushTokenRegistered, registerPushToken, sendPushNotification, shouldSendForwardedPush, unregisterPushToken } from "./push-notifications";
 import { SessionPushRunTracker, sessionPushEventId } from "./session-push-state";
 import { assertFileManagerPathAllowed, getFileManagerRoots, listFileManagerDirectory, readDirectoryEntries, resolveFileManagerPath, statFileManagerPath, writeFileManagerText } from "./file-manager";
 import { checkMacosFileAccess, isMacosProtectedUserPath, macosPrivacyErrorDetails, performMacosPermissionAction } from "./macos-permissions";
@@ -1701,6 +1701,7 @@ function serverCapabilitiesPayload(
   transportLane: TransportLane = "control",
 ): Record<string, unknown> {
   const settings = getAdvertisedServerSettings();
+  const pushDelivery = getPushDeliveryCapabilities();
   return {
     type: "server_capabilities",
     serverReleaseVersion: SERVER_RELEASE_VERSION,
@@ -1737,8 +1738,13 @@ function serverCapabilitiesPayload(
     },
     relayPairing: relayPairingInfo(),
     pushNotifications: {
+      version: 2,
       directFcm: true,
-      configured: isPushConfigured(),
+      configured:
+        pushDelivery.directFcmConfigured || pushDelivery.relayConfigured,
+      directFcmConfigured: pushDelivery.directFcmConfigured,
+      directFcmIssue: pushDelivery.directFcmIssue,
+      relayConfigured: pushDelivery.relayConfigured,
     },
     platform: process.platform,
     macosFileAccess: process.platform === "darwin" ? { supported: true } : { supported: false },
@@ -4042,13 +4048,40 @@ function createConnectionHandler(
       case "register_push_token": {
         const token = typeof msg.fcmToken === "string" ? msg.fcmToken : "";
         const appServerId = typeof msg.appServerId === "string" ? msg.appServerId : undefined;
+        const deliveryRoute = msg.deliveryRoute === "relay" || msg.deliveryRoute === "direct"
+          ? msg.deliveryRoute
+          : undefined;
         if (token.trim()) {
+          const pushDelivery = getPushDeliveryCapabilities();
+          if (deliveryRoute === "direct" && !pushDelivery.directFcmConfigured) {
+            sendJson({
+              type: "push_registration_status",
+              appServerId,
+              registered: false,
+              reason: pushDelivery.directFcmIssue || "missing",
+            });
+            break;
+          }
+          if (deliveryRoute === "relay" && !pushDelivery.relayConfigured) {
+            sendJson({
+              type: "push_registration_status",
+              appServerId,
+              registered: false,
+              reason: "relay_unavailable",
+            });
+            break;
+          }
           registerPushToken(
             token,
             typeof msg.platform === "string" ? msg.platform : "android",
             appServerId,
+            deliveryRoute,
           );
-          sendJson({ type: "push_token_registered", appServerId });
+          sendJson({
+            type: "push_token_registered",
+            appServerId,
+            deliveryRoute,
+          });
         } else {
           sendJson({ type: "error", message: "Missing FCM token" });
         }
@@ -4070,10 +4103,13 @@ function createConnectionHandler(
       case "get_push_registration": {
         const token = typeof (msg as any).fcmToken === "string" ? (msg as any).fcmToken : "";
         const appServerId = typeof (msg as any).appServerId === "string" ? (msg as any).appServerId : undefined;
+        const deliveryRoute = (msg as any).deliveryRoute === "relay" || (msg as any).deliveryRoute === "direct"
+          ? (msg as any).deliveryRoute
+          : undefined;
         sendJson({
           type: "push_registration_status",
           appServerId,
-          registered: isPushTokenRegistered(token, appServerId),
+          registered: isPushTokenRegistered(token, appServerId, deliveryRoute),
         });
         break;
       }
