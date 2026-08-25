@@ -231,7 +231,7 @@ install_browser_runtime() {
       run_as_root apt-get update
       local chromium_package="chromium"
       local chromium_candidate
-      chromium_candidate="$(apt-cache policy chromium 2>/dev/null | awk '/Candidate:/ { print $2; exit }')"
+      chromium_candidate="$(apt-cache policy chromium 2>/dev/null | awk '/Candidate:/ && !found { print $2; found=1 }')"
       if [[ -z "$chromium_candidate" || "$chromium_candidate" == "(none)" ]]; then
         chromium_package="chromium-browser"
       fi
