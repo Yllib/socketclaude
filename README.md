@@ -69,6 +69,40 @@ socketagent doctor    # run basic diagnostics
 socketagent restart   # restart the server safely
 ```
 
+## Notifications
+
+Relay-connected phones use SocketAgent's Firebase project and need no Firebase
+setup of their own. Open the computer in the app, choose **Notifications**, grant
+Android notification permission, and enroll the phone.
+
+A phone that connects only over the local network needs a Firebase project so
+the computer can deliver notifications while the app is closed:
+
+1. Create or open a project in the [Firebase console](https://console.firebase.google.com/).
+2. Add an Android app with the package name `com.socketagent.app`. The app
+   nickname can be anything. A signing certificate is not required for push
+   notifications.
+3. Download `google-services.json` to the phone.
+4. In SocketAgent, open the computer, choose **Notifications**, then choose
+   **Manage Firebase** and **Import JSON**. Close and reopen SocketAgent when it
+   asks.
+5. In the Firebase console, open **Project settings**, then **Service accounts**.
+   Generate a private key for the Firebase Admin SDK and save that JSON file on
+   the computer. Do not put this private file on the phone or commit it to Git.
+6. Add its absolute path to `server/.env` in the SocketAgent checkout:
+
+   ```env
+   FIREBASE_SERVICE_ACCOUNT_PATH=/absolute/path/service-account.json
+   ```
+
+7. Run `socketagent restart`, reconnect the app, and enroll the phone under
+   **Notifications**.
+
+The phone's `google-services.json` and the computer's service-account JSON must
+come from the same Firebase project. The app reports missing permission,
+missing registration, unreadable credentials, and project mismatches in the
+Notifications section.
+
 ## Requirements
 
 - Android phone
