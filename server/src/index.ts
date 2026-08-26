@@ -1738,12 +1738,13 @@ function serverCapabilitiesPayload(
     },
     relayPairing: relayPairingInfo(),
     pushNotifications: {
-      version: 2,
+      version: 3,
       directFcm: true,
       configured:
         pushDelivery.directFcmConfigured || pushDelivery.relayConfigured,
       directFcmConfigured: pushDelivery.directFcmConfigured,
       directFcmIssue: pushDelivery.directFcmIssue,
+      directFcmProjectId: pushDelivery.directFcmProjectId,
       relayConfigured: pushDelivery.relayConfigured,
     },
     platform: process.platform,
@@ -4048,6 +4049,9 @@ function createConnectionHandler(
       case "register_push_token": {
         const token = typeof msg.fcmToken === "string" ? msg.fcmToken : "";
         const appServerId = typeof msg.appServerId === "string" ? msg.appServerId : undefined;
+        const firebaseProjectId = typeof msg.firebaseProjectId === "string"
+          ? msg.firebaseProjectId.trim()
+          : "";
         const deliveryRoute = msg.deliveryRoute === "relay" || msg.deliveryRoute === "direct"
           ? msg.deliveryRoute
           : undefined;
@@ -4059,6 +4063,20 @@ function createConnectionHandler(
               appServerId,
               registered: false,
               reason: pushDelivery.directFcmIssue || "missing",
+            });
+            break;
+          }
+          if (
+            deliveryRoute === "direct"
+            && firebaseProjectId
+            && pushDelivery.directFcmProjectId
+            && firebaseProjectId !== pushDelivery.directFcmProjectId
+          ) {
+            sendJson({
+              type: "push_registration_status",
+              appServerId,
+              registered: false,
+              reason: "firebase_project_mismatch",
             });
             break;
           }
@@ -4076,6 +4094,7 @@ function createConnectionHandler(
             typeof msg.platform === "string" ? msg.platform : "android",
             appServerId,
             deliveryRoute,
+            firebaseProjectId || undefined,
           );
           sendJson({
             type: "push_token_registered",

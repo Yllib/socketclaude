@@ -8,6 +8,7 @@ interface StoredPushToken {
   platform: string;
   appServerId?: string;
   deliveryRoute?: "relay" | "direct";
+  firebaseProjectId?: string;
   updatedAt: string;
 }
 
@@ -26,6 +27,7 @@ export type DirectFcmConfigurationIssue = "missing" | "invalid" | "unreadable";
 export interface PushDeliveryCapabilities {
   directFcmConfigured: boolean;
   directFcmIssue?: DirectFcmConfigurationIssue;
+  directFcmProjectId?: string;
   relayConfigured: boolean;
 }
 
@@ -118,11 +120,20 @@ export function registerPushToken(
   platform = "android",
   appServerId?: string,
   deliveryRoute?: "relay" | "direct",
+  firebaseProjectId?: string,
 ): void {
   const token = fcmToken.trim();
   if (!token) return;
 
-  const withoutToken = readStore().filter((entry) => entry.token !== token);
+  const withoutToken = readStore().filter((entry) => {
+    if (entry.token === token) return false;
+    return !(
+      appServerId
+      && deliveryRoute
+      && entry.appServerId === appServerId
+      && entry.deliveryRoute === deliveryRoute
+    );
+  });
   writeStore([
     ...withoutToken,
     {
@@ -130,6 +141,7 @@ export function registerPushToken(
       platform,
       ...(appServerId ? { appServerId } : {}),
       ...(deliveryRoute ? { deliveryRoute } : {}),
+      ...(firebaseProjectId ? { firebaseProjectId } : {}),
       updatedAt: new Date().toISOString(),
     },
   ].slice(-20));
@@ -182,14 +194,35 @@ function hasRequiredServiceAccountFields(value: unknown): boolean {
 
 function directFcmConfiguration(): Pick<
   PushDeliveryCapabilities,
-  "directFcmConfigured" | "directFcmIssue"
+  "directFcmConfigured" | "directFcmIssue" | "directFcmProjectId"
 > {
+  const explicitProjectId = String(
+    process.env.FIREBASE_PROJECT_ID
+      || process.env.GOOGLE_CLOUD_PROJECT
+      || process.env.GCLOUD_PROJECT
+      || "",
+  ).trim();
+  const resultForCredentials = (
+    credentials: Record<string, unknown>,
+  ): Pick<
+    PushDeliveryCapabilities,
+    "directFcmConfigured" | "directFcmIssue" | "directFcmProjectId"
+  > => {
+    if (!hasRequiredServiceAccountFields(credentials)) {
+      return { directFcmConfigured: false, directFcmIssue: "invalid" };
+    }
+    const credentialProjectId = typeof credentials.project_id === "string"
+      ? credentials.project_id.trim()
+      : "";
+    return {
+      directFcmConfigured: true,
+      directFcmProjectId: explicitProjectId || credentialProjectId,
+    };
+  };
   const rawJson = String(process.env.FIREBASE_SERVICE_ACCOUNT_JSON || "").trim();
   if (rawJson) {
     try {
-      return hasRequiredServiceAccountFields(JSON.parse(rawJson))
-        ? { directFcmConfigured: true }
-        : { directFcmConfigured: false, directFcmIssue: "invalid" };
+      return resultForCredentials(JSON.parse(rawJson));
     } catch {
       return { directFcmConfigured: false, directFcmIssue: "invalid" };
     }
@@ -205,9 +238,7 @@ function directFcmConfiguration(): Pick<
   }
   try {
     const credentials = JSON.parse(fs.readFileSync(credentialsPath, "utf-8"));
-    return hasRequiredServiceAccountFields(credentials)
-      ? { directFcmConfigured: true }
-      : { directFcmConfigured: false, directFcmIssue: "invalid" };
+    return resultForCredentials(credentials);
   } catch (error: unknown) {
     const hasFileErrorCode = error !== null
       && typeof error === "object"
@@ -438,27 +469,33 @@ export async function sendPushNotification(
   const directEntries = relayResult && relayResult.attempted > 0
     ? entries.filter((entry) => entry.deliveryRoute === "direct")
     : entries;
-  const tokens = directEntries.map((entry) => entry.token).filter(Boolean);
-  if (tokens.length === 0) {
+  if (directEntries.length === 0) {
     return relayResult ?? { sent: 0, attempted: 0 };
   }
   const auth = getFcmAuth();
   if (!auth) {
     return {
       sent: relayResult?.sent ?? 0,
-      attempted: (relayResult?.attempted ?? 0) + tokens.length,
+      attempted: (relayResult?.attempted ?? 0) + directEntries.length,
     };
   }
   const projectId = await getFcmProjectId(auth);
   if (!projectId) {
     return {
       sent: relayResult?.sent ?? 0,
-      attempted: (relayResult?.attempted ?? 0) + tokens.length,
+      attempted: (relayResult?.attempted ?? 0) + directEntries.length,
     };
+  }
+  const projectEntries = directEntries.filter(
+    (entry) => !entry.firebaseProjectId || entry.firebaseProjectId === projectId,
+  );
+  const tokens = projectEntries.map((entry) => entry.token).filter(Boolean);
+  if (tokens.length === 0) {
+    return relayResult ?? { sent: 0, attempted: 0 };
   }
 
   const groups = new Map<string, StoredPushToken[]>();
-  for (const entry of directEntries) {
+  for (const entry of projectEntries) {
     const key = entry.appServerId || "";
     groups.set(key, [...(groups.get(key) || []), entry]);
   }

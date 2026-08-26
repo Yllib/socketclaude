@@ -828,6 +828,7 @@ export interface RegisterPushTokenMessage {
   platform?: string;
   appServerId?: string;
   deliveryRoute?: "relay" | "direct";
+  firebaseProjectId?: string;
 }
 
 export interface UnregisterPushTokenMessage {
@@ -1635,7 +1636,7 @@ export interface PushRegistrationStatusServerMessage {
   type: "push_registration_status";
   appServerId?: string;
   registered: boolean;
-  reason?: "missing" | "invalid" | "unreadable" | "relay_unavailable";
+  reason?: "missing" | "invalid" | "unreadable" | "relay_unavailable" | "firebase_project_mismatch";
 }
 
 export interface ServerCapabilitiesMessage {
@@ -1690,6 +1691,8 @@ export interface ServerCapabilitiesMessage {
     configured?: boolean;
     /** The configured Firebase service account passed local validation. */
     directFcmConfigured?: boolean;
+    /** Firebase project that issues tokens accepted by direct delivery. */
+    directFcmProjectId?: string;
     directFcmIssue?: "missing" | "invalid" | "unreadable";
     /** The server has a relay URL and pairing token for push delivery. */
     relayConfigured?: boolean;

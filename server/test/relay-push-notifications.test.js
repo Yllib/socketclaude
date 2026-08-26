@@ -66,6 +66,22 @@ test("reports missing, invalid, and valid direct Firebase setup separately", asy
     });
     assert.deepEqual(getPushDeliveryCapabilities(), {
       directFcmConfigured: true,
+      directFcmProjectId: "socketagent-test",
+      relayConfigured: false,
+    });
+  });
+});
+
+test("reports an explicit Firebase target project", async () => {
+  await withCleanPushEnvironment(async () => {
+    process.env.FIREBASE_PROJECT_ID = "socketagent-target";
+    process.env.FIREBASE_SERVICE_ACCOUNT_JSON = JSON.stringify({
+      client_email: "firebase@example.test",
+      private_key: "test-key",
+    });
+    assert.deepEqual(getPushDeliveryCapabilities(), {
+      directFcmConfigured: true,
+      directFcmProjectId: "socketagent-target",
       relayConfigured: false,
     });
   });
