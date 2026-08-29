@@ -227,6 +227,14 @@ if ! $BUNDLE; then
     echo "Play APK is missing Google Play Billing permission." >&2
     exit 1
   fi
+  if [[ "$FLAVOR" == "play" && "$REMOTE_PERMISSIONS" == *"android.permission.SCHEDULE_EXACT_ALARM"* ]]; then
+    echo "Play APK must not request exact alarm access." >&2
+    exit 1
+  fi
+  if [[ "$FLAVOR" == "play" && "$REMOTE_PERMISSIONS" == *"android.permission.SYSTEM_ALERT_WINDOW"* ]]; then
+    echo "Play APK must not request display-over-other-apps access." >&2
+    exit 1
+  fi
   if [[ "$FLAVOR" == "direct" && "$REMOTE_PERMISSIONS" != *"android.permission.REQUEST_INSTALL_PACKAGES"* ]]; then
     echo "Direct APK is missing package installation permission." >&2
     exit 1
