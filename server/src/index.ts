@@ -4135,7 +4135,6 @@ function createConnectionHandler(
         const historyKind = page.historyKind;
         const todos = getTodos(msg.sessionId);
         const taskStates = getTaskStates(msg.sessionId);
-        const browserSessions = getBrowserSessionHistory(msg.sessionId);
         const lastSuggestion = getLastPromptSuggestion(msg.sessionId);
         sendJson({
           type: "session_history",
@@ -4150,7 +4149,6 @@ function createConnectionHandler(
           ...(openTraceId ? { openTraceId } : {}),
           ...(todos.length > 0 ? { todos } : {}),
           taskStates,
-          ...(browserSessions.length > 0 ? { browserSessions } : {}),
           runStats: getSessionRunStats(msg.sessionId) || {
             completedCount: 0,
             totalDurationMs: 0,

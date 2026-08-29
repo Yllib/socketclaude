@@ -10,13 +10,12 @@ process.env.SOCKET_AGENT_DATA_DIR = dataDir;
 const { publishBrowserSessionCard } = require("../dist/app-tool-handlers");
 const {
   appendHistory,
-  getBrowserSessionHistory,
   getHistory,
 } = require("../dist/session-store");
 
 test.after(() => fs.rmSync(dataDir, { recursive: true, force: true }));
 
-test("browser cards are durable and reopening a profile updates one transcript row", () => {
+test("every browser card send appends at its exact transcript position", () => {
   const sessionId = "browser-card-session";
   const packets = [];
   const ctx = {
@@ -39,26 +38,17 @@ test("browser cards are durable and reopening a profile updates one transcript r
   }, browser.url);
 
   const cards = getHistory(sessionId).filter((entry) => entry.role === "browser_session");
-  assert.equal(cards.length, 1);
-  assert.equal(cards[0].toolInput.profile, "google-play-rubano");
-  assert.equal(cards[0].toolInput.url, "https://admin.google.com/ac/domains/manage");
+  assert.equal(cards.length, 2);
+  assert.equal(cards[0].toolInput.url, "https://play.google.com/console");
+  assert.equal(cards[1].toolInput.url, "https://admin.google.com/ac/domains/manage");
   assert.equal(cards[0].entryId, first.entryId);
   assert.equal(cards[0].sessionSeq, first.sessionSeq);
-  assert.ok(second.revision > first.revision);
+  assert.equal(cards[1].entryId, second.entryId);
+  assert.equal(cards[1].sessionSeq, second.sessionSeq);
+  assert.notEqual(second.entryId, first.entryId);
+  assert.ok(second.sessionSeq > first.sessionSeq);
   assert.equal(packets.length, 2);
-  assert.equal(packets[1].entryId, cards[0].entryId);
-  assert.equal(packets[1].sessionSeq, cards[0].sessionSeq);
-  assert.equal(packets[1].revision, cards[0].revision);
-  assert.deepEqual(getBrowserSessionHistory(sessionId), cards);
-
-  appendHistory(sessionId, {
-    ...cards[0],
-    entryId: "legacy-browser-card",
-    sessionSeq: undefined,
-    revision: undefined,
-    timestamp: new Date(Date.now() + 1_000).toISOString(),
-  });
-  const recovered = getBrowserSessionHistory(sessionId);
-  assert.equal(recovered.length, 1);
-  assert.equal(recovered[0].entryId, `browser-session:${browser.profile}`);
+  assert.equal(packets[1].entryId, cards[1].entryId);
+  assert.equal(packets[1].sessionSeq, cards[1].sessionSeq);
+  assert.equal(packets[1].revision, cards[1].revision);
 });

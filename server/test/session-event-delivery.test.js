@@ -139,6 +139,22 @@ test("Work Review cards use acknowledged delivery and stable replay IDs", () => 
   delivery.dispose();
 });
 
+test("protected browser cards use acknowledged delivery", () => {
+  const delivery = new SessionEventDelivery(() => {});
+  const prepared = delivery.prepare({
+    type: "browser_session_open",
+    sessionId: "browser-session",
+    profile: "google-play-rubano",
+    entryId: "browser-session:google-play-rubano",
+    sessionSeq: 12,
+    revision: 4,
+  });
+  assert.ok(prepared.deliveryId);
+  assert.equal(delivery.pendingCount, 1);
+  assert.equal(delivery.acknowledge(prepared.deliveryId), true);
+  delivery.dispose();
+});
+
 test("Monitor output cards use acknowledged delivery", () => {
   const delivery = new SessionEventDelivery(() => {});
   const prepared = delivery.prepare({

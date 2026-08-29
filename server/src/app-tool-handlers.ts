@@ -126,7 +126,6 @@ export function publishBrowserSessionCard(
     content: session.label,
     toolName: "BrowserSession",
     toolInput,
-    entryId: `browser-session:${session.profile}`,
     timestamp: new Date().toISOString(),
   }) as Record<string, any> | undefined;
   ctx.send({

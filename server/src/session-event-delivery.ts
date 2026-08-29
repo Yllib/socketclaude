@@ -19,6 +19,7 @@ function requiresAcknowledgement(message: SessionEvent): boolean {
     || type === "file"
     || type === "html_plan"
     || type === "work_review_card"
+    || type === "browser_session_open"
     || type === "monitor_output"
     || ((type === "text" || type === "thinking") && message.finalSnapshot === true);
 }
