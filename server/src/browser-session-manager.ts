@@ -110,6 +110,40 @@ function restrictDirectory(target: string): void {
   try { fs.chmodSync(target, 0o700); } catch {}
 }
 
+/** Chromium can leave control files and singleton links behind after a crash. */
+export function removeStaleBrowserControlFile(profileDir: string): void {
+  const singletonLock = path.join(profileDir, "SingletonLock");
+  try {
+    const lockTarget = fs.readlinkSync(singletonLock);
+    const pidMatch = /-(\d+)$/.exec(lockTarget);
+    if (pidMatch) {
+      const pid = Number(pidMatch[1]);
+      try {
+        process.kill(pid, 0);
+        throw new Error(`Browser profile is still owned by process ${pid}.`);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+      }
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT"
+      && !String((error as Error).message).startsWith("Browser profile is still owned")) {
+      throw new Error(`Could not inspect the browser profile lock: ${(error as Error).message}`);
+    }
+    if (String((error as Error).message).startsWith("Browser profile is still owned")) throw error;
+  }
+
+  for (const name of ["DevToolsActivePort", "SingletonLock", "SingletonSocket", "SingletonCookie"]) {
+    try {
+      fs.rmSync(path.join(profileDir, name), { force: true });
+    } catch (error) {
+      throw new Error(
+        `Could not remove stale browser control file ${name}: ${(error as Error).message}`,
+      );
+    }
+  }
+}
+
 export function normalizeBrowserProfile(value: string): string {
   const normalized = value.trim().toLowerCase();
   if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(normalized)) {
@@ -278,6 +312,7 @@ export class BrowserSessionManager {
     fs.mkdirSync(profileDir, { recursive: true, mode: 0o700 });
     restrictDirectory(root);
     restrictDirectory(profileDir);
+    removeStaleBrowserControlFile(profileDir);
     const processHandle = spawn(browserExecutable, [
       "--headless",
       "--remote-debugging-port=0",
@@ -608,7 +643,7 @@ export class BrowserSessionManager {
   }
 
   private async waitForPageTarget(port: number): Promise<CdpTarget[]> {
-    for (let attempt = 0; attempt < 50; attempt++) {
+    for (let attempt = 0; attempt < 150; attempt++) {
       try {
         const response = await fetch(`http://127.0.0.1:${port}/json/list`);
         const targets = await response.json() as CdpTarget[];
@@ -616,7 +651,7 @@ export class BrowserSessionManager {
       } catch {}
       await wait(100);
     }
-    throw new Error("Browser page did not become available.");
+    throw new Error("Browser page did not become available within 15 seconds.");
   }
 }
 

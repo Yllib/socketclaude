@@ -2134,6 +2134,32 @@ export function getLastPermissionMode(sessionId: string): string | undefined {
   return historyDatabase().getLatestByRole(sessionId, "permission_mode")?.permissionMode;
 }
 
+/** Browser cards stay available even when their transcript position is older than the resume window. */
+export function getBrowserSessionHistory(sessionId: string): HistoryEntry[] {
+  ensureHistoryDatabaseSession(sessionId);
+  const byProfile = new Map<string, HistoryEntry>();
+  for (const entry of hydrateHistoryEntries(historyDatabase().getByRole(sessionId, "browser_session"))) {
+    const profile = String(entry.toolInput?.profile || "").trim();
+    const key = profile || String(entry.entryId || entry.sessionSeq || byProfile.size);
+    const existing = byProfile.get(key);
+    if (!existing) {
+      byProfile.set(key, entry);
+      continue;
+    }
+    const canonicalEntryId = profile ? `browser-session:${profile}` : "";
+    const existingIsCanonical = existing.entryId === canonicalEntryId;
+    const incomingIsCanonical = entry.entryId === canonicalEntryId;
+    if ((!existingIsCanonical && incomingIsCanonical)
+      || (existingIsCanonical === incomingIsCanonical
+        && Date.parse(entry.timestamp || "") >= Date.parse(existing.timestamp || ""))) {
+      byProfile.set(key, entry);
+    }
+  }
+  return [...byProfile.values()].sort(
+    (left, right) => Number(left.sessionSeq || 0) - Number(right.sessionSeq || 0),
+  );
+}
+
 /**
  * Get a page of history entries.
  * Returns the most recent `limit` entries by default, or entries starting at `offset`.

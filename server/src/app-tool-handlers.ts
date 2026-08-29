@@ -56,6 +56,7 @@ import {
   browserSessionManager,
   normalizeBrowserProfile,
   normalizeBrowserUrl,
+  type BrowserSessionSummary,
 } from "./browser-session-manager";
 
 export interface AppToolContext {
@@ -105,6 +106,41 @@ export interface BrowserSessionToolArgs {
   delta_y?: number;
 }
 
+export function publishBrowserSessionCard(
+  ctx: Pick<AppToolContext, "getSessionId" | "appendHistory" | "send">,
+  session: BrowserSessionSummary,
+  fallbackUrl: string,
+  runtimeRequired = false,
+): Record<string, any> | undefined {
+  const url = session.url || fallbackUrl;
+  const toolInput = {
+    profile: session.profile,
+    label: session.label,
+    url,
+    width: 430,
+    height: 860,
+    ...(runtimeRequired ? { runtimeRequired: true } : {}),
+  };
+  const positioned = ctx.appendHistory?.({
+    role: "browser_session",
+    content: session.label,
+    toolName: "BrowserSession",
+    toolInput,
+    entryId: `browser-session:${session.profile}`,
+    timestamp: new Date().toISOString(),
+  }) as Record<string, any> | undefined;
+  ctx.send({
+    type: "browser_session_open",
+    ...toolInput,
+    sessionId: ctx.getSessionId(),
+    ...(positioned?.entryId ? { entryId: positioned.entryId } : {}),
+    ...(positioned?.sessionSeq ? { sessionSeq: positioned.sessionSeq } : {}),
+    ...(positioned?.revision ? { revision: positioned.revision } : {}),
+    ...(positioned?.timestamp ? { timestamp: positioned.timestamp } : {}),
+  });
+  return positioned;
+}
+
 export async function handleBrowserSessionTool(
   ctx: AppToolContext,
   args: BrowserSessionToolArgs,
@@ -121,15 +157,7 @@ export async function handleBrowserSessionTool(
       case "open": {
         if (!args.url) throw new Error("BrowserSession open requires a URL.");
         const session = await browserSessionManager.open(profile, args.url, args.label);
-        ctx.send({
-          type: "browser_session_open",
-          profile: session.profile,
-          label: session.label,
-          url: session.url || args.url,
-          width: 430,
-          height: 860,
-          sessionId: ctx.getSessionId(),
-        });
+        publishBrowserSessionCard(ctx, session, args.url);
         return {
           content: [{
             type: "text",
@@ -137,8 +165,11 @@ export async function handleBrowserSessionTool(
           }],
         };
       }
-      case "status":
-        return { content: [{ type: "text", text: JSON.stringify(await browserSessionManager.status(profile), null, 2) }] };
+      case "status": {
+        const session = await browserSessionManager.status(profile);
+        publishBrowserSessionCard(ctx, session, session.url || args.url || "https://localhost/");
+        return { content: [{ type: "text", text: JSON.stringify(session, null, 2) }] };
+      }
       case "snapshot":
         return { content: [{ type: "text", text: JSON.stringify(await browserSessionManager.snapshot(profile), null, 2) }] };
       case "navigate":
@@ -176,16 +207,14 @@ export async function handleBrowserSessionTool(
       && args.url
       && /No supported Chrome, Chromium, or Edge installation was found/.test(message)) {
       const profile = normalizeBrowserProfile(String(args.profile || ""));
-      ctx.send({
-        type: "browser_session_open",
+      publishBrowserSessionCard(ctx, {
         profile,
         label: String(args.label || profile).trim().slice(0, 80) || profile,
+        running: false,
         url: normalizeBrowserUrl(args.url),
-        width: 430,
-        height: 860,
-        sessionId: ctx.getSessionId(),
-        runtimeRequired: true,
-      });
+        title: "",
+        lastUsedAt: new Date().toISOString(),
+      }, args.url, true);
     }
     return {
       content: [{ type: "text", text: message }],

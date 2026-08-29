@@ -8,6 +8,7 @@ const {
   browserDataDir,
   normalizeBrowserProfile,
   normalizeBrowserUrl,
+  removeStaleBrowserControlFile,
   resolveBrowserBinary,
 } = require("../dist/browser-session-manager");
 test("browser navigation permits normal cross-domain and local HTTP URLs", () => {
@@ -53,4 +54,25 @@ test("Ubuntu snap Chromium stores persistent profiles in its confined writable h
     browserDataDir("/usr/bin/chromium-browser"),
     path.join(process.env.HOME || os.homedir(), "snap", "chromium", "common", "socketagent-browser-sessions"),
   );
+});
+
+test("browser launch discards stale Chromium control files", () => {
+  const profileDir = fs.mkdtempSync(path.join(os.tmpdir(), "socketagent-browser-profile-"));
+  const activePortPath = path.join(profileDir, "DevToolsActivePort");
+  const singletonLock = path.join(profileDir, "SingletonLock");
+  const singletonSocket = path.join(profileDir, "SingletonSocket");
+  const singletonCookie = path.join(profileDir, "SingletonCookie");
+  try {
+    fs.writeFileSync(activePortPath, "41723\n/devtools/browser/stale\n");
+    fs.symlinkSync("agent-dev-999999999", singletonLock);
+    fs.symlinkSync("/tmp/socketagent-missing/SingletonSocket", singletonSocket);
+    fs.symlinkSync("123456789", singletonCookie);
+    removeStaleBrowserControlFile(profileDir);
+    assert.equal(fs.existsSync(activePortPath), false);
+    assert.throws(() => fs.lstatSync(singletonLock), { code: "ENOENT" });
+    assert.throws(() => fs.lstatSync(singletonSocket), { code: "ENOENT" });
+    assert.throws(() => fs.lstatSync(singletonCookie), { code: "ENOENT" });
+  } finally {
+    fs.rmSync(profileDir, { recursive: true, force: true });
+  }
 });

@@ -784,44 +784,6 @@ export interface TerminalKillMessage {
   type: "terminal_kill";
 }
 
-export interface AdbBridgeSidecarStartMessage {
-  type: "adb_bridge_sidecar_start";
-  requestId?: string;
-  localPort?: number;
-}
-
-export interface AdbBridgeSidecarStopMessage {
-  type: "adb_bridge_sidecar_stop";
-  requestId?: string;
-}
-
-export interface AdbBridgeSidecarStatusMessage {
-  type: "adb_bridge_sidecar_status";
-  requestId?: string;
-}
-
-export interface AdbCommandMessage {
-  type: "adb_command";
-  requestId?: string;
-  command: "pair" | "connect";
-  host: string;
-  port: number;
-  code?: string;
-}
-
-export interface PhoneAdbResultMessage {
-  type: "phone_adb_result";
-  requestId: string;
-  result: Record<string, unknown>;
-}
-
-export interface PhoneAdbStreamChunkMessage {
-  type: "phone_adb_stream_chunk";
-  requestId: string;
-  stream: "stdout" | "stderr" | string;
-  data: string;
-}
-
 export interface RegisterPushTokenMessage {
   type: "register_push_token";
   fcmToken: string;
@@ -1185,12 +1147,6 @@ export type ClientMessage =
   | TerminalResizeMessage
   | TerminalDetachMessage
   | TerminalKillMessage
-  | AdbBridgeSidecarStartMessage
-  | AdbBridgeSidecarStopMessage
-  | AdbBridgeSidecarStatusMessage
-  | AdbCommandMessage
-  | PhoneAdbResultMessage
-  | PhoneAdbStreamChunkMessage
   | RegisterPushTokenMessage
   | UnregisterPushTokenMessage
   | GetPushRegistrationMessage
@@ -1764,7 +1720,7 @@ export interface SessionArchiveFailedServerMessage {
 }
 
 export interface HistoryEntry {
-  role: "user" | "assistant" | "tool_call" | "tool_result" | "tool_image" | "question" | "secure_input" | "html_plan" | "work_review" | "todos_update" | "codex_plan" | "user_uuid" | "elicitation_url" | "prompt_suggestion" | "monitor" | "notification" | "task_state" | "permission_mode" | "run_boundary";
+  role: "user" | "assistant" | "tool_call" | "tool_result" | "tool_image" | "question" | "secure_input" | "browser_session" | "html_plan" | "work_review" | "todos_update" | "codex_plan" | "user_uuid" | "elicitation_url" | "prompt_suggestion" | "monitor" | "notification" | "task_state" | "permission_mode" | "run_boundary";
   content: string;
   toolName?: string;
   toolInput?: Record<string, unknown>;
@@ -1929,6 +1885,8 @@ export interface SessionHistoryServerMessage {
   todos?: Record<string, unknown>[];
   /** Latest lifecycle revision for tasks/subagents, independent of the delta cursor. */
   taskStates?: HistoryEntry[];
+  /** Browser cards remain available even when their original position is outside the bounded page. */
+  browserSessions?: HistoryEntry[];
   /** Authoritative logical-run aggregates, including a current run if active. */
   runStats?: SessionRunStats;
 }
@@ -2630,37 +2588,6 @@ export interface TerminalErrorServerMessage {
   message: string;
 }
 
-export interface PhoneAdbRequestServerMessage {
-  type: "phone_adb_request";
-  requestId: string;
-  command: string;
-  shellCommand?: string;
-  args?: string[];
-  timeoutSeconds?: number;
-  maxBytes?: number;
-  fileName?: string;
-  fileSize?: number;
-}
-
-export interface PhoneAdbFileChunkServerMessage {
-  type: "phone_adb_file_chunk";
-  requestId: string;
-  chunkIndex: number;
-  data: string;
-}
-
-export interface PhoneAdbFileEndServerMessage {
-  type: "phone_adb_file_end";
-  requestId: string;
-  ok: boolean;
-  message?: string;
-}
-
-export interface PhoneAdbCancelServerMessage {
-  type: "phone_adb_cancel";
-  requestId: string;
-}
-
 export interface SessionMemoryStateServerMessage {
   type: "session_memory_state";
   sessionId: string;
@@ -2809,9 +2736,5 @@ export type ServerMessage =
   | TerminalOutputServerMessage
   | TerminalExitedServerMessage
   | TerminalErrorServerMessage
-  | PhoneAdbRequestServerMessage
-  | PhoneAdbFileChunkServerMessage
-  | PhoneAdbFileEndServerMessage
-  | PhoneAdbCancelServerMessage
   | SessionMemoryStateServerMessage
   | SessionMemoryErrorServerMessage;

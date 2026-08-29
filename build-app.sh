@@ -5,6 +5,8 @@ set -euo pipefail
 #
 # Usage:
 #   ./build-app.sh                     # Build APK on remote build machine
+#   ./build-app.sh --flavor play       # Build the Play APK for validation
+#   ./build-app.sh --flavor play --bundle  # Build the Play Store AAB
 #   ./build-app.sh --deploy            # Build, bump patch, deploy to GitHub
 #   ./build-app.sh --deploy --bump minor   # Build, bump minor, deploy
 
@@ -15,6 +17,7 @@ PUBSPEC="$APP_DIR/pubspec.yaml"
 VERSION_FILE="$REPO_ROOT/app-version.json"
 SERVER_REPO="Yllib/socketagent"
 APK_PATH="$APP_DIR/build/app/outputs/flutter-apk/app-release.apk"
+AAB_PATH="$APP_DIR/build/app/outputs/bundle/playRelease/app-play-release.aab"
 APP_ID_OVERRIDE="${SOCKETAGENT_APPLICATION_ID:-}"
 SIGN_RELEASES="${SOCKETAGENT_SIGN_RELEASES:-1}"
 SIGNING_KEY="${SOCKETAGENT_GIT_SIGNING_KEY:-$HOME/.ssh/id_rsa.pub}"
@@ -30,15 +33,48 @@ REMOTE_ANDROID_HOME="C:/Users/billy/AppData/Local/Android/Sdk"
 
 BUMP="patch"
 DEPLOY=false
+FLAVOR="direct"
+BUNDLE=false
 
 while [[ $# -gt 0 ]]; do
   case $1 in
     --deploy) DEPLOY=true; shift ;;
+    --flavor) FLAVOR="$2"; shift 2 ;;
+    --bundle) BUNDLE=true; shift ;;
     --local) echo "Local app builds are disabled. Use the remote build machine."; exit 1 ;;
     --bump) BUMP="$2"; shift 2 ;;
-    *) echo "Unknown option: $1"; echo "Usage: $0 [--deploy] [--bump major|minor|patch]"; exit 1 ;;
+    *) echo "Unknown option: $1"; echo "Usage: $0 [--flavor direct|play] [--bundle] [--deploy] [--bump major|minor|patch]"; exit 1 ;;
   esac
 done
+
+if [[ "$FLAVOR" != "direct" && "$FLAVOR" != "play" ]]; then
+  echo "Invalid flavor: $FLAVOR (use direct or play)" >&2
+  exit 1
+fi
+if $DEPLOY && [[ "$FLAVOR" != "direct" ]]; then
+  echo "GitHub deployment is only available for the direct flavor." >&2
+  exit 1
+fi
+if $BUNDLE && [[ "$FLAVOR" != "play" ]]; then
+  echo "App bundles are only supported for the Play flavor." >&2
+  exit 1
+fi
+if $BUNDLE && $DEPLOY; then
+  echo "Play app bundles cannot use the direct GitHub deployment flow." >&2
+  exit 1
+fi
+
+if $BUNDLE; then
+  BUILD_KIND="appbundle"
+  ARTIFACT_LABEL="Play app bundle"
+  ARTIFACT_PATH="$AAB_PATH"
+  REMOTE_ARTIFACT_RELATIVE="build/app/outputs/bundle/playRelease/app-play-release.aab"
+else
+  BUILD_KIND="apk"
+  ARTIFACT_LABEL="$FLAVOR APK"
+  ARTIFACT_PATH="$APK_PATH"
+  REMOTE_ARTIFACT_RELATIVE="build/app/outputs/flutter-apk/app-${FLAVOR}-release.apk"
+fi
 
 git_signed() {
   if [[ "$SIGN_RELEASES" == "0" || "$SIGN_RELEASES" == "false" || "$SIGN_RELEASES" == "off" ]]; then
@@ -121,11 +157,11 @@ if $DEPLOY; then
   VERSION_BUMPED=true
 else
   NEW_VERSION="$CURRENT"
-  echo "Building v$CURRENT (no version bump)"
+  echo "Building $FLAVOR v$CURRENT (no version bump)"
 fi
 
-# ── Build APK ──
-echo "Building APK on remote ($REMOTE_HOST)..."
+# ── Build Android artifact ──
+echo "Building $ARTIFACT_LABEL on remote ($REMOTE_HOST)..."
 if [[ -n "$APP_ID_OVERRIDE" ]]; then
   echo "Using Android applicationId override: $APP_ID_OVERRIDE"
 fi
@@ -140,7 +176,7 @@ tar cf - -C "$APP_DIR" \
   --exclude='.idea' \
   --exclude='*.iml' \
   --exclude='.flutter-plugins-dependencies' \
-  . | ssh "$REMOTE_HOST" "powershell -Command \"if (-not (Test-Path '$REMOTE_DIR')) { New-Item -ItemType Directory -Path '$REMOTE_DIR' -Force | Out-Null }; Set-Location '$REMOTE_DIR'; tar xf -\""
+  . | ssh "$REMOTE_HOST" "powershell -Command \"if (Test-Path '$REMOTE_DIR') { Remove-Item '$REMOTE_DIR' -Recurse -Force }; New-Item -ItemType Directory -Path '$REMOTE_DIR' -Force | Out-Null; Set-Location '$REMOTE_DIR'; tar xf -\""
 
 # Build on remote
 echo "  Building on remote..."
@@ -148,48 +184,108 @@ REMOTE_APP_ID_ASSIGNMENT=""
 if [[ -n "$APP_ID_OVERRIDE" ]]; then
   REMOTE_APP_ID_ASSIGNMENT="\$env:SOCKETAGENT_APPLICATION_ID='$APP_ID_OVERRIDE'; "
 fi
-ssh "$REMOTE_HOST" "powershell -Command \"${REMOTE_APP_ID_ASSIGNMENT}\$env:ANDROID_HOME='$REMOTE_ANDROID_HOME'; Set-Location '$REMOTE_DIR'; \$apk='build/app/outputs/flutter-apk/app-release.apk'; \$gradleApk='build/app/outputs/apk/release/app-release.apk'; Remove-Item \$apk,\$gradleApk -Force -ErrorAction SilentlyContinue; & '$REMOTE_FLUTTER' build apk --release 2>&1; \$code=\$LASTEXITCODE; if ((Test-Path \$apk) -and \$code -ne 0) { Write-Output \\\"Flutter exited with code \$code after producing app-release.apk; continuing.\\\"; exit 0 }; exit \$code\"" | while read -r line; do
+BUILD_LOG="$(mktemp)"
+trap - ERR
+set +e
+ssh "$REMOTE_HOST" "powershell -Command \"${REMOTE_APP_ID_ASSIGNMENT}\$env:ANDROID_HOME='$REMOTE_ANDROID_HOME'; Set-Location '$REMOTE_DIR'; \$artifact='$REMOTE_ARTIFACT_RELATIVE'; Remove-Item \$artifact -Force -ErrorAction SilentlyContinue; & '$REMOTE_FLUTTER' build '$BUILD_KIND' --release --flavor '$FLAVOR' --dart-define 'SOCKETAGENT_DISTRIBUTION=$FLAVOR' 2>&1; exit \$LASTEXITCODE\"" 2>&1 | tee "$BUILD_LOG" | while read -r line; do
   echo "  [remote] $line"
 done
-
-# Refuse to publish a stale or mislabeled artifact. This is deliberately
-# checked on the build host with Android's own manifest parser before the APK
-# is copied, signed metadata is generated, or any release commits are made.
-echo "  Verifying embedded app version..."
-REMOTE_BADGING="$(ssh "$REMOTE_HOST" "powershell -NoProfile -Command \"\$aapt = Get-ChildItem '$REMOTE_ANDROID_HOME/build-tools' -Recurse -Filter aapt.exe | Sort-Object FullName | Select-Object -Last 1 -ExpandProperty FullName; if (-not \$aapt) { throw 'aapt.exe not found' }; & \$aapt dump badging '$REMOTE_DIR/build/app/outputs/flutter-apk/app-release.apk' | Select-Object -First 1\"" | tr -d '\r')"
-echo "  [remote] $REMOTE_BADGING"
-if [[ "$REMOTE_BADGING" != *"versionName='$NEW_VERSION'"* ]]; then
-  echo "Embedded APK version name does not match release: expected $NEW_VERSION" >&2
-  exit 1
+REMOTE_BUILD_EXIT=${PIPESTATUS[0]}
+set -e
+trap restore_version_on_failure ERR
+if [[ $REMOTE_BUILD_EXIT -ne 0 ]]; then
+  if $BUNDLE && grep -Fq "Release app bundle failed to strip debug symbols from native libraries." "$BUILD_LOG"; then
+    echo "  Flutter hit its known app-bundle symbol-check failure; validating the generated bundle before accepting it."
+  else
+    rm -f "$BUILD_LOG"
+    echo "Remote Flutter build failed with exit code $REMOTE_BUILD_EXIT." >&2
+    exit "$REMOTE_BUILD_EXIT"
+  fi
 fi
-if [[ "$REMOTE_BADGING" != *"versionCode='$BUILD'"* ]]; then
-  echo "Embedded APK version code does not match release: expected $BUILD" >&2
-  exit 1
+rm -f "$BUILD_LOG"
+
+if ! $BUNDLE; then
+  # Refuse to publish a stale or mislabeled APK. Android's manifest parser runs
+  # before the artifact is copied or any release commits are made.
+  echo "  Verifying embedded app version..."
+  REMOTE_BADGING="$(ssh "$REMOTE_HOST" "powershell -NoProfile -Command \"\$aapt = Get-ChildItem '$REMOTE_ANDROID_HOME/build-tools' -Recurse -Filter aapt.exe | Sort-Object FullName | Select-Object -Last 1 -ExpandProperty FullName; if (-not \$aapt) { throw 'aapt.exe not found' }; & \$aapt dump badging '$REMOTE_DIR/$REMOTE_ARTIFACT_RELATIVE' | Select-Object -First 1\"" | tr -d '\r')"
+  echo "  [remote] $REMOTE_BADGING"
+  if [[ "$REMOTE_BADGING" != *"versionName='$NEW_VERSION'"* ]]; then
+    echo "Embedded APK version name does not match release: expected $NEW_VERSION" >&2
+    exit 1
+  fi
+  if [[ "$REMOTE_BADGING" != *"versionCode='$BUILD'"* ]]; then
+    echo "Embedded APK version code does not match release: expected $BUILD" >&2
+    exit 1
+  fi
+  REMOTE_PERMISSIONS="$(ssh "$REMOTE_HOST" "powershell -NoProfile -Command \"\$aapt = Get-ChildItem '$REMOTE_ANDROID_HOME/build-tools' -Recurse -Filter aapt.exe | Sort-Object FullName | Select-Object -Last 1 -ExpandProperty FullName; if (-not \$aapt) { throw 'aapt.exe not found' }; & \$aapt dump permissions '$REMOTE_DIR/$REMOTE_ARTIFACT_RELATIVE'\"" | tr -d '\r')"
+  if [[ "$FLAVOR" == "play" && "$REMOTE_PERMISSIONS" == *"android.permission.REQUEST_INSTALL_PACKAGES"* ]]; then
+    echo "Play APK must not request package installation permission." >&2
+    exit 1
+  fi
+  if [[ "$FLAVOR" == "play" && "$REMOTE_PERMISSIONS" != *"com.android.vending.BILLING"* ]]; then
+    echo "Play APK is missing Google Play Billing permission." >&2
+    exit 1
+  fi
+  if [[ "$FLAVOR" == "direct" && "$REMOTE_PERMISSIONS" != *"android.permission.REQUEST_INSTALL_PACKAGES"* ]]; then
+    echo "Direct APK is missing package installation permission." >&2
+    exit 1
+  fi
+  if [[ "$FLAVOR" == "direct" && "$REMOTE_PERMISSIONS" == *"com.android.vending.BILLING"* ]]; then
+    echo "Direct APK must not request Google Play Billing permission." >&2
+    exit 1
+  fi
 fi
 
-# Copy APK back
-echo "  Copying APK back..."
-mkdir -p "$(dirname "$APK_PATH")"
-scp "$REMOTE_HOST:$REMOTE_DIR/build/app/outputs/flutter-apk/app-release.apk" "$APK_PATH"
+# Copy artifact back
+echo "  Copying $ARTIFACT_LABEL back..."
+mkdir -p "$(dirname "$ARTIFACT_PATH")"
+scp "$REMOTE_HOST:$REMOTE_DIR/$REMOTE_ARTIFACT_RELATIVE" "$ARTIFACT_PATH"
+
+if $BUNDLE; then
+  unzip -tq "$ARTIFACT_PATH" >/dev/null
+  jarsigner -verify "$ARTIFACT_PATH" >/dev/null
+  BUNDLE_ENTRIES_FILE="$(mktemp)"
+  unzip -Z1 "$ARTIFACT_PATH" > "$BUNDLE_ENTRIES_FILE"
+  for abi in arm64-v8a armeabi-v7a x86_64; do
+    if ! grep -Fqx "base/lib/$abi/libapp.so" "$BUNDLE_ENTRIES_FILE"; then
+      rm -f "$BUNDLE_ENTRIES_FILE"
+      echo "Play app bundle is missing base/lib/$abi/libapp.so." >&2
+      exit 1
+    fi
+    NATIVE_CHECK_FILE="$(mktemp)"
+    unzip -p "$ARTIFACT_PATH" "base/lib/$abi/libapp.so" > "$NATIVE_CHECK_FILE"
+    if readelf -S "$NATIVE_CHECK_FILE" | grep -Eq '\.(debug_info|symtab)'; then
+      rm -f "$NATIVE_CHECK_FILE"
+      echo "Play app bundle contains unstripped Dart native symbols for $abi." >&2
+      exit 1
+    fi
+    rm -f "$NATIVE_CHECK_FILE"
+  done
+  rm -f "$BUNDLE_ENTRIES_FILE"
+  echo "  App bundle signature, archive, ABIs, and stripped native libraries verified."
+fi
 
 ELAPSED=$((SECONDS - BUILD_START))
 echo "Remote build completed in ${ELAPSED}s"
-echo "APK: $APK_PATH"
-APK_SHA256="$(sha256sum "$APK_PATH" | awk '{print $1}')"
-APK_SIZE="$(stat -c%s "$APK_PATH")"
+echo "Artifact: $ARTIFACT_PATH"
+APK_SHA256="$(sha256sum "$ARTIFACT_PATH" | awk '{print $1}')"
+APK_SIZE="$(stat -c%s "$ARTIFACT_PATH")"
 APK_CERT_SHA256=""
 APKSIGNER="${APKSIGNER:-}"
 if [[ -z "$APKSIGNER" ]]; then
   APKSIGNER="$(find "${ANDROID_HOME:-/home/rdp/Android/Sdk}/build-tools" -name apksigner -type f 2>/dev/null | sort -V | tail -1 || true)"
 fi
-if [[ -n "$APKSIGNER" && -x "$APKSIGNER" ]]; then
-  APK_CERT_SHA256="$("$APKSIGNER" verify --print-certs "$APK_PATH" 2>/dev/null | awk -F': ' '/Signer #1 certificate SHA-256 digest/ {print $2; exit}' | tr -d ':\r')"
+if $BUNDLE; then
+  APK_CERT_SHA256=""
+elif [[ -n "$APKSIGNER" && -x "$APKSIGNER" ]]; then
+  APK_CERT_SHA256="$("$APKSIGNER" verify --print-certs "$ARTIFACT_PATH" 2>/dev/null | awk -F': ' '/Signer #1 certificate SHA-256 digest/ {print $2; exit}' | tr -d ':\r')"
 else
   # The Linux server intentionally delegates Android builds to the Windows
   # desktop, so apksigner may only exist alongside that remote Android SDK.
-  APK_CERT_SHA256="$(ssh "$REMOTE_HOST" "powershell -Command \"\$apksigner = Get-ChildItem '$REMOTE_ANDROID_HOME/build-tools' -Recurse -Filter apksigner.bat | Sort-Object FullName | Select-Object -Last 1 -ExpandProperty FullName; & \$apksigner verify --print-certs '$REMOTE_DIR/build/app/outputs/flutter-apk/app-release.apk'\"" 2>/dev/null | awk -F': ' '/Signer #1 certificate SHA-256 digest/ {print $2; exit}' | tr -d ':\r')"
+  APK_CERT_SHA256="$(ssh "$REMOTE_HOST" "powershell -Command \"\$apksigner = Get-ChildItem '$REMOTE_ANDROID_HOME/build-tools' -Recurse -Filter apksigner.bat | Sort-Object FullName | Select-Object -Last 1 -ExpandProperty FullName; & \$apksigner verify --print-certs '$REMOTE_DIR/$REMOTE_ARTIFACT_RELATIVE'\"" 2>/dev/null | awk -F': ' '/Signer #1 certificate SHA-256 digest/ {print $2; exit}' | tr -d ':\r')"
 fi
-echo "APK SHA-256: $APK_SHA256"
+echo "Artifact SHA-256: $APK_SHA256"
 if [[ -n "$APK_CERT_SHA256" ]]; then
   echo "Signing cert SHA-256: $APK_CERT_SHA256"
 fi
@@ -197,7 +293,8 @@ fi
 if ! $DEPLOY; then
   echo ""
   echo "=== Build complete ==="
-  echo "APK: $APK_PATH"
+  echo "Flavor: $FLAVOR"
+  echo "Artifact: $ARTIFACT_PATH"
   echo "Run with --deploy to bump version and publish to GitHub."
   exit 0
 fi
@@ -229,7 +326,7 @@ git push origin "v$NEW_VERSION"
 
 # ── Create GitHub release with APK ──
 echo "Creating GitHub release v$NEW_VERSION..."
-gh release create "v$NEW_VERSION" "$APK_PATH" \
+gh release create "v$NEW_VERSION" "$ARTIFACT_PATH" \
   --repo "$SERVER_REPO" \
   --title "SocketAgent v$NEW_VERSION" \
   --notes "App version $NEW_VERSION" \

@@ -27,15 +27,6 @@ function Show-Usage {
     Write-Host "  socketagent status              Show scheduled task status"
     Write-Host "  socketagent logs                Follow server logs"
     Write-Host "  socketagent restart             Restart scheduled task"
-    Write-Host "  socketagent adb-bridge [args...] Start ADB bridge sidecar"
-    Write-Host "  socketagent phone-adb devices    Ask the connected phone app to run adb devices"
-    Write-Host "  socketagent phone-adb pair <port> <code> Pair phone-local adb"
-    Write-Host "  socketagent phone-adb connect <port> Connect phone-local adb"
-    Write-Host "  socketagent phone-adb shell <cmd> Ask the connected phone app to run adb shell"
-    Write-Host "  socketagent phone-adb adb <args> Ask the phone app to run arbitrary adb args"
-    Write-Host "  socketagent phone-adb install <apk-path> [args] Install an APK through phone-local adb"
-    Write-Host "  socketagent phone-adb open-apk <apk-path> Transfer an APK and open Android installer"
-    Write-Host "  socketagent phone-adb logcat [args] Stream adb logcat through the phone app"
     Write-Host "  socketagent doctor              Print basic install diagnostics"
     Write-Host "  socketagent help                Show this help"
 }
@@ -88,24 +79,6 @@ switch ($cmd.ToLowerInvariant()) {
         Start-Sleep -Seconds 2
         Start-ScheduledTask -TaskName $taskName
         Get-ScheduledTask -TaskName $taskName
-    }
-    { $_ -in @("adb-bridge", "adb") } {
-        $bridge = Join-Path $serverDir "dist\adb-bridge.js"
-        if (-not (Test-Path $bridge)) {
-            Push-Location $serverDir
-            try {
-                & npx tsc
-                if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-            } finally {
-                Pop-Location
-            }
-        }
-        & node $bridge @rest
-        exit $LASTEXITCODE
-    }
-    "phone-adb" {
-        & node (Join-Path $serverDir "scripts\phone-adb.js") @rest
-        exit $LASTEXITCODE
     }
     "doctor" {
         Write-Host "SocketAgent diagnostics"

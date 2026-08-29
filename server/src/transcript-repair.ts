@@ -27,6 +27,9 @@ function historyIdentityKey(entry: HistoryEntry): string | null {
   if (entry.questionId) return `${entry.role}:question:${entry.questionId}`;
   if (entry.role === "user" && entry.uuid) return `user:uuid:${entry.uuid}`;
   if (entry.role === "monitor" && entry.taskId) return `monitor:${entry.taskId}`;
+  if (entry.role === "browser_session" && entry.toolInput?.profile) {
+    return `browser_session:${String(entry.toolInput.profile)}`;
+  }
   if (entry.role === "task_state" && entry.taskId) {
     return `task_state:${entry.taskKind || "background"}:${entry.taskId}`;
   }

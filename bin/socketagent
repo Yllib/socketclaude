@@ -37,15 +37,6 @@ Usage:
   socketagent logs                Follow server logs
   socketagent restart             Restart server using the safe restart script
   socketagent macos-permissions   Open macOS file-access settings and reveal helper
-  socketagent adb-bridge [args...] Start ADB bridge sidecar
-  socketagent phone-adb devices    Ask the connected phone app to run adb devices
-  socketagent phone-adb pair <port> <code> Pair phone-local adb
-  socketagent phone-adb connect <port> Connect phone-local adb
-  socketagent phone-adb shell <cmd> Ask the connected phone app to run adb shell
-  socketagent phone-adb adb <args> Ask the phone app to run arbitrary adb args
-  socketagent phone-adb install <apk-path> [args] Install an APK through phone-local adb
-  socketagent phone-adb open-apk <apk-path> Transfer an APK and open Android installer
-  socketagent phone-adb logcat [args] Stream adb logcat through the phone app
   socketagent doctor              Print basic install diagnostics
   socketagent help                Show this help
 EOF
@@ -93,15 +84,6 @@ case "$cmd" in
     open -R "$HELPER_APP"
     echo "Opened Full Disk Access settings and revealed:"
     echo "  $HELPER_APP"
-    ;;
-  adb-bridge|adb)
-    if [[ ! -f "$SERVER_DIR/dist/adb-bridge.js" ]]; then
-      (cd "$SERVER_DIR" && npx tsc)
-    fi
-    exec node "$SERVER_DIR/dist/adb-bridge.js" "$@"
-    ;;
-  phone-adb)
-    exec node "$SERVER_DIR/scripts/phone-adb.js" "$@"
     ;;
   doctor)
     echo "SocketAgent diagnostics"
