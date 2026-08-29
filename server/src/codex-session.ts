@@ -80,6 +80,10 @@ const TRANSIENT_CODEX_RAW_EVENT_METHODS = new Set([
   "account/rateLimits/updated",
 ]);
 
+function playReviewModeEnabled(): boolean {
+  return process.env.SOCKETAGENT_PLAY_REVIEW_MODE === "1";
+}
+
 const CODEX_GOAL_STATUSES = new Set<CodexGoalStatus>([
   "active",
   "paused",
@@ -2170,7 +2174,159 @@ export class CodexSession {
   }
 
   async runQuery(prompt: string, resumeSessionId?: string): Promise<void> {
+    if (playReviewModeEnabled()) {
+      return this.runPlayReviewQuery(prompt, resumeSessionId);
+    }
     return this.runAppServerQuery(prompt, resumeSessionId);
+  }
+
+  private async runPlayReviewQuery(
+    prompt: string,
+    resumeSessionId?: string,
+  ): Promise<void> {
+    if (this._isRunning) throw new Error("CodexSession already running a turn");
+    this._isRunning = true;
+    this._runStartedAt = new Date().toISOString();
+    this._currentPrompt = prompt;
+    this.onActivity?.();
+
+    try {
+      const existingId = resumeSessionId || this._resumeSessionId || this.sessionId;
+      if (existingId) {
+        this.sessionId = existingId;
+        this.threadId = existingId;
+        this._sessionInfoSaved = true;
+      } else {
+        const sessionId = `play-review-${crypto.randomUUID()}`;
+        const title = prompt.trim().slice(0, 50) || "SocketAgent review";
+        this.sessionId = sessionId;
+        this.threadId = sessionId;
+        this._sessionInfoSaved = true;
+        saveSession({
+          id: sessionId,
+          title,
+          cwd: this.cwd,
+          createdAt: now(),
+          lastActive: now(),
+          messagePreview: "",
+          backend: "codex",
+          codexDriver: "app-server",
+          permissionMode: this.permissionMode || undefined,
+          agentSettings: this.getAgentSettings(),
+        });
+        this.send({
+          type: "session_created",
+          sessionId,
+          cwd: this.cwd,
+          title,
+          backend: "codex",
+          permissionMode: this.permissionMode,
+        } as ServerMessage);
+        this.send({
+          type: "session_settings",
+          sessionId,
+          settings: this.getAgentSettings(),
+        } as any);
+      }
+
+      const sessionId = this.sessionId!;
+      const userUuid = this._currentClientMessageId || crypto.randomUUID();
+      const userEntry = appendHistory(sessionId, {
+        role: "user",
+        content: prompt,
+        uuid: userUuid,
+        timestamp: now(),
+      });
+      this.send({
+        type: "user_message_uuid",
+        uuid: userUuid,
+        sessionId,
+        entryId: userEntry.entryId,
+        sessionSeq: userEntry.sessionSeq,
+        revision: userEntry.revision,
+        ...(this._currentClientMessageId
+          ? { clientMessageId: this._currentClientMessageId }
+          : {}),
+      } as any);
+
+      await new Promise((resolve) => setTimeout(resolve, 250));
+
+      if (/\b(tool|command|file)\b/i.test(prompt)) {
+        const toolUseId = `play-review-tool-${crypto.randomUUID()}`;
+        const input = { path: "README.txt", operation: "inspect" };
+        const output = "SocketAgent Play review workspace\nNo publisher files or credentials are available.";
+        this.send({
+          type: "tool_call",
+          tool: "ReviewWorkspace",
+          input,
+          toolUseId,
+          sessionId,
+        } as any);
+        appendHistory(sessionId, {
+          role: "tool_call",
+          content: "Inspecting the isolated review workspace",
+          toolName: "ReviewWorkspace",
+          toolInput: input,
+          toolUseId,
+          timestamp: now(),
+        });
+        this.send({
+          type: "tool_result",
+          toolUseId,
+          output,
+          sessionId,
+        } as any);
+        appendHistory(sessionId, {
+          role: "tool_result",
+          content: output,
+          toolUseId,
+          toolOutput: output,
+          timestamp: now(),
+        });
+      }
+
+      const response = [
+        "You are connected to SocketAgent's isolated Google Play review server.",
+        "",
+        "This session demonstrates encrypted relay chat, persisted history, and tool-result rendering without exposing publisher files, credentials, or paid AI accounts.",
+        "",
+        "Your message was received successfully. You can send another message, close and reopen this session to verify history, or use Report response on this reply to test the reporting flow.",
+      ].join("\n");
+      const streamId = `play-review-response-${crypto.randomUUID()}`;
+      this._lastAssistantText = response;
+      this.send({
+        type: "text",
+        content: response,
+        sessionId,
+        streamId,
+        snapshot: true,
+        finalSnapshot: true,
+      } as any);
+      appendHistory(sessionId, {
+        role: "assistant",
+        content: response,
+        streamId,
+        timestamp: now(),
+      });
+      const usage = {
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheCreateTokens: 0,
+        contextWindow: 0,
+      };
+      this.send({
+        type: "result",
+        content: response,
+        sessionId,
+        usage,
+      } as ServerMessage);
+      updateSessionActivity(sessionId, response, usage);
+    } finally {
+      this._isRunning = false;
+      this._runStartedAt = null;
+      this.onActivity?.();
+    }
   }
 
   private async runAppServerQuery(prompt: string, resumeSessionId?: string): Promise<void> {
@@ -5249,6 +5405,9 @@ export function createSession(
   plugins: SocketAgentPlugin[],
   _codexDriver?: CodexDriver,
 ): Session {
+  if (playReviewModeEnabled()) {
+    return new CodexSession(ws, cwd, plugins);
+  }
   const requestedBackend = backend || "claude";
   if (requestedBackend === "codex") {
     const availability = getCodexAvailability();

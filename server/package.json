@@ -1,6 +1,6 @@
 {
   "name": "socketagent-server",
-  "version": "1.1.28",
+  "version": "1.1.29",
   "description": "WebSocket server bridging Flutter app to Claude Agent SDK",
   "main": "dist/index.js",
   "scripts": {
