@@ -477,6 +477,23 @@ export function isRecoverableCodexAppServerError(params: any): boolean {
     && errorInfo?.responseStreamDisconnected != null;
 }
 
+/** Errors that leave the app-server process unsafe to reuse for another turn. */
+export function isCodexAppServerProcessFailure(value: unknown): boolean {
+  let detail: string;
+  if (value instanceof Error) {
+    detail = `${value.name}: ${value.message}`;
+  } else if (typeof value === "string") {
+    detail = value;
+  } else {
+    try {
+      detail = JSON.stringify(value);
+    } catch {
+      detail = String(value);
+    }
+  }
+  return /\bsystemError\b|\bspawn E(?:IO|PERM|ACCES)\b|app-server exited|broken pipe|transport (?:closed|failed)|request .*timed out/i.test(detail);
+}
+
 type CodexSubagentStatus = "pending" | "running" | "completed" | "interrupted" | "errored" | "shutdown";
 
 type CodexSubagentState = {
@@ -510,6 +527,8 @@ export class CodexSession {
   private appServerInitialized = false;
   private appServerInitializePromise: Promise<void> | null = null;
   private appServerIdleStopTimer: ReturnType<typeof setTimeout> | null = null;
+  private appServerSystemErrorTimer: ReturnType<typeof setTimeout> | null = null;
+  private appServerTerminalFailureHandled = false;
   private appServerAuthenticationInvalidated = false;
   private appServerMcpRegistration: ReturnType<typeof registerCodexAppMcp> | null = null;
   private activeAppServerTurnId: string | null = null;
@@ -2338,6 +2357,7 @@ export class CodexSession {
     this._runStartedAt = new Date().toISOString();
     this.onActivity?.();
     this._abortRequested = false;
+    this.appServerTerminalFailureHandled = false;
     this._currentPrompt = prompt;
     this._lastAssistantText = "";
     const transferContext = this._pendingTransferContext;
@@ -2528,6 +2548,7 @@ export class CodexSession {
       this.appServerIdleStopTimer = null;
     }
     if (!this.appServer) {
+      this.appServerTerminalFailureHandled = false;
       const codex = buildCodexSpawn(["app-server", "--listen", "stdio://"]);
       const socketAgentSessionId = this.sessionId || this.threadId || this._resumeSessionId || "";
       const codexEnv: NodeJS.ProcessEnv = { ...codex.env };
@@ -2563,7 +2584,7 @@ export class CodexSession {
       });
       this.appServer.on("exit", (code: number | null, signal: NodeJS.Signals | null) => {
         if (this._isRunning && !this._abortRequested) {
-          this.appServerTurnSettler?.reject(new Error(`codex app-server exited code=${code} signal=${signal}`));
+          this.handleAppServerProcessFailure(`codex app-server exited code=${code} signal=${signal}`);
         }
       });
       // Codex "error" notifications (e.g. usageLimitExceeded / systemError)
@@ -2577,7 +2598,7 @@ export class CodexSession {
       this.appServer.on("error", (err: Error) => {
         this._stderrBuffer.push(`[codex app-server error] ${err?.message || String(err)}\n`);
         if (this._isRunning && !this._abortRequested) {
-          this.appServerTurnSettler?.reject(err instanceof Error ? err : new Error(String(err)));
+          this.handleAppServerProcessFailure(err?.message || String(err));
         }
       });
     }
@@ -2622,20 +2643,68 @@ export class CodexSession {
       return;
     }
     const message = codexAppServerErrorMessage(params, "Codex reported an error");
+    if (isCodexAuthError(params) || isCodexAuthError(message)) {
+      void this.handleAppServerAuthFailure(message, {
+        hintedMcp: isMcpAuthSignal(params) || isMcpAuthSignal(message),
+        terminal: true,
+      });
+      return;
+    }
+    const processFailure = isCodexAppServerProcessFailure(params);
+    if (processFailure && this.appServerSystemErrorTimer) {
+      clearTimeout(this.appServerSystemErrorTimer);
+      this.appServerSystemErrorTimer = null;
+    }
+    this.surfaceTerminalAppServerFailure(message, processFailure);
+    if (processFailure) {
+      void this.recycleFailedAppServer();
+    }
+  }
+
+  private surfaceTerminalAppServerFailure(message: string, recycling = false): void {
+    if (this.appServerTerminalFailureHandled) return;
+    this.appServerTerminalFailureHandled = true;
     const sid = this.sessionId;
     if (sid) {
       this.send({ type: "session_state_changed", state: "idle", sessionId: sid } as any);
-      if (isCodexAuthError(params) || isCodexAuthError(message)) {
-        void this.handleAppServerAuthFailure(message, {
-          hintedMcp: isMcpAuthSignal(params) || isMcpAuthSignal(message),
-          terminal: true,
-        });
-        return;
-      } else {
-        this.send({ type: "error", message: `Codex: ${message}`, sessionId: sid } as any);
-      }
+      const recovery = recycling
+        ? " SocketAgent is restarting Codex; retry your message. If this keeps happening on Windows, rerun the SocketAgent installer once so the server starts in your interactive logon session."
+        : "";
+      this.send({ type: "error", message: `Codex: ${message}${recovery}`, sessionId: sid } as any);
     }
-    this.appServerTurnSettler?.reject(new Error(message));
+    const error = new Error(message);
+    (error as any).socketAgentSurfaced = true;
+    this.appServerTurnSettler?.reject(error);
+  }
+
+  private scheduleSystemErrorRecovery(params: any): void {
+    const sid = this.sessionId;
+    if (sid) {
+      this.send({ type: "session_state_changed", state: "idle", sessionId: sid } as any);
+    }
+    if (this.appServerSystemErrorTimer) return;
+    this.appServerSystemErrorTimer = setTimeout(() => {
+      this.appServerSystemErrorTimer = null;
+      this.surfaceTerminalAppServerFailure(
+        codexAppServerErrorMessage(params, "Codex app-server entered systemError state"),
+        true,
+      );
+      void this.recycleFailedAppServer();
+    }, 300);
+    this.appServerSystemErrorTimer.unref?.();
+  }
+
+  private async recycleFailedAppServer(): Promise<void> {
+    try {
+      await this.stopAppServerClient(true);
+    } catch (error: any) {
+      console.warn(`[codex app-server] failed to recycle after terminal error: ${error?.message || error}`);
+    }
+  }
+
+  private handleAppServerProcessFailure(message: string): void {
+    this.surfaceTerminalAppServerFailure(message, true);
+    void this.recycleFailedAppServer();
   }
 
   private async classifyAppServerAuthFailure(hintedMcp: boolean): Promise<CodexAuthScope> {
@@ -2736,6 +2805,10 @@ export class CodexSession {
     if (this.appServerIdleStopTimer) {
       clearTimeout(this.appServerIdleStopTimer);
       this.appServerIdleStopTimer = null;
+    }
+    if (this.appServerSystemErrorTimer) {
+      clearTimeout(this.appServerSystemErrorTimer);
+      this.appServerSystemErrorTimer = null;
     }
     const client = this.appServer;
     this.appServer = null;
@@ -3680,15 +3753,16 @@ export class CodexSession {
           this.send({ type: "session_state_changed", state: "idle", sessionId: sid } as any);
         } else if (statusType === "systemError") {
           const message = codexAppServerErrorMessage(p, "Codex app-server entered systemError state");
-          this.send({ type: "session_state_changed", state: "idle", sessionId: sid } as any);
           if (isCodexAuthError(p) || isCodexAuthError(message)) {
             void this.handleAppServerAuthFailure(message, {
               hintedMcp: isMcpAuthSignal(p) || isMcpAuthSignal(message),
               terminal: true,
             });
           } else {
-            this.send({ type: "error", message, sessionId: sid } as any);
-            this.appServerTurnSettler?.reject(new Error(message));
+            // The detailed `error` notification normally follows this status
+            // change. Give it a short head start so users see one useful error
+            // instead of the status fallback and detailed error as duplicates.
+            this.scheduleSystemErrorRecovery(p);
           }
         }
         return;

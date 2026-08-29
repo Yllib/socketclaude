@@ -8,6 +8,7 @@ require("./test-data-dir");
 
 const {
   CodexSession,
+  isCodexAppServerProcessFailure,
   isRecoverableCodexAppServerError,
   summarizeCodexCommandActions,
 } = require("../dist/codex-session");
@@ -102,6 +103,46 @@ test("still rejects a terminal Codex app-server error exactly once", () => {
   assert.ok(sent.some((message) =>
     message.type === "session_state_changed"
     && message.state === "idle"));
+});
+
+test("recycles a systemError app-server and surfaces its detailed error once", async () => {
+  const sent = [];
+  const session = new CodexSession(testSocket(sent), process.cwd(), []);
+  session.sessionId = "system-error-session";
+  session.threadId = session.sessionId;
+  session._isRunning = true;
+  let rejected = 0;
+  let stopped = 0;
+  session.appServerTurnSettler = {
+    resolve: () => {},
+    reject: () => { rejected += 1; },
+  };
+  session.appServer = {
+    stop: async () => { stopped += 1; },
+    removeAllListeners: () => {},
+  };
+  session.appServerInitialized = true;
+
+  session.handleAppServerNotification("thread/status/changed", {
+    threadId: session.threadId,
+    status: { type: "systemError" },
+  });
+  session.handleAppServerNotification("error", {
+    error: { message: "spawn EIO" },
+  });
+  session.handleAppServerErrorNotification({
+    error: { message: "spawn EIO" },
+  });
+
+  await new Promise((resolve) => setTimeout(resolve, 350));
+
+  assert.equal(isCodexAppServerProcessFailure("spawn EIO"), true);
+  assert.equal(rejected, 1);
+  assert.equal(stopped, 1);
+  assert.equal(session.appServer, null);
+  const errors = sent.filter((message) => message.type === "error");
+  assert.equal(errors.length, 1);
+  assert.match(errors[0].message, /spawn EIO/);
 });
 
 test("raw Codex SDK events are sent only to subscribed sockets", () => {

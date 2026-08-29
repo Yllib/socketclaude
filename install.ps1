@@ -805,52 +805,25 @@ $settings = New-ScheduledTaskSettingsSet `
     -RestartInterval (New-TimeSpan -Minutes 1) `
     -StartWhenAvailable
 
-$registeredTaskMode = "startup"
-try {
-    # Preferred: current user, S4U logon, at startup. This runs without an
-    # active desktop session, but some Windows account/policy setups reject it.
-    $startupTrigger = New-ScheduledTaskTrigger -AtStartup
-    $startupPrincipal = New-ScheduledTaskPrincipal `
-        -UserId $env:USERNAME `
-        -LogonType S4U `
-        -RunLevel Limited
+# Codex's native Windows process launcher requires an interactive user session.
+# S4U startup tasks run in Session 0 and can leave app-server turns in
+# `systemError` even though account checks succeed. Start SocketAgent when the
+# user logs on so Claude and Codex share the same usable Windows session.
+$logonTrigger = New-ScheduledTaskTrigger -AtLogOn
+$logonPrincipal = New-ScheduledTaskPrincipal `
+    -UserId $env:USERNAME `
+    -LogonType Interactive `
+    -RunLevel Limited
 
-    Register-ScheduledTask `
-        -TaskName $TASK_NAME `
-        -Action $action `
-        -Trigger $startupTrigger `
-        -Settings $settings `
-        -Principal $startupPrincipal `
-        -Description "SocketAgent WebSocket server" | Out-Null
-} catch {
-    Write-Warn "Could not register startup task using S4U: $($_.Exception.Message)"
-    Write-Warn "Falling back to an interactive logon task for this Windows account."
-    $partialTask = Get-ScheduledTask -TaskName $TASK_NAME -ErrorAction SilentlyContinue
-    if ($partialTask) {
-        Unregister-ScheduledTask -TaskName $TASK_NAME -Confirm:$false
-    }
+Register-ScheduledTask `
+    -TaskName $TASK_NAME `
+    -Action $action `
+    -Trigger $logonTrigger `
+    -Settings $settings `
+    -Principal $logonPrincipal `
+    -Description "SocketAgent WebSocket server" | Out-Null
 
-    $registeredTaskMode = "logon"
-    $logonTrigger = New-ScheduledTaskTrigger -AtLogOn
-    $logonPrincipal = New-ScheduledTaskPrincipal `
-        -UserId $env:USERNAME `
-        -LogonType Interactive `
-        -RunLevel Limited
-
-    Register-ScheduledTask `
-        -TaskName $TASK_NAME `
-        -Action $action `
-        -Trigger $logonTrigger `
-        -Settings $settings `
-        -Principal $logonPrincipal `
-        -Description "SocketAgent WebSocket server" | Out-Null
-}
-
-if ($registeredTaskMode -eq "startup") {
-    Write-Ok "Registered as scheduled task '$TASK_NAME' (startup)"
-} else {
-    Write-Ok "Registered as scheduled task '$TASK_NAME' (logon fallback)"
-}
+Write-Ok "Registered as scheduled task '$TASK_NAME' (interactive logon)"
 
 # Add Windows Firewall rule (requires admin — skip silently if not elevated)
 $fwRuleName = "SocketAgent Server (TCP $Port)"
