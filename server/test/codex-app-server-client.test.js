@@ -43,6 +43,10 @@ test("thread resume excludes the native turn transcript by default", async () =>
       excludeTurns: false,
     });
     assert.equal(explicit.params.excludeTurns, false);
+
+    const unsubscribe = await client.unsubscribeThread("large-thread");
+    assert.equal(unsubscribe.method, "thread/unsubscribe");
+    assert.equal(unsubscribe.params.threadId, "large-thread");
   } finally {
     await client.stop();
   }

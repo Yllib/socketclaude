@@ -258,6 +258,10 @@ export class CodexAppServerClient extends EventEmitter {
     });
   }
 
+  async unsubscribeThread(threadId: string): Promise<unknown> {
+    return this.request("thread/unsubscribe", { threadId });
+  }
+
   async forkThread(params: CodexAppServerThreadResumeParams): Promise<unknown> {
     return this.request("thread/fork", params);
   }

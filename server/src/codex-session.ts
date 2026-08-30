@@ -529,6 +529,7 @@ export class CodexSession {
   private appServerIdleStopTimer: ReturnType<typeof setTimeout> | null = null;
   private appServerSystemErrorTimer: ReturnType<typeof setTimeout> | null = null;
   private appServerTerminalFailureHandled = false;
+  private appServerStopExpected = false;
   private appServerAuthenticationInvalidated = false;
   private appServerMcpRegistration: ReturnType<typeof registerCodexAppMcp> | null = null;
   private activeAppServerTurnId: string | null = null;
@@ -2502,7 +2503,8 @@ export class CodexSession {
       }
       this._pendingUserPrompt = null;
       this.clearPendingAppServerSteers(`codex app-server error: ${err?.message || String(err)}`);
-      if (isTimedOutCodexThreadResume(err) || isCodexActiveWriterError(err)) {
+      const activeWriterConflict = isCodexActiveWriterError(err);
+      if (isTimedOutCodexThreadResume(err) || activeWriterConflict) {
         const reason = isTimedOutCodexThreadResume(err)
           ? `timed-out thread resume after ${err.timeoutMs}ms`
           : "thread resume rejected because another writer owns the thread";
@@ -2515,13 +2517,20 @@ export class CodexSession {
           );
         }
       }
-      if (!isCodexAuthError(err)) {
+      const surfacedError = activeWriterConflict
+        ? new Error(
+            "Another Codex client currently owns this session. Close that client, then retry here."
+          )
+        : err;
+      if (!isCodexAuthError(surfacedError)) {
         // The caller emits the canonical prompt_failed event with the stable
         // user-message ID. Mark this handled so it does not also emit a
         // second generic error card for the same failure.
-        if (err && typeof err === "object") err.socketAgentSurfaced = true;
+        if (surfacedError && typeof surfacedError === "object") {
+          surfacedError.socketAgentSurfaced = true;
+        }
       }
-      throw err;
+      throw surfacedError;
     } finally {
       this._isRunning = false;
       this._runStartedAt = null;
@@ -2530,10 +2539,13 @@ export class CodexSession {
       this.onActivity?.();
       if (this.appServerAuthenticationInvalidated) {
         await this.resetInvalidatedAppServerAuthentication();
-      } else if (CODEX_APP_SERVER_WARM_IDLE_TIMEOUT_MS <= 0) {
-        await this.stopAppServerClient();
       } else {
-        this.scheduleAppServerIdleStop(CODEX_APP_SERVER_WARM_IDLE_TIMEOUT_MS);
+        await this.releaseAppServerThreadWriter();
+        if (CODEX_APP_SERVER_WARM_IDLE_TIMEOUT_MS <= 0) {
+          await this.stopAppServerClient();
+        } else {
+          this.scheduleAppServerIdleStop(CODEX_APP_SERVER_WARM_IDLE_TIMEOUT_MS);
+        }
       }
     }
   }
@@ -2583,7 +2595,7 @@ export class CodexSession {
         void this.handleAppServerRequest(request, respond);
       });
       this.appServer.on("exit", (code: number | null, signal: NodeJS.Signals | null) => {
-        if (this._isRunning && !this._abortRequested) {
+        if (this._isRunning && !this._abortRequested && !this.appServerStopExpected) {
           this.handleAppServerProcessFailure(`codex app-server exited code=${code} signal=${signal}`);
         }
       });
@@ -2597,7 +2609,7 @@ export class CodexSession {
       // "error" event never becomes an uncaught ERR_UNHANDLED_ERROR.
       this.appServer.on("error", (err: Error) => {
         this._stderrBuffer.push(`[codex app-server error] ${err?.message || String(err)}\n`);
-        if (this._isRunning && !this._abortRequested) {
+        if (this._isRunning && !this._abortRequested && !this.appServerStopExpected) {
           this.handleAppServerProcessFailure(err?.message || String(err));
         }
       });
@@ -2797,6 +2809,23 @@ export class CodexSession {
     }, delayMs);
   }
 
+  /** Release Codex's one-writer lease without throwing away the warm process. */
+  private async releaseAppServerThreadWriter(): Promise<void> {
+    const client = this.appServer;
+    const threadId = this.threadId;
+    if (!client || !threadId || !this.appServerInitialized) return;
+    try {
+      await client.unsubscribeThread(threadId);
+    } catch (error: any) {
+      // thread/unsubscribe is unavailable in older Codex builds. Stopping our
+      // app-server still releases the writer and keeps desktop handoff safe.
+      console.warn(
+        `[codex app-server] thread unsubscribe failed; stopping warm process: ${error?.message || error}`
+      );
+      await this.stopAppServerClient(true);
+    }
+  }
+
   private async stopAppServerClient(requireConfirmedExit = false): Promise<void> {
     if (this.appServerStopPromise) {
       await this.appServerStopPromise;
@@ -2820,6 +2849,7 @@ export class CodexSession {
     }
     if (!client) return;
     let stopped = false;
+    this.appServerStopExpected = true;
     const stopPromise = (async () => {
       try {
         await client.stop(
@@ -2837,6 +2867,7 @@ export class CodexSession {
         }
         console.warn(`[codex app-server] cleanup failed: ${err?.message || err}`);
       } finally {
+        this.appServerStopExpected = false;
         if (stopped || !requireConfirmedExit) {
           client.removeAllListeners();
           this.onClose?.();

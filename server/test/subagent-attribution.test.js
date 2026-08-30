@@ -145,6 +145,45 @@ test("recycles a systemError app-server and surfaces its detailed error once", a
   assert.match(errors[0].message, /spawn EIO/);
 });
 
+test("releases the Codex thread writer while keeping the app-server warm", async () => {
+  const session = new CodexSession(testSocket([]), process.cwd(), []);
+  const released = [];
+  const client = {
+    unsubscribeThread: async (threadId) => { released.push(threadId); },
+  };
+  session.threadId = "shared-with-desktop";
+  session.appServer = client;
+  session.appServerInitialized = true;
+
+  await session.releaseAppServerThreadWriter();
+
+  assert.deepEqual(released, ["shared-with-desktop"]);
+  assert.equal(session.appServer, client);
+});
+
+test("stops the warm app-server when thread unsubscribe is unavailable", async () => {
+  const session = new CodexSession(testSocket([]), process.cwd(), []);
+  let stopped = 0;
+  let expectedDuringStop = false;
+  session.threadId = "legacy-codex-thread";
+  session.appServer = {
+    unsubscribeThread: async () => { throw new Error("Method not found"); },
+    stop: async () => {
+      stopped += 1;
+      expectedDuringStop = session.appServerStopExpected;
+    },
+    removeAllListeners: () => {},
+  };
+  session.appServerInitialized = true;
+
+  await session.releaseAppServerThreadWriter();
+
+  assert.equal(stopped, 1);
+  assert.equal(expectedDuringStop, true);
+  assert.equal(session.appServer, null);
+  assert.equal(session.appServerStopExpected, false);
+});
+
 test("raw Codex SDK events are sent only to subscribed sockets", () => {
   const sent = [];
   const socket = testSocket(sent);
