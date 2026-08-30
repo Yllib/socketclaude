@@ -219,8 +219,8 @@ if ! $BUNDLE; then
     exit 1
   fi
   REMOTE_PERMISSIONS="$(ssh "$REMOTE_HOST" "powershell -NoProfile -Command \"\$aapt = Get-ChildItem '$REMOTE_ANDROID_HOME/build-tools' -Recurse -Filter aapt.exe | Sort-Object FullName | Select-Object -Last 1 -ExpandProperty FullName; if (-not \$aapt) { throw 'aapt.exe not found' }; & \$aapt dump permissions '$REMOTE_DIR/$REMOTE_ARTIFACT_RELATIVE'\"" | tr -d '\r')"
-  if [[ "$FLAVOR" == "play" && "$REMOTE_PERMISSIONS" == *"android.permission.REQUEST_INSTALL_PACKAGES"* ]]; then
-    echo "Play APK must not request package installation permission." >&2
+  if [[ "$REMOTE_PERMISSIONS" != *"android.permission.REQUEST_INSTALL_PACKAGES"* ]]; then
+    echo "$FLAVOR APK is missing user-initiated package installation permission." >&2
     exit 1
   fi
   if [[ "$FLAVOR" == "play" && "$REMOTE_PERMISSIONS" != *"com.android.vending.BILLING"* ]]; then
@@ -233,10 +233,6 @@ if ! $BUNDLE; then
   fi
   if [[ "$FLAVOR" == "play" && "$REMOTE_PERMISSIONS" == *"android.permission.SYSTEM_ALERT_WINDOW"* ]]; then
     echo "Play APK must not request display-over-other-apps access." >&2
-    exit 1
-  fi
-  if [[ "$FLAVOR" == "direct" && "$REMOTE_PERMISSIONS" != *"android.permission.REQUEST_INSTALL_PACKAGES"* ]]; then
-    echo "Direct APK is missing package installation permission." >&2
     exit 1
   fi
   if [[ "$FLAVOR" == "direct" && "$REMOTE_PERMISSIONS" == *"com.android.vending.BILLING"* ]]; then
