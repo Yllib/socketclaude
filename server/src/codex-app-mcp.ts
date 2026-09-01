@@ -226,9 +226,9 @@ function createServer(context: AppToolContext): McpServer {
     "BrowserSession",
     {
       title: "Remote Browser Session",
-      description: "Open and control a persistent isolated browser profile. Normal HTTP and HTTPS redirects are allowed across domains. Use snapshots, refs, and clipboard actions only for non-sensitive interaction. Never type or read passwords, recovery codes, tokens, MFA values, or other credentials with this tool; ask the user to enter them in the protected phone browser. Device-bound passkeys may require the site's alternate sign-in method. Use clear only when the user explicitly asks to delete a saved browser profile.",
+      description: "Open and control a persistent isolated browser profile. Open adds a browser button to the phone session header without adding a transcript card; show deliberately sends a card. Use clipboard_read only for non-sensitive text because it returns the value to the agent. When the user explicitly asks to save sensitive clipboard data, use clipboard_to_secret so the value goes directly to secure storage and is never returned. Never type or otherwise read credentials. Use clear only when the user explicitly asks to delete a saved browser profile.",
       inputSchema: {
-        action: z.enum(["open", "list", "status", "snapshot", "navigate", "click", "type", "key", "scroll", "clipboard_read", "clipboard_write", "close", "clear"]),
+        action: z.enum(["open", "show", "list", "status", "snapshot", "navigate", "click", "type", "key", "scroll", "clipboard_read", "clipboard_write", "clipboard_to_secret", "close", "clear"]),
         profile: z.string().optional().describe("Stable isolated profile name, for example google-play-william"),
         url: z.string().optional().describe("HTTP or HTTPS URL for open or navigate"),
         label: z.string().optional().describe("User-facing profile label used when opening"),
@@ -236,6 +236,10 @@ function createServer(context: AppToolContext): McpServer {
         text: z.string().optional().describe("Non-sensitive text to enter or write to the browser clipboard. Never pass a secret here."),
         key: z.string().optional().describe("Enter, Tab, Backspace, Escape, or Ctrl+A"),
         delta_y: z.number().optional().describe("Vertical scroll distance in CSS pixels"),
+        secret_label: z.string().optional().describe("Required label when clipboard_to_secret saves the browser clipboard without revealing it"),
+        secret_scope: z.enum(["session", "project", "global"]).optional().describe("Secure-storage scope; defaults to session"),
+        secret_env_hint: z.string().optional().describe("Optional environment variable name for the saved secret"),
+        clear_clipboard: z.boolean().optional().describe("Clear the browser clipboard after saving; defaults to true"),
       },
     },
     async (args) => handleBrowserSessionTool(context, args),

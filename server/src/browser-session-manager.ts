@@ -10,6 +10,7 @@ export interface BrowserSessionSummary {
   profile: string;
   label: string;
   running: boolean;
+  sessionId?: string;
   url?: string;
   title?: string;
   lastUsedAt?: string;
@@ -68,6 +69,8 @@ interface CdpTarget {
 interface RunningBrowserSession {
   profile: string;
   label: string;
+  sessionId?: string;
+  url: string;
   profileDir: string;
   process: ChildProcess;
   cdp: CdpClient;
@@ -306,12 +309,19 @@ function boundedLabel(value: string | undefined, profile: string): string {
 export class BrowserSessionManager {
   private sessions = new Map<string, RunningBrowserSession>();
 
-  async open(profileValue: string, rawUrl: string, labelValue?: string): Promise<BrowserSessionSummary> {
+  async open(
+    profileValue: string,
+    rawUrl: string,
+    labelValue?: string,
+    sessionId?: string,
+  ): Promise<BrowserSessionSummary> {
     const profile = normalizeBrowserProfile(profileValue);
     const url = normalizeBrowserUrl(rawUrl);
     const existing = this.sessions.get(profile);
     if (existing) {
       existing.label = boundedLabel(labelValue, profile);
+      existing.sessionId = sessionId || existing.sessionId;
+      existing.url = url;
       await existing.cdp.command("Page.navigate", { url });
       this.touch(existing);
       await wait(300);
@@ -364,6 +374,8 @@ export class BrowserSessionManager {
       const session: RunningBrowserSession = {
         profile,
         label: boundedLabel(labelValue, profile),
+        ...(sessionId ? { sessionId } : {}),
+        url,
         profileDir,
         process: processHandle,
         cdp,
@@ -402,9 +414,27 @@ export class BrowserSessionManager {
     return [...saved].sort().map((profile) => {
       const running = this.sessions.get(profile);
       return running
-        ? { profile, label: running.label, running: true, lastUsedAt: running.lastUsedAt }
+        ? {
+            profile,
+            label: running.label,
+            running: true,
+            sessionId: running.sessionId,
+            url: running.url,
+            lastUsedAt: running.lastUsedAt,
+          }
         : { profile, label: profile, running: false };
     });
+  }
+
+  active(): BrowserSessionSummary[] {
+    return [...this.sessions.values()].map((session) => ({
+      profile: session.profile,
+      label: session.label,
+      running: true,
+      sessionId: session.sessionId,
+      url: session.url,
+      lastUsedAt: session.lastUsedAt,
+    }));
   }
 
   async status(profileValue: string): Promise<BrowserSessionSummary> {
@@ -428,13 +458,15 @@ export class BrowserSessionManager {
     ]);
     const imageBase64 = typeof capture.data === "string" ? capture.data : "";
     if (!imageBase64) throw new Error("Browser did not return a frame.");
+    const url = readStringResult(location) || session.url;
+    session.url = url;
     return {
       profile: session.profile,
       imageBase64,
       mimeType: "image/jpeg",
       width: session.width,
       height: session.height,
-      url: readStringResult(location),
+      url,
       title: readStringResult(title),
     };
   }
@@ -519,6 +551,7 @@ export class BrowserSessionManager {
     const serialized = readStringResult(result);
     if (!serialized) throw new Error("Browser page could not be inspected.");
     const parsed = JSON.parse(serialized) as Omit<BrowserSnapshot, "profile">;
+    session.url = parsed.url || session.url;
     return { profile: session.profile, ...parsed };
   }
 
@@ -549,6 +582,8 @@ export class BrowserSessionManager {
   }
 
   async navigate(profileValue: string, rawUrl: string): Promise<void> {
+    const session = this.require(normalizeBrowserProfile(profileValue));
+    session.url = normalizeBrowserUrl(rawUrl);
     await this.phoneInput(profileValue, { action: "navigate", url: rawUrl });
   }
 
@@ -634,11 +669,14 @@ export class BrowserSessionManager {
       session.cdp.command("Runtime.evaluate", { expression: "location.href", returnByValue: true }),
       session.cdp.command("Runtime.evaluate", { expression: "document.title", returnByValue: true }),
     ]);
+    const url = readStringResult(location) || session.url;
+    session.url = url;
     return {
       profile: session.profile,
       label: session.label,
       running: true,
-      url: readStringResult(location),
+      sessionId: session.sessionId,
+      url,
       title: readStringResult(title),
       lastUsedAt: session.lastUsedAt,
     };

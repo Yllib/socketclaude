@@ -2613,6 +2613,18 @@ export interface BrowserSessionOpenServerMessage {
   runtimeRequired?: boolean;
 }
 
+export interface BrowserSessionStateServerMessage {
+  type: "browser_session_state";
+  profile: string;
+  label: string;
+  url: string;
+  width: number;
+  height: number;
+  sessionId: string;
+  active: boolean;
+  runtimeRequired?: boolean;
+}
+
 export interface BrowserRuntimeInstallProgressServerMessage {
   type: "browser_runtime_install_progress";
   profile: string;
@@ -2652,6 +2664,7 @@ export type ServerMessage =
   | SecureInputRequestServerMessage
   | SecureInputSavedServerMessage
   | BrowserSessionOpenServerMessage
+  | BrowserSessionStateServerMessage
   | BrowserRuntimeInstallProgressServerMessage
   | BrowserFrameServerMessage
   | BrowserClipboardServerMessage

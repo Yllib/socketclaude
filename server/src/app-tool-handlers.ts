@@ -5,7 +5,13 @@ import type { Backend, CodexDriver, HistoryEntry, ServerMessage } from "./protoc
 import { generateKokoroAudio } from "./kokoro-tts";
 import { getScheduledTaskSessionIds, saveScheduledTask, ScheduledTask, RecurrenceConfig } from "./scheduled-task-store";
 import { listSkills, SkillEntry } from "./skills-manager";
-import { requestSecureInput, SecureInputRequestArgs, SecureInputRequestStatus } from "./secure-input-store";
+import {
+  requestSecureInput,
+  saveSecureInput,
+  type SecureInputRequestArgs,
+  type SecureInputScope,
+  type SecureInputRequestStatus,
+} from "./secure-input-store";
 import { sendPushNotification } from "./push-notifications";
 import { getHtmlPlan, saveHtmlPlan } from "./html-plan-store";
 import {
@@ -96,7 +102,7 @@ export interface McpTextResult {
 }
 
 export interface BrowserSessionToolArgs {
-  action: "open" | "list" | "status" | "snapshot" | "navigate" | "click" | "type" | "key" | "scroll" | "clipboard_read" | "clipboard_write" | "close" | "clear";
+  action: "open" | "show" | "list" | "status" | "snapshot" | "navigate" | "click" | "type" | "key" | "scroll" | "clipboard_read" | "clipboard_write" | "clipboard_to_secret" | "close" | "clear";
   profile?: string;
   url?: string;
   label?: string;
@@ -104,6 +110,30 @@ export interface BrowserSessionToolArgs {
   text?: string;
   key?: string;
   delta_y?: number;
+  secret_label?: string;
+  secret_scope?: SecureInputScope;
+  secret_env_hint?: string;
+  clear_clipboard?: boolean;
+}
+
+function publishBrowserSessionState(
+  ctx: Pick<AppToolContext, "getSessionId" | "send">,
+  session: BrowserSessionSummary,
+  fallbackUrl: string,
+  active: boolean,
+  runtimeRequired = false,
+): void {
+  ctx.send({
+    type: "browser_session_state",
+    profile: session.profile,
+    label: session.label,
+    url: session.url || fallbackUrl,
+    width: 430,
+    height: 860,
+    sessionId: session.sessionId || ctx.getSessionId(),
+    active,
+    ...(runtimeRequired ? { runtimeRequired: true } : {}),
+  });
 }
 
 export function publishBrowserSessionCard(
@@ -155,18 +185,34 @@ export async function handleBrowserSessionTool(
     switch (args.action) {
       case "open": {
         if (!args.url) throw new Error("BrowserSession open requires a URL.");
-        const session = await browserSessionManager.open(profile, args.url, args.label);
-        publishBrowserSessionCard(ctx, session, args.url);
+        const session = await browserSessionManager.open(
+          profile,
+          args.url,
+          args.label,
+          ctx.getSessionId(),
+        );
+        publishBrowserSessionState(ctx, session, args.url, true);
         return {
           content: [{
             type: "text",
-            text: `Browser profile ${session.profile} is open at ${session.url || args.url}. A protected remote browser card was sent to the phone. The user must enter passwords and MFA there. Device-bound passkeys may require the site's alternate sign-in method.`,
+            text: `Browser profile ${session.profile} is open at ${session.url || args.url}. The active browser button is available in the phone session header. Use the show action only when a transcript card is useful. The user must enter passwords and MFA in the protected phone browser.`,
+          }],
+        };
+      }
+      case "show": {
+        const session = await browserSessionManager.status(profile);
+        publishBrowserSessionState(ctx, session, session.url || "https://localhost/", true);
+        publishBrowserSessionCard(ctx, session, session.url || "https://localhost/");
+        return {
+          content: [{
+            type: "text",
+            text: `A protected browser card for ${session.label} was sent to the phone.`,
           }],
         };
       }
       case "status": {
         const session = await browserSessionManager.status(profile);
-        publishBrowserSessionCard(ctx, session, session.url || args.url || "https://localhost/");
+        publishBrowserSessionState(ctx, session, session.url || args.url || "https://localhost/", true);
         return { content: [{ type: "text", text: JSON.stringify(session, null, 2) }] };
       }
       case "snapshot":
@@ -211,12 +257,70 @@ export async function handleBrowserSessionTool(
             text: `Browser profile ${profile} clipboard updated.`,
           }],
         };
-      case "close":
+      case "clipboard_to_secret": {
+        const secretLabel = String(args.secret_label || "").trim();
+        if (!secretLabel) {
+          throw new Error("BrowserSession clipboard_to_secret requires secret_label.");
+        }
+        const value = await browserSessionManager.readClipboard(profile);
+        if (!value) throw new Error("Browser clipboard is empty.");
+        const saved = saveSecureInput({
+          label: secretLabel,
+          value,
+          scope: args.secret_scope,
+          envHint: args.secret_env_hint,
+          sessionId: ctx.getSessionId(),
+          cwd: ctx.getCwd?.(),
+        });
+        let clipboardCleared = false;
+        if (args.clear_clipboard !== false) {
+          try {
+            await browserSessionManager.writeClipboard(profile, "");
+            clipboardCleared = true;
+          } catch {}
+        }
+        return {
+          content: [{
+            type: "text",
+            text: [
+              "Browser clipboard saved directly to secure storage.",
+              `Label: ${saved.label}`,
+              `Secret ID: ${saved.secretId}`,
+              `Scope: ${saved.scope}`,
+              `File path: ${saved.filePath}`,
+              `Suggested env var: ${saved.envHint}`,
+              `Browser clipboard cleared: ${clipboardCleared ? "yes" : "no"}`,
+              "The secret value was not returned to the agent or written to session history.",
+            ].join("\n"),
+          }],
+        };
+      }
+      case "close": {
+        let session: BrowserSessionSummary = {
+          profile,
+          label: args.label || profile,
+          running: false,
+        };
+        try {
+          session = await browserSessionManager.status(profile);
+        } catch {}
         await browserSessionManager.close(profile);
+        publishBrowserSessionState(ctx, session, session.url || args.url || "https://localhost/", false);
         return { content: [{ type: "text", text: `Browser profile ${profile} was closed. Its signed-in state remains saved.` }] };
-      case "clear":
+      }
+      case "clear": {
+        let session: BrowserSessionSummary = {
+          profile,
+          label: args.label || profile,
+          running: false,
+        };
+        try {
+          session = await browserSessionManager.status(profile);
+        } catch {}
         await browserSessionManager.clear(profile);
+        publishBrowserSessionState(ctx, session, session.url || args.url || "https://localhost/", false);
         return { content: [{ type: "text", text: `Browser profile ${profile} and its saved browsing state were deleted.` }] };
+      }
     }
 
     return { content: [{ type: "text", text: `Browser profile ${profile} accepted ${args.action}.` }] };
@@ -226,14 +330,17 @@ export async function handleBrowserSessionTool(
       && args.url
       && /No supported Chrome, Chromium, or Edge installation was found/.test(message)) {
       const profile = normalizeBrowserProfile(String(args.profile || ""));
-      publishBrowserSessionCard(ctx, {
+      const session = {
         profile,
         label: String(args.label || profile).trim().slice(0, 80) || profile,
         running: false,
+        sessionId: ctx.getSessionId(),
         url: normalizeBrowserUrl(args.url),
         title: "",
         lastUsedAt: new Date().toISOString(),
-      }, args.url, true);
+      };
+      publishBrowserSessionState(ctx, session, args.url, true, true);
+      publishBrowserSessionCard(ctx, session, args.url, true);
     }
     return {
       content: [{ type: "text", text: message }],

@@ -1297,6 +1297,11 @@ function serverCapabilitiesPayload(
     sessionTransfer: { version: 1 },
     codexGoals: { version: 1 },
     sessionMemory: { version: 1 },
+    browserSessions: {
+      version: 2,
+      activeHeader: true,
+      clipboardToSecret: true,
+    },
     backends: detectAvailableBackends(),
     codexDriver: settings.codexDriver,
     codexDriversAvailable: settings.codexDriversAvailable,
@@ -4805,7 +4810,12 @@ function createConnectionHandler(
               message: "Installing browser component...",
             });
             await ensureBrowserRuntimeInstalled();
-            await browserSessionManager.open(profile, url, label);
+            await browserSessionManager.open(
+              profile,
+              url,
+              label,
+              activeSessionId || undefined,
+            );
             sendJson({
               type: "browser_runtime_install_progress",
               profile,
@@ -9242,6 +9252,17 @@ function buildStatusSyncMessage(): string {
   for (const monitor of durableMonitors) {
     if (!backgroundTaskIds.includes(monitor.taskId)) backgroundTaskIds.push(monitor.taskId);
   }
+  const browserSessions = browserSessionManager.active()
+    .filter((session) => session.sessionId && session.url)
+    .map((session) => ({
+      profile: session.profile,
+      label: session.label,
+      url: session.url,
+      sessionId: session.sessionId,
+      width: 430,
+      height: 860,
+      active: true,
+    }));
   return JSON.stringify({
     type: "status_sync",
     running: anyRunning || compactingSessions.length > 0,
@@ -9257,6 +9278,7 @@ function buildStatusSyncMessage(): string {
     scheduledTaskRevision: getScheduledTaskRevision(),
     backgroundTaskIds,
     durableMonitors,
+    browserSessions,
     rateLimits: getCachedRateLimitEvents(),
     ...(Object.keys(sessionActiveStartedAt).length > 0 ? { sessionActiveStartedAt } : {}),
     ...(Object.keys(sessionTitles).length > 0 ? { sessionTitles } : {}),
