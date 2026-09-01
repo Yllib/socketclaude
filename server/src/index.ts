@@ -4872,6 +4872,10 @@ function createConnectionHandler(
               case "clipboard_write":
                 await browserSessionManager.writeClipboard(msg.profile, String(msg.text || ""));
                 return;
+              default: {
+                const action = String((msg as { action?: unknown }).action || "unknown");
+                throw new Error(`This server version does not support browser action: ${action}`);
+              }
             }
             await browserSessionManager.phoneInput(msg.profile, input);
             await new Promise<void>((resolve) => setTimeout(resolve, 180));
