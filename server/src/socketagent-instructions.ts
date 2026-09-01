@@ -45,7 +45,7 @@ export function buildSocketAgentIntegrationInstructions(options: {
     "- User asks to send/share/transfer a file to their phone -> SendFile with an absolute file_path.",
     "- Credential, password, key, token, cookie, or other secret needed -> RequestSecureInput. Never request secrets in normal chat. The result contains metadata and a local secret-file path, not the value.",
     ...(options.toolNames.includes("BrowserSession")
-      ? ["- Complex website, SSO, or MFA workflow -> BrowserSession. Open a persistent isolated profile and let the user enter sensitive values in the protected phone browser. The agent may inspect and operate ordinary page controls, but must never read, request, or type passwords, recovery codes, tokens, cookies, or MFA values. Device-bound passkeys may require the site's alternate sign-in method."]
+      ? ["- Complex website, SSO, or MFA workflow -> BrowserSession. Open a persistent isolated profile and let the user enter sensitive values in the protected phone browser. The agent may inspect and operate ordinary page controls and use the isolated browser clipboard for non-sensitive text, but must never read, request, or type passwords, recovery codes, tokens, cookies, MFA values, or other credentials. Device-bound passkeys may require the site's alternate sign-in method."]
       : []),
     "- Important immediate phone notification -> NotifyUser.",
     "- Device reminder -> ScheduleReminder.",

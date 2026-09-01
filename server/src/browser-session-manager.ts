@@ -286,6 +286,18 @@ function readStringResult(result: JsonRecord): string {
   return typeof value === "string" ? value : "";
 }
 
+function runtimeExceptionDescription(result: JsonRecord): string {
+  const details = result.exceptionDetails;
+  if (!details || typeof details !== "object") return "";
+  const record = details as JsonRecord;
+  const exception = record.exception;
+  if (exception && typeof exception === "object") {
+    const description = (exception as JsonRecord).description;
+    if (typeof description === "string") return description.split("\n", 1)[0].slice(0, 300);
+  }
+  return typeof record.text === "string" ? record.text.slice(0, 300) : "";
+}
+
 function boundedLabel(value: string | undefined, profile: string): string {
   const label = String(value || "").trim().replace(/[\r\n\t]+/g, " ").slice(0, 80);
   return label || profile;
@@ -549,6 +561,38 @@ export class BrowserSessionManager {
     await this.phoneInput(profileValue, { action: "scroll", deltaY });
   }
 
+  async readClipboard(profileValue: string): Promise<string> {
+    const session = this.require(normalizeBrowserProfile(profileValue));
+    await this.grantClipboardAccess(session);
+    const result = await session.cdp.command("Runtime.evaluate", {
+      expression: "navigator.clipboard.readText()",
+      returnByValue: true,
+      awaitPromise: true,
+    });
+    const exception = runtimeExceptionDescription(result);
+    if (exception) throw new Error(`The browser page did not allow clipboard access: ${exception}`);
+    const text = readStringResult(result);
+    if (text.length > 65_536) throw new Error("Browser clipboard text is too large.");
+    this.touch(session);
+    return text;
+  }
+
+  async writeClipboard(profileValue: string, text: string): Promise<void> {
+    const session = this.require(normalizeBrowserProfile(profileValue));
+    if (text.length > 65_536) throw new Error("Browser clipboard text is too large.");
+    await this.grantClipboardAccess(session);
+    const result = await session.cdp.command("Runtime.evaluate", {
+      expression: `navigator.clipboard.writeText(${JSON.stringify(text)})`,
+      returnByValue: true,
+      awaitPromise: true,
+    });
+    const exception = runtimeExceptionDescription(result);
+    if (exception) {
+      throw new Error(`The browser page did not allow clipboard access: ${exception}`);
+    }
+    this.touch(session);
+  }
+
   async close(profileValue: string): Promise<void> {
     const profile = normalizeBrowserProfile(profileValue);
     const session = this.sessions.get(profile);
@@ -614,6 +658,22 @@ export class BrowserSessionManager {
     await session.cdp.command("Input.dispatchKeyEvent", { type: "keyDown", ...definition });
     await session.cdp.command("Input.dispatchKeyEvent", { type: "keyUp", ...definition });
     this.touch(session);
+  }
+
+  private async grantClipboardAccess(session: RunningBrowserSession): Promise<void> {
+    await session.cdp.command("Page.bringToFront");
+    const location = await session.cdp.command("Runtime.evaluate", {
+      expression: "location.origin",
+      returnByValue: true,
+    });
+    const origin = readStringResult(location);
+    if (!/^https?:\/\//.test(origin)) {
+      throw new Error("Clipboard access requires an HTTP or HTTPS page.");
+    }
+    await session.cdp.command("Browser.grantPermissions", {
+      origin,
+      permissions: ["clipboardReadWrite", "clipboardSanitizedWrite"],
+    });
   }
 
   private async historyStep(session: RunningBrowserSession, delta: number): Promise<void> {

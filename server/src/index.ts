@@ -4864,6 +4864,14 @@ function createConnectionHandler(
               case "forward":
                 input = { action: msg.action };
                 break;
+              case "clipboard_read": {
+                const text = await browserSessionManager.readClipboard(msg.profile);
+                sendJson({ type: "browser_clipboard", profile: msg.profile, text });
+                return;
+              }
+              case "clipboard_write":
+                await browserSessionManager.writeClipboard(msg.profile, String(msg.text || ""));
+                return;
             }
             await browserSessionManager.phoneInput(msg.profile, input);
             await new Promise<void>((resolve) => setTimeout(resolve, 180));

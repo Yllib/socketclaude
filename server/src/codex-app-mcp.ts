@@ -226,14 +226,14 @@ function createServer(context: AppToolContext): McpServer {
     "BrowserSession",
     {
       title: "Remote Browser Session",
-      description: "Open and control a persistent isolated browser profile. Normal HTTP and HTTPS redirects are allowed across domains. Use snapshots and refs for non-sensitive interaction. Never type passwords, recovery codes, tokens, or MFA values with this tool; ask the user to enter them in the protected phone browser. Device-bound passkeys may require the site's alternate sign-in method. Use clear only when the user explicitly asks to delete a saved browser profile.",
+      description: "Open and control a persistent isolated browser profile. Normal HTTP and HTTPS redirects are allowed across domains. Use snapshots, refs, and clipboard actions only for non-sensitive interaction. Never type or read passwords, recovery codes, tokens, MFA values, or other credentials with this tool; ask the user to enter them in the protected phone browser. Device-bound passkeys may require the site's alternate sign-in method. Use clear only when the user explicitly asks to delete a saved browser profile.",
       inputSchema: {
-        action: z.enum(["open", "list", "status", "snapshot", "navigate", "click", "type", "key", "scroll", "close", "clear"]),
+        action: z.enum(["open", "list", "status", "snapshot", "navigate", "click", "type", "key", "scroll", "clipboard_read", "clipboard_write", "close", "clear"]),
         profile: z.string().optional().describe("Stable isolated profile name, for example google-play-william"),
         url: z.string().optional().describe("HTTP or HTTPS URL for open or navigate"),
         label: z.string().optional().describe("User-facing profile label used when opening"),
         ref: z.string().optional().describe("Element ref returned by snapshot"),
-        text: z.string().optional().describe("Non-sensitive text to enter. Never pass a secret here."),
+        text: z.string().optional().describe("Non-sensitive text to enter or write to the browser clipboard. Never pass a secret here."),
         key: z.string().optional().describe("Enter, Tab, Backspace, Escape, or Ctrl+A"),
         delta_y: z.number().optional().describe("Vertical scroll distance in CSS pixels"),
       },

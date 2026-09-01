@@ -118,7 +118,7 @@ export interface BrowserFrameRequestMessage {
 export interface BrowserSessionInputMessage {
   type: "browser_session_input";
   profile: string;
-  action: "tap" | "text" | "key" | "scroll" | "navigate" | "reload" | "back" | "forward";
+  action: "tap" | "text" | "key" | "scroll" | "navigate" | "reload" | "back" | "forward" | "clipboard_read" | "clipboard_write";
   x?: number;
   y?: number;
   text?: string;
@@ -2631,6 +2631,12 @@ export interface BrowserFrameServerMessage {
   title: string;
 }
 
+export interface BrowserClipboardServerMessage {
+  type: "browser_clipboard";
+  profile: string;
+  text: string;
+}
+
 export interface BrowserSessionErrorServerMessage {
   type: "browser_session_error";
   profile: string;
@@ -2648,6 +2654,7 @@ export type ServerMessage =
   | BrowserSessionOpenServerMessage
   | BrowserRuntimeInstallProgressServerMessage
   | BrowserFrameServerMessage
+  | BrowserClipboardServerMessage
   | BrowserSessionErrorServerMessage
   | SecretInventoryServerMessage
   | SecretOperationResultServerMessage

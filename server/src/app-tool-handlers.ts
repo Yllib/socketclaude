@@ -96,7 +96,7 @@ export interface McpTextResult {
 }
 
 export interface BrowserSessionToolArgs {
-  action: "open" | "list" | "status" | "snapshot" | "navigate" | "click" | "type" | "key" | "scroll" | "close" | "clear";
+  action: "open" | "list" | "status" | "snapshot" | "navigate" | "click" | "type" | "key" | "scroll" | "clipboard_read" | "clipboard_write" | "close" | "clear";
   profile?: string;
   url?: string;
   label?: string;
@@ -191,6 +191,26 @@ export async function handleBrowserSessionTool(
       case "scroll":
         await browserSessionManager.scroll(profile, Number(args.delta_y || 0));
         break;
+      case "clipboard_read": {
+        const text = await browserSessionManager.readClipboard(profile);
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({ profile, text }),
+          }],
+        };
+      }
+      case "clipboard_write":
+        if (typeof args.text !== "string") {
+          throw new Error("BrowserSession clipboard_write requires text.");
+        }
+        await browserSessionManager.writeClipboard(profile, args.text);
+        return {
+          content: [{
+            type: "text",
+            text: `Browser profile ${profile} clipboard updated.`,
+          }],
+        };
       case "close":
         await browserSessionManager.close(profile);
         return { content: [{ type: "text", text: `Browser profile ${profile} was closed. Its signed-in state remains saved.` }] };
