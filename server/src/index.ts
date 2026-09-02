@@ -762,6 +762,13 @@ function sessionIsBusy(session: Session): boolean {
   return session.isRunning || (session as any).isCompacting === true;
 }
 
+function hasBusyLiveSession(sessionId: string): boolean {
+  const mapped = activeSessions.get(sessionId);
+  return liveSessionInstances
+    .instances(sessionId, mapped ? [mapped] : [])
+    .some((session) => sessionIsBusy(session));
+}
+
 function sessionInstanceId(session: Session): string {
   return String(
     session.getSessionId?.()
@@ -2830,6 +2837,10 @@ function isContextClearedSession(sessionInfo: SessionInfo | undefined, sessionId
 
 async function syncCodexNativeHistory(sessionInfo: SessionInfo): Promise<any[]> {
   if (sessionInfo.backend !== "codex") return [];
+  // App-server events are authoritative while SocketAgent owns a live turn.
+  // A reconnect-triggered rollout import can otherwise append the completed
+  // assistant item just before the live item persists the same response.
+  if (hasBusyLiveSession(sessionInfo.id)) return [];
   const rolloutAdded = syncCodexRolloutHistory(sessionInfo);
   if (rolloutAdded.length > 0) return rolloutAdded;
   let appServerHistory: any[] = [];
@@ -2849,6 +2860,7 @@ async function syncCodexNativeHistory(sessionInfo: SessionInfo): Promise<any[]> 
 
 function syncCodexRolloutHistory(sessionInfo: SessionInfo): any[] {
   if (sessionInfo.backend !== "codex") return [];
+  if (hasBusyLiveSession(sessionInfo.id)) return [];
   const rolloutHistory = readCodexRolloutHistory(sessionInfo.id);
   if (rolloutHistory.length === 0) return [];
   const added = appendNativeHistorySuffix(sessionInfo.id, rolloutHistory);
