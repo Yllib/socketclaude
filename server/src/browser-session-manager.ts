@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { ChildProcess, spawn } from "node:child_process";
+import { createServer } from "node:net";
 import WebSocket from "ws";
 
 type JsonRecord = Record<string, unknown>;
@@ -73,6 +74,7 @@ interface RunningBrowserSession {
   url: string;
   profileDir: string;
   process: ChildProcess;
+  displayProcess?: ChildProcess;
   cdp: CdpClient;
   width: number;
   height: number;
@@ -83,6 +85,12 @@ interface RunningBrowserSession {
 const DEFAULT_WIDTH = 430;
 const DEFAULT_HEIGHT = 860;
 const IDLE_CLOSE_MS = 2 * 60 * 60_000;
+
+interface BrowserDisplay {
+  headless: boolean;
+  env: NodeJS.ProcessEnv;
+  process?: ChildProcess;
+}
 
 function socketAgentDataDir(): string {
   return process.env.SOCKET_AGENT_DATA_DIR
@@ -211,6 +219,102 @@ async function wait(ms: number): Promise<void> {
   await new Promise<void>((resolve) => setTimeout(resolve, ms));
 }
 
+async function stopChildProcess(processHandle: ChildProcess | undefined): Promise<void> {
+  if (!processHandle || processHandle.exitCode !== null) return;
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(() => {
+      processHandle.kill("SIGKILL");
+      resolve();
+    }, 3_000);
+    processHandle.once("exit", () => {
+      clearTimeout(timer);
+      resolve();
+    });
+    processHandle.kill("SIGTERM");
+  });
+}
+
+async function reserveLoopbackPort(): Promise<number> {
+  return await new Promise<number>((resolve, reject) => {
+    const server = createServer();
+    server.unref();
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      const port = address && typeof address === "object" ? address.port : 0;
+      server.close((error) => {
+        if (error) reject(error);
+        else if (!port) reject(new Error("Could not reserve a browser control port."));
+        else resolve(port);
+      });
+    });
+  });
+}
+
+function resolveXvfbBinary(): string {
+  const configured = process.env.SOCKETAGENT_XVFB_BINARY?.trim();
+  return [configured, "/usr/bin/Xvfb", "/usr/local/bin/Xvfb"]
+    .find((candidate): candidate is string => !!candidate && fs.existsSync(candidate)) || "";
+}
+
+async function startVirtualDisplay(width: number, height: number): Promise<BrowserDisplay> {
+  if (process.platform !== "linux") {
+    return { headless: false, env: { ...process.env } };
+  }
+  if (process.env.DISPLAY) {
+    return { headless: false, env: { ...process.env } };
+  }
+
+  const xvfbBinary = resolveXvfbBinary();
+  if (!xvfbBinary) {
+    console.warn("[BrowserSession] Xvfb is unavailable; falling back to headless Chromium.");
+    return { headless: true, env: { ...process.env } };
+  }
+
+  const displayProcess = spawn(xvfbBinary, [
+    "-displayfd", "3",
+    "-screen", "0", `${width}x${height}x24`,
+    "-nolisten", "tcp",
+    "-noreset",
+  ], {
+    stdio: ["ignore", "ignore", "pipe", "pipe"],
+  });
+  const displayPipe = displayProcess.stdio[3];
+  if (!displayPipe) {
+    displayProcess.kill("SIGTERM");
+    throw new Error("Virtual browser display did not expose its display number.");
+  }
+
+  const displayNumber = await new Promise<string>((resolve, reject) => {
+    let output = "";
+    const timer = setTimeout(() => finish(new Error("Virtual browser display did not start within 5 seconds.")), 5_000);
+    const finish = (error?: Error, value?: string): void => {
+      clearTimeout(timer);
+      displayPipe.removeAllListeners();
+      displayProcess.removeListener("exit", onExit);
+      if (error) reject(error);
+      else resolve(value || "");
+    };
+    const onExit = (): void => finish(new Error("Virtual browser display exited before startup."));
+    displayProcess.once("exit", onExit);
+    displayPipe.on("data", (chunk) => {
+      output += chunk.toString();
+      const line = output.split(/\r?\n/, 1)[0].trim();
+      if (/^[0-9]+$/.test(line)) finish(undefined, line);
+    });
+    displayPipe.once("error", (error) => finish(error));
+  }).catch((error) => {
+    displayProcess.kill("SIGTERM");
+    throw error;
+  });
+
+  return {
+    headless: false,
+    env: { ...process.env, DISPLAY: `:${displayNumber}` },
+    process: displayProcess,
+  };
+}
+
 class CdpClient {
   private socket: WebSocket;
   private nextId = 0;
@@ -335,9 +439,12 @@ export class BrowserSessionManager {
     restrictDirectory(root);
     restrictDirectory(profileDir);
     removeStaleBrowserControlFile(profileDir);
+    const display = await startVirtualDisplay(DEFAULT_WIDTH, DEFAULT_HEIGHT);
+    const debuggingPort = await reserveLoopbackPort();
     const processHandle = spawn(browserExecutable, [
-      "--headless",
-      "--remote-debugging-port=0",
+      ...(display.headless ? ["--headless"] : []),
+      `--remote-debugging-port=${debuggingPort}`,
+      "--remote-debugging-address=127.0.0.1",
       `--user-data-dir=${profileDir}`,
       `--window-size=${DEFAULT_WIDTH},${DEFAULT_HEIGHT}`,
       "--force-device-scale-factor=1",
@@ -352,11 +459,11 @@ export class BrowserSessionManager {
     ], {
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
+      env: display.env,
     });
 
     try {
-      const port = await this.waitForDebuggingPort(profileDir, processHandle);
-      const targets = await this.waitForPageTarget(port);
+      const targets = await this.waitForPageTarget(debuggingPort, processHandle);
       const page = targets.find((target) => target.type === "page" && target.webSocketDebuggerUrl);
       if (!page?.webSocketDebuggerUrl) throw new Error("Browser did not create an interactive page.");
       const cdp = await CdpClient.connect(page.webSocketDebuggerUrl);
@@ -378,6 +485,7 @@ export class BrowserSessionManager {
         url,
         profileDir,
         process: processHandle,
+        ...(display.process ? { displayProcess: display.process } : {}),
         cdp,
         width: DEFAULT_WIDTH,
         height: DEFAULT_HEIGHT,
@@ -388,6 +496,7 @@ export class BrowserSessionManager {
         if (current === session) {
           if (current.idleTimer) clearTimeout(current.idleTimer);
           current.cdp.close();
+          current.displayProcess?.kill("SIGTERM");
           this.sessions.delete(profile);
         }
       });
@@ -397,7 +506,8 @@ export class BrowserSessionManager {
       await wait(500);
       return await this.summary(session);
     } catch (error) {
-      processHandle.kill("SIGTERM");
+      await stopChildProcess(processHandle);
+      await stopChildProcess(display.process);
       throw error;
     }
   }
@@ -635,7 +745,8 @@ export class BrowserSessionManager {
     this.sessions.delete(profile);
     if (session.idleTimer) clearTimeout(session.idleTimer);
     session.cdp.close();
-    session.process.kill("SIGTERM");
+    await stopChildProcess(session.process);
+    await stopChildProcess(session.displayProcess);
   }
 
   async clear(profileValue: string): Promise<void> {
@@ -644,7 +755,12 @@ export class BrowserSessionManager {
     const root = browserDataDir();
     const target = path.join(root, profile);
     if (path.dirname(target) !== root) throw new Error("Browser profile path is invalid.");
-    fs.rmSync(target, { recursive: true, force: true });
+    fs.rmSync(target, {
+      recursive: true,
+      force: true,
+      maxRetries: 10,
+      retryDelay: 100,
+    });
   }
 
   async closeAll(): Promise<void> {
@@ -724,24 +840,11 @@ export class BrowserSessionManager {
     }
   }
 
-  private async waitForDebuggingPort(
-    profileDir: string,
-    processHandle: ChildProcess,
-  ): Promise<number> {
-    const activePortPath = path.join(profileDir, "DevToolsActivePort");
+  private async waitForPageTarget(port: number, processHandle: ChildProcess): Promise<CdpTarget[]> {
     for (let attempt = 0; attempt < 150; attempt++) {
-      if (processHandle.exitCode !== null) throw new Error("Browser exited before its control channel opened.");
-      try {
-        const port = Number(fs.readFileSync(activePortPath, "utf8").split(/\r?\n/)[0]);
-        if (Number.isInteger(port) && port > 0 && port <= 65535) return port;
-      } catch {}
-      await wait(100);
-    }
-    throw new Error("Browser control channel did not start within 15 seconds.");
-  }
-
-  private async waitForPageTarget(port: number): Promise<CdpTarget[]> {
-    for (let attempt = 0; attempt < 150; attempt++) {
+      if (processHandle.exitCode !== null) {
+        throw new Error("Browser exited before its control channel opened.");
+      }
       try {
         const response = await fetch(`http://127.0.0.1:${port}/json/list`);
         const targets = await response.json() as CdpTarget[];

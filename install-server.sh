@@ -131,6 +131,36 @@ ensure_native_build_tools() {
   ok "Native build tools are ready"
 }
 
+ensure_virtual_browser_display() {
+  [[ "$OS_NAME" == "Linux" ]] || return
+  command -v Xvfb >/dev/null 2>&1 && return
+
+  echo "  Installing the virtual display used by protected browser sessions..."
+  if command -v apt-get >/dev/null 2>&1; then
+    run_as_root apt-get update
+    run_as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y xvfb
+  elif command -v dnf >/dev/null 2>&1; then
+    run_as_root dnf install -y xorg-x11-server-Xvfb
+  elif command -v yum >/dev/null 2>&1; then
+    run_as_root yum install -y xorg-x11-server-Xvfb
+  elif command -v pacman >/dev/null 2>&1; then
+    run_as_root pacman -Sy --noconfirm xorg-server-xvfb
+  elif command -v zypper >/dev/null 2>&1; then
+    run_as_root zypper --non-interactive install xorg-x11-server-Xvfb
+  elif command -v apk >/dev/null 2>&1; then
+    run_as_root apk add xvfb
+  else
+    warn "Install Xvfb to let protected browser sessions use headed Chromium."
+    return
+  fi
+
+  if command -v Xvfb >/dev/null 2>&1; then
+    ok "Virtual browser display is ready"
+  else
+    warn "Xvfb was not found after installation. Browser sessions will use headless mode."
+  fi
+}
+
 require_git_checkout() {
   if ! command -v git >/dev/null 2>&1; then
     fail "Git is required. SocketAgent must be installed from a git checkout."
@@ -394,6 +424,7 @@ fi
 
 phase "Phase 4: Install Dependencies & Build"
 
+ensure_virtual_browser_display
 install_server_dependencies_and_build
 
 # ══════════════════════════════════════════════
