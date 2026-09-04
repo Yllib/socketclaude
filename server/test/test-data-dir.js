@@ -5,6 +5,7 @@ const test = require("node:test");
 
 const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "socketagent-test-file-"));
 process.env.SOCKET_AGENT_DATA_DIR = dataDir;
+process.env.SOCKETAGENT_TEST_MODE = "1";
 
 test.after(() => fs.rmSync(dataDir, { recursive: true, force: true }));
 

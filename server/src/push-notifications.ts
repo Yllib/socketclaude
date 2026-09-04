@@ -440,6 +440,11 @@ async function sendFcmHttpV1(
 export async function sendPushNotification(
   payload: PushNotificationPayload,
 ): Promise<{ sent: number; attempted: number }> {
+  // Test processes inherit the developer's relay credentials. Never let a
+  // fixture notification escape to a real enrolled device.
+  if (process.env.SOCKETAGENT_TEST_MODE === "1") {
+    return { sent: 0, attempted: 0 };
+  }
   const entries = readStore();
   const endpoint = relayPushEndpoint();
   const pairingToken = String(process.env.PAIRING_TOKEN || "").trim();

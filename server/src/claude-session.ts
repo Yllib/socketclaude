@@ -151,6 +151,15 @@ export function claudeDisallowedTools(userDisallowedTools: string[]): string[] {
   return [...new Set([...userDisallowedTools, "Monitor"])];
 }
 
+/** Keep the task APIs SocketAgent renders available on newer Claude models. */
+export const CLAUDE_TASK_TOOLS = [
+  "TaskCreate",
+  "TaskGet",
+  "TaskUpdate",
+  "TaskList",
+  "TodoWrite",
+] as const;
+
 /** Background completion follow-ups are SDK-owned turns, not phone prompts. */
 export function isClaudeTaskNotificationResult(message: unknown): boolean {
   if (!message || typeof message !== "object") return false;
@@ -631,6 +640,67 @@ const TOOL_CANCELLED_SENTINELS = [
 /** Minimum gap between forwarded thinking-token progress updates. */
 const THINKING_TOKENS_MIN_INTERVAL_MS = 500;
 
+interface ClaudeTurnCorrelation {
+  triggerUserMessageUuid?: string;
+  triggerUserMessageUuids?: string[];
+}
+
+export function claudeTurnCorrelation(message: unknown): ClaudeTurnCorrelation {
+  if (!message || typeof message !== "object") return {};
+  const record = message as Record<string, unknown>;
+  const primary = typeof record.user_message_uuid === "string"
+    ? record.user_message_uuid.trim()
+    : "";
+  const all = Array.isArray(record.user_message_uuids)
+    ? record.user_message_uuids
+        .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+        .map((value) => value.trim())
+    : [];
+  const unique = [...new Set(all.length > 0 ? all : primary ? [primary] : [])];
+  return {
+    ...(primary ? { triggerUserMessageUuid: primary } : {}),
+    ...(unique.length > 0 ? { triggerUserMessageUuids: unique } : {}),
+  };
+}
+
+export function appendClaudeResourceLinks(output: string, value: unknown): string {
+  if (!Array.isArray(value)) return output;
+  const links = value
+    .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object")
+    .map((item) => {
+      const uri = typeof item.uri === "string" ? item.uri.trim() : "";
+      if (!uri) return "";
+      const rawLabel = String(item.title || item.name || uri).trim();
+      const label = rawLabel.replaceAll("[", "\\[").replaceAll("]", "\\]");
+      return `- [${label}](${uri})`;
+    })
+    .filter(Boolean);
+  if (links.length === 0) return output;
+  return `${output.trim()}${output.trim() ? "\n\n" : ""}Resources:\n${links.join("\n")}`;
+}
+
+export function filterClaudePhoneCommands(
+  commands: unknown[],
+  terminalCommands: Iterable<string>,
+): Array<Record<string, unknown>> {
+  const hidden = new Set(
+    [...terminalCommands].map((command) => String(command).replace(/^\//, "").trim()),
+  );
+  return commands
+    .filter((command): command is Record<string, unknown> => Boolean(command) && typeof command === "object")
+    .filter((command) => {
+      const name = String(command.name || "").replace(/^\//, "").trim();
+      return name.length > 0 && !hidden.has(name);
+    });
+}
+
+export function claudeContinuationPending(
+  sdkQueuedTurnCount: unknown,
+  socketAgentQueuedCount: number,
+): boolean {
+  return Math.max(0, Number(sdkQueuedTurnCount || 0)) > 0 || socketAgentQueuedCount > 0;
+}
+
 function isCancelledToolResult(output: string): boolean {
   const trimmed = output.trim();
   return TOOL_CANCELLED_SENTINELS.some((s) => trimmed.startsWith(s));
@@ -944,6 +1014,8 @@ export class ClaudeSession {
   private _streamingText = new Map<string, { content: string; parentToolUseId?: string; uuid?: string; startedAtMs?: number }>();
   private _streamingThinking = new Map<string, { content: string; parentToolUseId?: string; uuid?: string; startedAtMs?: number }>();
   private _thinkingProgress: { startedAtMs: number; estimatedTokens: number; uuid?: string } | null = null;
+  private _turnCorrelation: ClaudeTurnCorrelation = {};
+  private _terminalSlashCommands = new Set<string>();
   private _activeSdkMessageIds = new Map<string, string>();
   private _lastPreview: string = "";
   private _lastSessionInit: ServerMessage | null = null;
@@ -1859,17 +1931,23 @@ export class ClaudeSession {
   }
 
   private _handleSdkTaskStarted(ts: any): void {
+    if (ts.ambient === true) return;
     const taskId = String(ts.task_id || "");
     const directToolUseId = String(ts.tool_use_id || "") || undefined;
     const toolUseId = directToolUseId || this._taskIdToToolUseId.get(taskId);
+    const isBackgrounded = typeof ts.is_backgrounded === "boolean"
+      ? ts.is_backgrounded
+      : true;
     if (taskId) {
       this._sdkTaskIds.add(taskId);
       if (toolUseId) this._taskIdToToolUseId.set(taskId, toolUseId);
-      this._sdkBackgroundTasks.set(taskId, {
-        taskId,
-        taskType: String(ts.task_type || ""),
-        description: String(ts.description || ""),
-      });
+      if (isBackgrounded) {
+        this._sdkBackgroundTasks.set(taskId, {
+          taskId,
+          taskType: String(ts.task_type || ""),
+          description: String(ts.description || ""),
+        });
+      }
     }
 
     const isWorkflow = String(ts.task_type || "") === "local_workflow";
@@ -1882,7 +1960,7 @@ export class ClaudeSession {
         description: String(ts.description || previous?.description || "Agent"),
         subagentType: String(ts.subagent_type || previous?.subagentType || ""),
         startedAt: previous?.startedAt || new Date().toISOString(),
-        isBackgrounded: true,
+        isBackgrounded,
         status: "running",
         ...(String(ts.prompt || previous?.prompt || "") ? { prompt: String(ts.prompt || previous?.prompt || "") } : {}),
         ...(previous?.parentToolUseId ? { parentToolUseId: previous.parentToolUseId } : {}),
@@ -1903,7 +1981,7 @@ export class ClaudeSession {
       taskType: String(ts.task_type || "") || undefined,
       subagentType: String(ts.subagent_type || "") || undefined,
       prompt: String(ts.prompt || "") || undefined,
-      isBackgrounded: true,
+      isBackgrounded,
       skipTranscript: ts.skip_transcript === true || undefined,
       ...(isWorkflow ? {
         workflowState: this._workflowRuns.get(taskId)?.lastSnapshot
@@ -1926,6 +2004,10 @@ export class ClaudeSession {
       workflowName: String(ts.workflow_name || "") || undefined,
       prompt: String(ts.prompt || "") || undefined,
       skipTranscript: ts.skip_transcript === true || undefined,
+      isBackgrounded,
+      ...(Number.isFinite(Number(ts.spawn_depth))
+        ? { spawnDepth: Number(ts.spawn_depth) }
+        : {}),
       sessionId: this.sessionId || "",
     });
     this._emitActiveSubagentsSnapshot();
@@ -2062,7 +2144,9 @@ export class ClaudeSession {
   }
 
   private _handleSdkBackgroundTasksChanged(message: any): void {
-    const tasks = Array.isArray(message.tasks) ? message.tasks : [];
+    const tasks = Array.isArray(message.tasks)
+      ? message.tasks.filter((task: any) => task?.ambient !== true)
+      : [];
     const replacement = new Map<string, ClaudeSdkBackgroundTask>();
     for (const task of tasks) {
       const taskId = String(task?.task_id || "");
@@ -3008,6 +3092,10 @@ export class ClaudeSession {
       cleanEnv["CLAUDE_CODE_CONTAINER_ID"] = "socketagent";
       // Enable session state change events (idle/running/requires_action)
       cleanEnv["CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS"] = "1";
+      // Newer Claude models hide task/todo tools by default. SocketAgent has a
+      // durable task pane for these events, so keep the SDK surface explicit.
+      cleanEnv["CLAUDE_CODE_ENABLE_TASKS"] = "1";
+      cleanEnv["CLAUDE_CODE_ENABLE_TODO_TOOLS"] = "1";
 
       // Merge plugin environment variables
       for (const plugin of this.plugins) {
@@ -3568,6 +3656,7 @@ export class ClaudeSession {
       // and pass it via streaming-input mode so it lands in the SDK transcript with
       // the same ID we hand to the app.)
       const userMsgUuid = messageId || crypto.randomUUID();
+      this._turnCorrelation = {};
       const promptSessionId = resumeTarget || this.sessionId || "";
       const transferContext = this._pendingTransferContext;
       const nativePrompt = transferContext
@@ -3630,6 +3719,7 @@ export class ClaudeSession {
           enableFileCheckpointing: true,
           promptSuggestions: true,
           agentProgressSummaries: true,
+          perTaskStopAffordance: true,
           toolConfig: { askUserQuestion: { previewFormat: 'markdown' } },
           settingSources: ["user", "project", "local"],
           mcpServers: (() => {
@@ -3640,7 +3730,7 @@ export class ClaudeSession {
             return servers;
           })(),
           allowedTools: (() => {
-            const tools = ["mcp__app__*"];
+            const tools = ["mcp__app__*", ...CLAUDE_TASK_TOOLS];
             for (const plugin of this.plugins) {
               if (plugin.allowedTools) tools.push(...plugin.allowedTools());
             }
@@ -4226,6 +4316,10 @@ export class ClaudeSession {
       const consumeQuery = async () => {
         try {
           for await (const message of q) {
+        if (!(message as { parent_tool_use_id?: unknown }).parent_tool_use_id) {
+          const correlation = claudeTurnCorrelation(message);
+          if (correlation.triggerUserMessageUuid) this._turnCorrelation = correlation;
+        }
         // Debug: log all message types to understand SDK event flow
         const msgType = message.type;
         const subtype = (message as any).subtype || (message as any).event?.type || '';
@@ -4403,6 +4497,13 @@ export class ClaudeSession {
 
           // Forward init data to app (available agents, tools, MCP servers, model, etc.)
           const initMsg = message as any;
+          this._terminalSlashCommands = new Set(
+            (Array.isArray(initMsg.terminal_slash_commands)
+              ? initMsg.terminal_slash_commands
+              : [])
+              .map((command: unknown) => String(command).replace(/^\//, "").trim())
+              .filter(Boolean),
+          );
           const initPermissionMode = initMsg.permissionMode as string | undefined;
           if (initPermissionMode) {
             this._permissionMode = initPermissionMode;
@@ -4451,9 +4552,13 @@ export class ClaudeSession {
               this.activeQuery.supportedCommands().then((commands: any) => {
                 console.log(`[Init] supportedCommands returned: ${Array.isArray(commands) ? commands.length + ' commands' : typeof commands}`);
                 if (commands && Array.isArray(commands) && commands.length > 0) {
+                  const phoneCommands = filterClaudePhoneCommands(
+                    commands,
+                    this._terminalSlashCommands,
+                  );
                   this._lastSupportedCommands = {
                     type: "supported_commands",
-                    commands,
+                    commands: phoneCommands,
                     sessionId: this.sessionId || "",
                   } as any;
                   this.send(this._lastSupportedCommands!);
@@ -4485,7 +4590,7 @@ export class ClaudeSession {
             }
 
             // Fetch initial context usage
-            this.activeQuery.getContextUsage().then((ctx: any) => {
+            this.activeQuery.getContextUsage({ detail: "summary" }).then((ctx: any) => {
               if (ctx) {
                 this.send({
                   type: "context_usage",
@@ -4559,6 +4664,22 @@ export class ClaudeSession {
           } as any);
         }
 
+        if (message.type === "system" && (message as any).subtype === "commands_changed") {
+          const rawCommands = Array.isArray((message as any).commands)
+            ? (message as any).commands as Array<Record<string, unknown>>
+            : [];
+          const phoneCommands = filterClaudePhoneCommands(
+            rawCommands,
+            this._terminalSlashCommands,
+          );
+          this._lastSupportedCommands = {
+            type: "supported_commands",
+            commands: phoneCommands,
+            sessionId: this.sessionId || "",
+          } as any;
+          if (this._lastSupportedCommands) this.send(this._lastSupportedCommands);
+        }
+
         // Live thinking progress. When extended thinking is redacted the API
         // streams pings rather than text, so thinking_delta carries no words and
         // the only signal that reasoning is happening is this running token
@@ -4586,6 +4707,7 @@ export class ClaudeSession {
               estimatedTokensDelta: tt.estimated_tokens_delta || 0,
               sessionId: this.sessionId || "",
               uuid: tt.uuid || undefined,
+              ...this._turnCorrelation,
             } as any);
           }
         }
@@ -4667,6 +4789,15 @@ export class ClaudeSession {
             ? this._activeSubagents.get(originToolUseId)
             : this._findSubagentByTaskId(sdkTaskId)?.[1];
           const taskUsage = this._taskUsage(tn.usage);
+          if (tn.ambient === true) {
+            if (originToolUseId) this._activeSubagents.delete(originToolUseId);
+            if (sdkTaskId) {
+              this._sdkBackgroundTasks.delete(sdkTaskId);
+              this._sdkTaskIds.delete(sdkTaskId);
+              this._taskIdToToolUseId.delete(sdkTaskId);
+            }
+            continue;
+          }
           console.log(`[SDK] Task notification: id=${sdkTaskId} status=${tn.status} originToolUseId=${originToolUseId} summary=${tn.summary?.slice(0, 80)}`);
           // If this task was being monitored, flush output and send final notification
           if (sdkTaskId && this._monitoredTasks.has(sdkTaskId)) {
@@ -4716,9 +4847,12 @@ export class ClaudeSession {
           // acknowledgement, completes a background card. Always emit a final
           // tool result for subagents so live UI and history settle identically,
           // including failed/stopped tasks with no output file.
-          const terminalOutput = bgOutputContent
-            || String(tn.summary || "")
-            || `Task ${tn.status || "completed"}`;
+          const terminalOutput = appendClaudeResourceLinks(
+            bgOutputContent
+              || String(tn.summary || "")
+              || `Task ${tn.status || "completed"}`,
+            tn.resource_links,
+          );
           if (originToolUseId && (bgOutputContent || subagentState || workflowRun)) {
             this.send({
               type: "tool_result",
@@ -5025,6 +5159,7 @@ export class ClaudeSession {
               snapshot: true,
               parentToolUseId,
               uuid: (message as any).uuid || undefined,
+              ...(!parentToolUseId ? this._turnCorrelation : {}),
             });
           }
 
@@ -5053,6 +5188,7 @@ export class ClaudeSession {
                 snapshot: true,
                 parentToolUseId: (message as any).parent_tool_use_id || null,
                 uuid: (message as any).uuid || undefined,
+                ...(!(message as any).parent_tool_use_id ? this._turnCorrelation : {}),
               });
             }
           }
@@ -5189,6 +5325,7 @@ export class ClaudeSession {
               timestamp: thinkingTimestamp,
               parentToolUseId: (message as any).parent_tool_use_id || null,
               uuid: (message as any).uuid || progress?.uuid || undefined,
+              ...(isRootMessage ? this._turnCorrelation : {}),
             } as any);
             if (this.sessionId) {
               appendHistory(this.sessionId, {
@@ -5200,6 +5337,7 @@ export class ClaudeSession {
                 ...(thinkingTokens > 0 ? { thinkingTokens } : {}),
                 parentToolUseId: (message as any).parent_tool_use_id || null,
                 uuid: (message as any).uuid || progress?.uuid || undefined,
+                ...(isRootMessage ? this._turnCorrelation : {}),
                 timestamp: thinkingTimestamp,
               });
             }
@@ -5223,6 +5361,7 @@ export class ClaudeSession {
               finalSnapshot: true,
               parentToolUseId: (message as any).parent_tool_use_id || null,
               uuid: (message as any).uuid || undefined,
+              ...(!(message as any).parent_tool_use_id ? this._turnCorrelation : {}),
             } as any);
           }
           // Only close the stream that produced this assistant message. Other
@@ -5246,6 +5385,7 @@ export class ClaudeSession {
                   streamId: this._streamKey(message),
                   parentToolUseId: (message as any).parent_tool_use_id || null,
                   uuid: (message as any).uuid || undefined,
+                  ...(!(message as any).parent_tool_use_id ? this._turnCorrelation : {}),
                   timestamp: now(),
                 });
               }
@@ -5485,6 +5625,10 @@ export class ClaudeSession {
                   // structured AgentOutput. Current SDKs use async_launched.
                   backgroundPending = /(?:async|background|launched|output file)/i.test(output);
                 }
+                output = appendClaudeResourceLinks(
+                  output,
+                  structuredToolOutput?.resourceLinks,
+                );
 
                 // Extract image blocks from tool results (e.g., Read on image files)
                 if (Array.isArray(block.content)) {
@@ -5693,11 +5837,13 @@ export class ClaudeSession {
               type: "text",
               content: result.result,
               sessionId: this.sessionId || "",
+              ...this._turnCorrelation,
             });
             if (this.sessionId) {
               appendHistory(this.sessionId, {
                 role: "assistant",
                 content: result.result,
+                ...this._turnCorrelation,
                 timestamp: now(),
               });
             }
@@ -5728,12 +5874,17 @@ export class ClaudeSession {
           };
 
           // Total usage across ALL turns (from SDK result.usage)
+          const totalThinkingTokens = result.modelUsage
+            ? Object.values(result.modelUsage as Record<string, { thinkingTokens?: number }>)
+                .reduce((sum, usage) => sum + Number(usage.thinkingTokens || 0), 0)
+            : 0;
           const totalUsage = result.usage ? {
             inputTokens: result.usage.inputTokens || 0,
             outputTokens: result.usage.outputTokens || 0,
             cacheReadTokens: result.usage.cacheReadInputTokens || 0,
             cacheCreateTokens: result.usage.cacheCreationInputTokens || 0,
             costUsd: result.usage.costUSD || 0,
+            ...(totalThinkingTokens > 0 ? { thinkingTokens: totalThinkingTokens } : {}),
           } : undefined;
 
           // "next" context is normally delivered by PostToolBatch. A
@@ -5741,7 +5892,11 @@ export class ClaudeSession {
           // run with a fresh SDK input turn instead of resolving the phone
           // prompt and sending a false completion notification.
           const pendingContinuation = this._takePendingBoundaryContext();
-          let continuationPending = false;
+          const sdkQueuedTurnCount = Math.max(0, Number(result.queued_turn_count || 0));
+          let continuationPending = claudeContinuationPending(
+            sdkQueuedTurnCount,
+            0,
+          );
           if (pendingContinuation.length > 0 && this.activeInputQueue) {
             try {
               for (const userMessage of createClaudeContinuationMessages(
@@ -5750,7 +5905,10 @@ export class ClaudeSession {
               )) {
                 this.activeInputQueue.push(userMessage);
               }
-              continuationPending = true;
+              continuationPending = claudeContinuationPending(
+                sdkQueuedTurnCount,
+                pendingContinuation.length,
+              );
               console.log(
                 `[Inject] Continuing after result with ${pendingContinuation.length} queued message(s)`,
               );
@@ -5777,6 +5935,7 @@ export class ClaudeSession {
             fastModeState: result.fast_mode_state || undefined,
             errors: result.errors?.length ? result.errors : undefined,
             permissionDenials: result.permission_denials?.length ? result.permission_denials : undefined,
+            ...this._turnCorrelation,
           });
 
           this._lastPreview = lastResultContent.slice(0, 200);
@@ -5790,7 +5949,7 @@ export class ClaudeSession {
 
           // Fetch detailed context usage breakdown from SDK (async, non-blocking)
           if (this.activeQuery) {
-            this.activeQuery.getContextUsage().then((ctx: any) => {
+            this.activeQuery.getContextUsage({ detail: "summary" }).then((ctx: any) => {
               if (ctx) {
                 this.send({
                   type: "context_usage",
@@ -5804,6 +5963,7 @@ export class ClaudeSession {
           }
 
           if (continuationPending) {
+            this._turnCorrelation = {};
             currentText = "";
             sawMainAssistantText = false;
             lastTurnInputTokens = 0;
@@ -5815,6 +5975,7 @@ export class ClaudeSession {
           }
 
           this._isRunning = false;
+          this._turnCorrelation = {};
           this._runStartedAt = null;
           if (CLAUDE_WARM_IDLE_TIMEOUT_MS > 0) {
             this._enterWarmIdle();

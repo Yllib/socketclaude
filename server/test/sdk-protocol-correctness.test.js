@@ -1,17 +1,25 @@
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
+const fs = require("node:fs");
+const path = require("node:path");
 const test = require("node:test");
 require("./test-data-dir");
 
 const {
   ClaudeSession,
+  CLAUDE_TASK_TOOLS,
+  appendClaudeResourceLinks,
+  claudeContinuationPending,
+  claudeTurnCorrelation,
   claudeApiRetryDelayMs,
+  filterClaudePhoneCommands,
   formatClaudeQueryError,
   isLiveClaudeUserEcho,
 } = require("../dist/claude-session");
 const {
   CodexSession,
   codexAgentMessagePhase,
+  codexThreadGitInfo,
 } = require("../dist/codex-session");
 const {
   appendHistory,
@@ -36,6 +44,175 @@ test("ignores replayed Claude user echoes and uses the SDK retry delay", () => {
   assert.equal(isLiveClaudeUserEcho({ type: "user", isSynthetic: true }), false);
   assert.equal(claudeApiRetryDelayMs({ retry_delay_ms: 2750 }), 2750);
   assert.equal(claudeApiRetryDelayMs({ delay_ms: 9999 }), 0);
+});
+
+test("adopts new Claude SDK correlation, queue, command, and resource metadata", () => {
+  assert.deepEqual(claudeTurnCorrelation({
+    user_message_uuid: "user-2",
+    user_message_uuids: ["user-1", "user-2", "user-2"],
+  }), {
+    triggerUserMessageUuid: "user-2",
+    triggerUserMessageUuids: ["user-1", "user-2"],
+  });
+  assert.equal(claudeContinuationPending(1, 0), true);
+  assert.equal(claudeContinuationPending(0, 1), true);
+  assert.equal(claudeContinuationPending(0, 0), false);
+  assert.deepEqual(
+    filterClaudePhoneCommands(
+      [{ name: "context" }, { name: "exit" }, { name: "statusline" }],
+      ["/exit", "statusline"],
+    ).map((command) => command.name),
+    ["context"],
+  );
+  assert.equal(
+    appendClaudeResourceLinks("Created report", [
+      { name: "Report", uri: "file:///tmp/report.pdf" },
+      { name: "missing-uri" },
+    ]),
+    "Created report\n\nResources:\n- [Report](file:///tmp/report.pdf)",
+  );
+});
+
+test("keeps Claude task tools required by the SocketAgent task pane explicit", () => {
+  assert.deepEqual(CLAUDE_TASK_TOOLS, [
+    "TaskCreate",
+    "TaskGet",
+    "TaskUpdate",
+    "TaskList",
+    "TodoWrite",
+  ]);
+
+  const source = fs.readFileSync(
+    path.join(__dirname, "../src/claude-session.ts"),
+    "utf8",
+  );
+  assert.match(source, /CLAUDE_CODE_ENABLE_TASKS\"\] = \"1\"/);
+  assert.match(source, /CLAUDE_CODE_ENABLE_TODO_TOOLS\"\] = \"1\"/);
+  assert.match(source, /\[\"mcp__app__\*\", \.\.\.CLAUDE_TASK_TOOLS\]/);
+});
+
+test("hides ambient Claude tasks and preserves foreground task metadata", () => {
+  const sent = [];
+  const sessionId = `claude-task-flags-${crypto.randomUUID()}`;
+  const session = new ClaudeSession(testSocket(sent), process.cwd(), []);
+  session.sessionId = sessionId;
+  saveSession({
+    id: sessionId,
+    title: "Task flags",
+    cwd: process.cwd(),
+    createdAt: new Date().toISOString(),
+    lastActive: new Date().toISOString(),
+    messagePreview: "",
+    backend: "claude",
+  });
+
+  try {
+    session._handleSdkTaskStarted({
+      task_id: "ambient-1",
+      description: "watcher",
+      ambient: true,
+    });
+    assert.equal(sent.length, 0);
+
+    session._handleSdkTaskStarted({
+      task_id: "agent-1",
+      tool_use_id: "tool-1",
+      task_type: "local_agent",
+      description: "review",
+      is_backgrounded: false,
+      spawn_depth: 2,
+    });
+    const started = sent.find((message) => message.type === "task_started");
+    assert.equal(started.isBackgrounded, false);
+    assert.equal(started.spawnDepth, 2);
+  } finally {
+    deleteSessionArtifacts(sessionId);
+  }
+});
+
+test("surfaces Codex async questions and authentication recovery", () => {
+  const sent = [];
+  const sessionId = `codex-new-events-${crypto.randomUUID()}`;
+  const session = new CodexSession(testSocket(sent), process.cwd(), []);
+  session.sessionId = sessionId;
+  session.threadId = sessionId;
+  saveSession({
+    id: sessionId,
+    title: "Codex events",
+    cwd: process.cwd(),
+    createdAt: new Date().toISOString(),
+    lastActive: new Date().toISOString(),
+    messagePreview: "",
+    backend: "codex",
+  });
+
+  try {
+    session.handleAppServerNotification("item/completed", {
+      threadId: sessionId,
+      item: {
+        id: "question-item",
+        type: "agentMessage",
+        text: "",
+        questions: [{ title: "Which target?", options: ["Server", "App"] }],
+      },
+    });
+    session.handleAppServerNotification("modelProvider/authRecoveryStarted", {
+      threadId: sessionId,
+      provider: "openai",
+      message: "Refreshing credentials",
+    });
+    session.handleAppServerNotification("modelProvider/authRecoveryCompleted", {
+      threadId: sessionId,
+      provider: "openai",
+    });
+
+    const question = sent.find((message) => message.type === "question");
+    assert.equal(question.asyncQuestion, true);
+    assert.deepEqual(question.questions[0].options, [
+      { label: "Server" },
+      { label: "App" },
+    ]);
+    assert.deepEqual(
+      sent.filter((message) => message.type === "backend_auth_recovery")
+        .map((message) => message.active),
+      [true, false],
+    );
+    assert.equal(
+      getHistory(sessionId).find((entry) => entry.role === "question").asyncQuestion,
+      true,
+    );
+  } finally {
+    deleteSessionArtifacts(sessionId);
+  }
+});
+
+test("restores Codex thread model settings and keeps plan updates enabled", () => {
+  const sent = [];
+  const sessionId = `codex-thread-settings-${crypto.randomUUID()}`;
+  const session = new CodexSession(testSocket(sent), process.cwd(), []);
+  try {
+    session.adoptAppServerThread(sessionId, {
+      thread: {
+        id: sessionId,
+        model: "gpt-5.6-codex",
+        reasoningEffort: "xhigh",
+      },
+    });
+    assert.equal(session.getAgentSettings().model, "gpt-5.6-codex");
+    assert.equal(session.getAgentSettings().effort, "xhigh");
+    assert.deepEqual(session.appServerConfig().tools, {
+      update_plan: { enabled: true },
+    });
+  } finally {
+    deleteSessionArtifacts(sessionId);
+  }
+});
+
+test("collects current git metadata for Codex thread attribution", () => {
+  const gitInfo = codexThreadGitInfo(path.join(__dirname, "../.."));
+  assert.match(gitInfo.sha, /^[0-9a-f]{40}$/);
+  assert.equal(gitInfo.branch, "master");
+  assert.equal(codexThreadGitInfo(path.join(__dirname, "missing-repository")), null);
 });
 
 test("reports useful Claude spawn details without exposing raw arguments", () => {

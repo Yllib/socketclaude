@@ -36,3 +36,13 @@ export function backendsForManagedBackendSpecs(specs: readonly string[]): Backen
     .filter(({ spec }) => requested.has(spec))
     .map(({ backend }) => backend);
 }
+
+export function managedBackendCheckIsDue(
+  lastCheckedAtMs: number,
+  nowMs: number,
+  intervalMs: number,
+): boolean {
+  if (!Number.isFinite(lastCheckedAtMs) || lastCheckedAtMs <= 0) return true;
+  if (!Number.isFinite(intervalMs) || intervalMs <= 0) return true;
+  return nowMs - lastCheckedAtMs >= intervalMs;
+}

@@ -69,7 +69,13 @@ import { HardAbortCoordinator } from "./hard-abort";
 import { ControlMessageScheduler, controlMessageQueueScope } from "./control-message-scheduler";
 import { SessionInstanceRegistry } from "./session-instance-registry";
 import { SessionAutomationLockedError, SessionAutomationLockStore } from "./session-automation-lock";
-import { backendsForManagedBackendSpecs, MANAGED_BACKEND_PACKAGES, managedBackendSpecsNeedingUpdate, parseNpmVersionOutput } from "./managed-backend-update";
+import {
+  backendsForManagedBackendSpecs,
+  managedBackendCheckIsDue,
+  MANAGED_BACKEND_PACKAGES,
+  managedBackendSpecsNeedingUpdate,
+  parseNpmVersionOutput,
+} from "./managed-backend-update";
 import { invalidateCachedModelCatalog } from "./model-catalog-store";
 import { getCachedRateLimitEvents } from "./rate-limit-cache";
 import { activeAppMonitorRecords, AppToolContext, publishWorkReviewCard, rebindAppMonitorsForSession, restoreAppMonitors } from "./app-tool-handlers";
@@ -5425,7 +5431,7 @@ function createConnectionHandler(
           runPackageUpdateSync(tscDir);
           try {
             runManagedBackendUpdateSync();
-            markManagedBackendUpdateApplied(afterHash);
+            markManagedBackendUpdateChecked();
           } catch (backendErr: any) {
             console.warn(`[ForceUpdate] Managed backend version check failed; keeping installed versions: ${backendErr?.message || String(backendErr)}`);
           }
@@ -10055,7 +10061,11 @@ const GIT_ROOT: string = (() => {
 let lastAutoUpdateError: string | null = null;
 let autoUpdateInProgress = false;
 const AUTO_UPDATE_ALLOWED_SIGNERS_FILE = path.join(GIT_ROOT, ".github", "allowed_signers");
-const MANAGED_BACKENDS_UPDATE_HASH_FILE = path.join(GIT_ROOT, ".last-managed-backends-update-hash");
+const MANAGED_BACKENDS_UPDATE_STATE_FILE = path.join(GIT_ROOT, ".last-managed-backends-update-hash");
+const MANAGED_BACKENDS_UPDATE_INTERVAL_MS = Math.max(
+  60 * 60 * 1000,
+  Number(process.env.SOCKETAGENT_MANAGED_BACKEND_CHECK_INTERVAL_MS) || 6 * 60 * 60 * 1000,
+);
 
 function gitOutput(args: string[], options: { timeout?: number } = {}): string {
   return execFileSync("git", args, {
@@ -10496,15 +10506,26 @@ async function runManagedBackendUpdate(): Promise<void> {
   refreshBackendRuntimeCaches(backendsForManagedBackendSpecs(specs));
 }
 
-function markManagedBackendUpdateApplied(hash: string): void {
-  fs.writeFileSync(MANAGED_BACKENDS_UPDATE_HASH_FILE, hash);
+function markManagedBackendUpdateChecked(): void {
+  fs.writeFileSync(MANAGED_BACKENDS_UPDATE_STATE_FILE, JSON.stringify({
+    checkedAt: new Date().toISOString(),
+  }));
 }
 
-function readManagedBackendUpdateHash(): string {
+function readManagedBackendUpdateCheckedAt(): number {
   try {
-    return fs.readFileSync(MANAGED_BACKENDS_UPDATE_HASH_FILE, "utf-8").trim();
+    const raw = fs.readFileSync(MANAGED_BACKENDS_UPDATE_STATE_FILE, "utf-8").trim();
+    try {
+      const parsed = JSON.parse(raw) as { checkedAt?: unknown };
+      const timestamp = Date.parse(String(parsed.checkedAt || ""));
+      if (Number.isFinite(timestamp)) return timestamp;
+    } catch {
+      // Older releases stored a git hash in this file. Its mtime is the best
+      // available migration value and avoids an unnecessary npm check.
+    }
+    return fs.statSync(MANAGED_BACKENDS_UPDATE_STATE_FILE).mtimeMs;
   } catch {
-    return "";
+    return 0;
   }
 }
 
@@ -10534,33 +10555,30 @@ async function waitForManagedBackendUpdate(): Promise<void> {
   }
 }
 
-async function ensureManagedBackendsUpdatedForCurrentHash(reason: string): Promise<void> {
+async function ensureManagedBackendsCurrent(reason: string): Promise<void> {
   if (!autoUpdateEnabled() || !managedBackendAutoUpdateEnabled()) return;
   if (managedBackendUpdateInProgress) return;
-
-  let currentHash = "";
-  try {
-    currentHash = gitOutput(["rev-parse", "HEAD"]);
-  } catch {
-    return;
-  }
-  if (!currentHash || readManagedBackendUpdateHash() === currentHash) return;
+  if (!managedBackendCheckIsDue(
+    readManagedBackendUpdateCheckedAt(),
+    Date.now(),
+    MANAGED_BACKENDS_UPDATE_INTERVAL_MS,
+  )) return;
 
   const blockReason = autoUpdateBlockReason();
   if (blockReason) {
-    console.log(`[Auto-update] Managed backend update for ${currentHash.substring(0, 7)} deferred because ${blockReason}`);
-    setTimeout(() => void ensureManagedBackendsUpdatedForCurrentHash(`${reason}-retry`), 60000);
+    console.log(`[Auto-update] Managed backend update deferred because ${blockReason}`);
+    setTimeout(() => void ensureManagedBackendsCurrent(`${reason}-retry`), 60000);
     return;
   }
 
   try {
-    console.log(`[Auto-update] Checking managed backends for current build ${currentHash.substring(0, 7)} (${reason})`);
+    console.log(`[Auto-update] Checking managed agent backends (${reason})`);
     await runManagedBackendUpdateTracked();
-    markManagedBackendUpdateApplied(currentHash);
+    markManagedBackendUpdateChecked();
   } catch (e: any) {
     lastAutoUpdateError = `Managed backend update failed: ${e?.message || String(e)}`;
     console.error(`[Auto-update] ${lastAutoUpdateError}`);
-    setTimeout(() => void ensureManagedBackendsUpdatedForCurrentHash(`${reason}-retry`), 300000);
+    setTimeout(() => void ensureManagedBackendsCurrent(`${reason}-retry`), 300000);
   }
 }
 
@@ -11063,7 +11081,7 @@ async function checkForUpdates(): Promise<void> {
     await runPackageUpdate(tscDir);
     try {
       await runManagedBackendUpdateTracked();
-      markManagedBackendUpdateApplied(remote);
+      markManagedBackendUpdateChecked();
     } catch (backendErr: any) {
       console.warn(`[Auto-update] Managed backend version check failed; keeping installed versions: ${backendErr?.message || String(backendErr)}`);
     }
@@ -11105,7 +11123,12 @@ if (process.platform === "linux" && codexLinuxSandboxAutoRepairEnabled()) {
   codexSandboxRepairTimer.unref();
 }
 if (autoUpdateEnabled()) {
-  void ensureManagedBackendsUpdatedForCurrentHash("startup");
+  void ensureManagedBackendsCurrent("startup");
+  const managedBackendUpdateTimer = setInterval(
+    () => void ensureManagedBackendsCurrent("periodic"),
+    Math.min(MANAGED_BACKENDS_UPDATE_INTERVAL_MS, 60 * 60 * 1000),
+  );
+  managedBackendUpdateTimer.unref();
   console.log(`[Auto-update] Watching git repo at ${GIT_ROOT} (every ${AUTO_UPDATE_INTERVAL / 1000}s, verify=${autoUpdateVerifyMode()})`);
   setInterval(checkForUpdates, AUTO_UPDATE_INTERVAL);
 } else {

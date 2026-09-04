@@ -1,4 +1,5 @@
 const assert = require("node:assert/strict");
+const path = require("node:path");
 const test = require("node:test");
 
 const {
@@ -24,6 +25,42 @@ process.stdin.on("data", (chunk) => {
   }
 });
 `;
+
+function waitForEvent(emitter, name) {
+  return Promise.race([
+    new Promise((resolve) => emitter.once(name, resolve)),
+    new Promise((_, reject) => setTimeout(
+      () => reject(new Error(`Timed out waiting for ${name}`)),
+      3000,
+    )),
+  ]);
+}
+
+test("completes the app-server initialize handshake before other requests", async () => {
+  const client = new CodexAppServerClient({
+    cwd: process.cwd(),
+    command: process.execPath,
+    args: [path.join(__dirname, "fixtures", "mock-codex-app-server.js")],
+  });
+
+  try {
+    const initialized = waitForEvent(client, "test/initialized_seen");
+    await client.initialize({ clientInfo: { name: "socketagent" } });
+    const event = await initialized;
+    assert.deepEqual(event.methods, ["initialize", "initialized"]);
+
+    const metadata = await client.updateThreadMetadata({
+      threadId: "thread-1",
+      gitInfo: { branch: "master", sha: "abc123" },
+    });
+    assert.deepEqual(metadata, {
+      threadId: "thread-1",
+      gitInfo: { branch: "master", sha: "abc123" },
+    });
+  } finally {
+    await client.stop();
+  }
+});
 
 test("thread resume excludes the native turn transcript by default", async () => {
   const client = new CodexAppServerClient({

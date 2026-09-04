@@ -1200,6 +1200,9 @@ export interface TextServerMessage {
   streamId?: string;
   parentToolUseId?: string | null;
   uuid?: string;
+  /** Client user message(s) that caused this assistant turn. */
+  triggerUserMessageUuid?: string;
+  triggerUserMessageUuids?: string[];
   replay?: boolean;
   snapshot?: boolean;
   finalSnapshot?: boolean;
@@ -1264,6 +1267,17 @@ export interface QuestionServerMessage {
   sessionId: string;
   emailPreview?: EmailPreview;
   mcpServerName?: string;
+  /** The answer is a new user turn, not a response to a blocking tool call. */
+  asyncQuestion?: boolean;
+}
+
+export interface BackendAuthRecoveryServerMessage {
+  type: "backend_auth_recovery";
+  backend: Backend;
+  active: boolean;
+  provider?: string;
+  message: string;
+  sessionId: string;
 }
 
 export interface QuestionAnsweredServerMessage {
@@ -1423,6 +1437,8 @@ export interface ThinkingServerMessage {
   streamId?: string;
   parentToolUseId?: string | null;
   uuid?: string;
+  triggerUserMessageUuid?: string;
+  triggerUserMessageUuids?: string[];
   replay?: boolean;
   snapshot?: boolean;
   finalSnapshot?: boolean;
@@ -1445,6 +1461,9 @@ export interface ThinkingTokensServerMessage {
   estimatedTokensDelta: number;
   sessionId: string;
   uuid?: string;
+  /** User turn correlation supplied by the native harness. */
+  triggerUserMessageUuid?: string;
+  triggerUserMessageUuids?: string[];
 }
 
 export interface UsageInfo {
@@ -1461,6 +1480,8 @@ export interface TotalUsageInfo {
   cacheReadTokens: number;
   cacheCreateTokens: number;
   costUsd: number;
+  /** Included in outputTokens; exposed separately for diagnostics. */
+  thinkingTokens?: number;
 }
 
 export interface ResultServerMessage {
@@ -1481,6 +1502,8 @@ export interface ResultServerMessage {
   fastModeState?: string;
   errors?: string[];
   permissionDenials?: { tool_name: string; tool_use_id: string; tool_input: Record<string, unknown> }[];
+  triggerUserMessageUuid?: string;
+  triggerUserMessageUuids?: string[];
 }
 
 export interface SessionListServerMessage {
@@ -1746,6 +1769,7 @@ export interface HistoryEntry {
   // Question fields (role === "question")
   questionId?: string;
   questions?: QuestionItem[];
+  asyncQuestion?: boolean;
   emailPreview?: EmailPreview;
   answered?: boolean;
   /** Safe, user-visible answers. Never used for secure-input values. */
@@ -1763,6 +1787,8 @@ export interface HistoryEntry {
   // Subagent hierarchy and message tracking
   parentToolUseId?: string | null;
   uuid?: string;
+  triggerUserMessageUuid?: string;
+  triggerUserMessageUuids?: string[];
   /** Codex Responses API message phase when supplied by app-server. */
   messagePhase?: "commentary" | "final_answer";
   // Tool summary fields
@@ -2306,6 +2332,8 @@ export interface TaskStartedServerMessage {
   workflowName?: string;
   prompt?: string;
   skipTranscript?: boolean;
+  isBackgrounded?: boolean;
+  spawnDepth?: number;
   sessionId: string;
 }
 
@@ -2687,6 +2715,7 @@ export type ServerMessage =
   | PromptReceivedServerMessage
   | PromptFailedServerMessage
   | BackendAuthRequiredServerMessage
+  | BackendAuthRecoveryServerMessage
   | PushTokenRegisteredServerMessage
   | PushTokenUnregisteredServerMessage
   | PushRegistrationStatusServerMessage

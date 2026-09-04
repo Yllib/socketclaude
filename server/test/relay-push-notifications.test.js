@@ -21,6 +21,7 @@ const pushEnvironmentKeys = [
   "GCLOUD_PROJECT",
   "RELAY_URL",
   "PAIRING_TOKEN",
+  "SOCKETAGENT_TEST_MODE",
 ];
 
 function withCleanPushEnvironment(run) {
@@ -46,6 +47,18 @@ test("headless forwarding never duplicates an FCM dispatch owned by NotifyUser",
   assert.equal(shouldSendForwardedPush({
     type: "scheduled_task_notification",
   }), true);
+});
+
+test("test mode cannot send a notification through inherited relay credentials", async () => {
+  await withCleanPushEnvironment(async () => {
+    process.env.SOCKETAGENT_TEST_MODE = "1";
+    process.env.RELAY_URL = "wss://relay.jarofdirt.info";
+    process.env.PAIRING_TOKEN = "inherited-production-token";
+    assert.deepEqual(
+      await sendPushNotification({ title: "Which target?" }),
+      { sent: 0, attempted: 0 },
+    );
+  });
 });
 
 test("reports missing, invalid, and valid direct Firebase setup separately", async () => {

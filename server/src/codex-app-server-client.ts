@@ -142,6 +142,15 @@ export interface CodexAppServerThreadLoadedListParams {
   limit?: number | null;
 }
 
+export interface CodexAppServerThreadMetadataUpdateParams {
+  threadId: string;
+  gitInfo?: {
+    sha?: string | null;
+    branch?: string | null;
+    originUrl?: string | null;
+  } | null;
+}
+
 export interface CodexAppServerNotification<T = unknown> {
   method: string;
   params: T;
@@ -244,7 +253,9 @@ export class CodexAppServerClient extends EventEmitter {
   }
 
   async initialize(params: CodexAppServerInitializeParams): Promise<unknown> {
-    return this.request("initialize", params, this.options.startupTimeoutMs);
+    const result = await this.request("initialize", params, this.options.startupTimeoutMs);
+    this.notify("initialized", {});
+    return result;
   }
 
   async startThread(params: CodexAppServerThreadStartParams): Promise<unknown> {
@@ -353,6 +364,10 @@ export class CodexAppServerClient extends EventEmitter {
     return this.request("thread/name/set", { threadId, name });
   }
 
+  async updateThreadMetadata(params: CodexAppServerThreadMetadataUpdateParams): Promise<unknown> {
+    return this.request("thread/metadata/update", params);
+  }
+
   async listCollaborationModes(): Promise<unknown> {
     return this.request("collaborationMode/list", {});
   }
@@ -378,6 +393,14 @@ export class CodexAppServerClient extends EventEmitter {
       }, timeoutMs);
       this.pending.set(id, { method, resolve: resolve as (value: unknown) => void, reject, timer });
     });
+  }
+
+  notify(method: string, params: object = {}): void {
+    this.start();
+    if (!this.proc || !this.proc.stdin.writable) {
+      throw new Error("codex app-server stdin is not writable");
+    }
+    this.proc.stdin.write(JSON.stringify({ method, params }) + "\n");
   }
 
   async stop(

@@ -3,9 +3,17 @@ const test = require("node:test");
 
 const {
   backendsForManagedBackendSpecs,
+  managedBackendCheckIsDue,
   managedBackendSpecsNeedingUpdate,
   parseNpmVersionOutput,
 } = require("../dist/managed-backend-update");
+
+test("checks managed backends on an elapsed cadence instead of once per git commit", () => {
+  const hour = 60 * 60 * 1000;
+  assert.equal(managedBackendCheckIsDue(0, 10 * hour, 6 * hour), true);
+  assert.equal(managedBackendCheckIsDue(8 * hour, 10 * hour, 6 * hour), false);
+  assert.equal(managedBackendCheckIsDue(4 * hour, 10 * hour, 6 * hour), true);
+});
 
 test("does not reinstall managed backends whose versions are already current", () => {
   assert.deepEqual(managedBackendSpecsNeedingUpdate(

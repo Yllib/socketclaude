@@ -19,6 +19,7 @@ import {
   CodexDriver,
   CodexGoal,
   CodexGoalStatus,
+  QuestionItem,
 } from "./protocol";
 import { SessionContext, SocketAgentPlugin } from "./plugin-api";
 import {
@@ -92,6 +93,27 @@ const CODEX_GOAL_STATUSES = new Set<CodexGoalStatus>([
   "budgetLimited",
   "complete",
 ]);
+
+export function codexThreadGitInfo(cwd: string): {
+  sha?: string;
+  branch?: string;
+} | null {
+  const read = (args: string[]): string => {
+    const result = spawnSync("git", ["-C", cwd, ...args], {
+      encoding: "utf8",
+      timeout: 2000,
+      windowsHide: true,
+    });
+    return result.status === 0 ? String(result.stdout || "").trim() : "";
+  };
+  const sha = read(["rev-parse", "HEAD"]);
+  const branch = read(["symbolic-ref", "--quiet", "--short", "HEAD"]);
+  if (!sha && !branch) return null;
+  return {
+    ...(sha ? { sha } : {}),
+    ...(branch ? { branch } : {}),
+  };
+}
 
 export function isTimedOutCodexThreadResume(
   error: unknown,
@@ -1930,6 +1952,14 @@ export class CodexSession {
             ...(tiers.length > 0 ? { tiers } : {}),
             ...(supportedReasoningEfforts.length > 0 ? { supportedReasoningEfforts } : {}),
             ...(model.defaultReasoningEffort ? { defaultReasoningEffort: String(model.defaultReasoningEffort) } : {}),
+            ...(Array.isArray(model.inputModalities)
+              ? { inputModalities: model.inputModalities.map(String) }
+              : {}),
+            ...(typeof model.supportsPersonality === "boolean"
+              ? { supportsPersonality: model.supportsPersonality }
+              : {}),
+            ...(model.upgrade ? { upgrade: model.upgrade } : {}),
+            ...(model.upgradeInfo ? { upgradeInfo: model.upgradeInfo } : {}),
           };
         })
         .filter(Boolean) as Array<Record<string, unknown>>;
@@ -2425,7 +2455,7 @@ export class CodexSession {
             this._resumeSessionId = undefined;
             this._sessionInfoSaved = false;
             const started = await this.appServer!.startThread(threadConfig);
-            this.adoptAppServerThread(this.extractThreadId(started));
+            this.adoptAppServerThread(this.extractThreadId(started), started);
             resumed = started;
           } else {
             if (!this.isArchivedAppServerError(err)) throw err;
@@ -2437,14 +2467,23 @@ export class CodexSession {
           }
         }
         if (this.threadId) {
-          this.adoptAppServerThread(this.extractThreadId(resumed) || this.threadId);
+          this.adoptAppServerThread(this.extractThreadId(resumed) || this.threadId, resumed);
         }
       } else {
         const started = await this.appServer!.startThread(threadConfig);
-        this.adoptAppServerThread(this.extractThreadId(started));
+        this.adoptAppServerThread(this.extractThreadId(started), started);
       }
 
       if (!this.threadId) throw new Error("codex app-server did not return a thread id");
+      const gitInfo = codexThreadGitInfo(this.cwd);
+      if (gitInfo) {
+        void this.appServer!.updateThreadMetadata({
+          threadId: this.threadId,
+          gitInfo,
+        }).catch((error: unknown) => {
+          console.warn(`[codex app-server] Could not update thread git metadata: ${String(error)}`);
+        });
+      }
       void this.refreshSupportedModels();
 
       // Install the turn settler only after thread startup/resume succeeds.
@@ -2936,6 +2975,9 @@ export class CodexSession {
     const mcpUrl = this.buildCodexMcpUrl(this.appServerMcpRegistration.token);
     const config: Record<string, unknown> = {
       model_reasoning_effort: this.codexReasoningEffort(),
+      tools: {
+        update_plan: { enabled: true },
+      },
       mcp_servers: {
         socketagent_app: {
           url: mcpUrl,
@@ -3009,8 +3051,22 @@ export class CodexSession {
     return v?.turn?.id || v?.turnId || null;
   }
 
-  private adoptAppServerThread(threadId: string | null): void {
+  private adoptAppServerThread(threadId: string | null, source?: unknown): void {
     if (!threadId) return;
+    const sourceRecord = source && typeof source === "object"
+      ? source as Record<string, unknown>
+      : undefined;
+    const threadRecord = sourceRecord?.thread && typeof sourceRecord.thread === "object"
+      ? sourceRecord.thread as Record<string, unknown>
+      : sourceRecord;
+    const nativeModel = typeof threadRecord?.model === "string"
+      ? threadRecord.model.trim()
+      : "";
+    const nativeReasoningEffort = typeof threadRecord?.reasoningEffort === "string"
+      ? threadRecord.reasoningEffort.trim()
+      : "";
+    if (nativeModel) this._model = nativeModel;
+    if (nativeReasoningEffort) this.setEffort(nativeReasoningEffort);
     const previousSessionId = this.sessionId
       || this.threadId
       || this.replacesSessionId
@@ -3020,6 +3076,12 @@ export class CodexSession {
     const isFirstTime = !this.sessionId;
     const replacesSessionId = this.replacesSessionId;
     this.sessionId = threadId;
+    if (nativeModel || nativeReasoningEffort) {
+      this.persistAgentSettings({
+        ...(nativeModel ? { model: nativeModel } : {}),
+        ...(nativeReasoningEffort ? { effort: this._effort } : {}),
+      });
+    }
     if (previousSessionId && previousSessionId !== threadId) {
       this.onSessionIdChanged?.(previousSessionId, threadId);
     }
@@ -3721,7 +3783,7 @@ export class CodexSession {
           const startedThreadId = String(p?.thread?.id || p?.threadId || "");
           if (!startedThreadId) return;
           if (!this.threadId || startedThreadId === this.threadId) {
-            this.adoptAppServerThread(startedThreadId);
+            this.adoptAppServerThread(startedThreadId, p?.thread);
           } else {
             const agent = this.registerCodexSubagent(startedThreadId, {
               agentPath: String(p?.agentPath || p?.thread?.agentPath || ""),
@@ -3730,6 +3792,34 @@ export class CodexSession {
           }
         }
         return;
+
+      case "modelProvider/authRecoveryStarted": {
+        const sid = this.sessionId;
+        if (!sid || (p?.threadId && p.threadId !== this.threadId)) return;
+        this.send({
+          type: "backend_auth_recovery",
+          backend: "codex",
+          active: true,
+          provider: String(p?.provider || ""),
+          message: String(p?.message || "Refreshing Codex authentication..."),
+          sessionId: sid,
+        });
+        return;
+      }
+
+      case "modelProvider/authRecoveryCompleted": {
+        const sid = this.sessionId;
+        if (!sid || (p?.threadId && p.threadId !== this.threadId)) return;
+        this.send({
+          type: "backend_auth_recovery",
+          backend: "codex",
+          active: false,
+          provider: String(p?.provider || ""),
+          message: String(p?.message || "Codex authentication refreshed"),
+          sessionId: sid,
+        });
+        return;
+      }
 
       case "turn/started":
         if (p?.threadId && p.threadId !== this.threadId) {
@@ -4503,6 +4593,39 @@ export class CodexSession {
             content: text,
             streamId: String(item.id),
             ...(messagePhase ? { messagePhase } : {}),
+            timestamp: now(),
+          });
+        }
+        const asyncQuestions: QuestionItem[] = Array.isArray(item.questions)
+          ? (item.questions as unknown[])
+              .flatMap((question: unknown): QuestionItem[] => {
+                if (!question || typeof question !== "object") return [];
+                const record = question as Record<string, unknown>;
+                const title = typeof record.title === "string" ? record.title.trim() : "";
+                if (!title) return [];
+                const options = Array.isArray(record.options)
+                  ? record.options
+                      .filter((option): option is string => typeof option === "string" && option.trim().length > 0)
+                      .map((option) => ({ label: option.trim() }))
+                  : [];
+                return [{ question: title, header: "Codex", options }];
+              })
+          : [];
+        if (asyncQuestions.length > 0) {
+          const questionId = `codex_async_${String(item.id)}`;
+          this.send({
+            type: "question",
+            questionId,
+            questions: asyncQuestions,
+            asyncQuestion: true,
+            sessionId: sid,
+          });
+          appendItem({
+            role: "question",
+            content: asyncQuestions.map((question) => question.question).join("\n"),
+            questionId,
+            questions: asyncQuestions,
+            asyncQuestion: true,
             timestamp: now(),
           });
         }
