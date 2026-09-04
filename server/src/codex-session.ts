@@ -2975,6 +2975,9 @@ export class CodexSession {
     const mcpUrl = this.buildCodexMcpUrl(this.appServerMcpRegistration.token);
     const config: Record<string, unknown> = {
       model_reasoning_effort: this.codexReasoningEffort(),
+      features: {
+        default_mode_request_user_input: true,
+      },
       tools: {
         update_plan: { enabled: true },
       },
@@ -2986,7 +2989,10 @@ export class CodexSession {
     };
     if (this._fastMode) {
       config.service_tier = "fast";
-      config.features = { fast_mode: true };
+      config.features = {
+        ...(config.features as Record<string, unknown>),
+        fast_mode: true,
+      };
     }
     return config;
   }

@@ -186,7 +186,7 @@ test("surfaces Codex async questions and authentication recovery", () => {
   }
 });
 
-test("restores Codex thread model settings and keeps plan updates enabled", () => {
+test("restores Codex thread settings and keeps interactive tools enabled", () => {
   const sent = [];
   const sessionId = `codex-thread-settings-${crypto.randomUUID()}`;
   const session = new CodexSession(testSocket(sent), process.cwd(), []);
@@ -202,6 +202,14 @@ test("restores Codex thread model settings and keeps plan updates enabled", () =
     assert.equal(session.getAgentSettings().effort, "xhigh");
     assert.deepEqual(session.appServerConfig().tools, {
       update_plan: { enabled: true },
+    });
+    assert.deepEqual(session.appServerConfig().features, {
+      default_mode_request_user_input: true,
+    });
+    session._fastMode = true;
+    assert.deepEqual(session.appServerConfig().features, {
+      default_mode_request_user_input: true,
+      fast_mode: true,
     });
   } finally {
     deleteSessionArtifacts(sessionId);
