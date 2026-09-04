@@ -484,7 +484,7 @@ export class TranscriptDatabase {
     `).all(sessionId, sessionSeq, limit) as unknown as StoredTranscriptRow[]).map(parseEntry);
   }
 
-  getRevisedBetween(
+  getRevisedInteractionsBetween(
     sessionId: string,
     startSessionSeq: number,
     endSessionSeq: number,
@@ -496,6 +496,13 @@ export class TranscriptDatabase {
         AND session_seq >= ?
         AND session_seq <= ?
         AND revision > 1
+        AND role IN (
+          'question',
+          'elicitation_url',
+          'secure_input',
+          'browser_session',
+          'work_review'
+        )
       ORDER BY session_seq
       LIMIT ?
     `).all(

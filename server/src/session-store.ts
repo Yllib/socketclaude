@@ -2345,12 +2345,12 @@ export function getResumeHistoryPage(
       const deltaCount = total - knownIndex! - 1;
       if (deltaCount <= maxDeltaEntries) {
         // A durable interaction update keeps its original sequence and raises
-        // its revision. Re-send revised rows from the phone's cached window so
-        // an answered question cannot return to its older pending state after
-        // a reconnect. Clients already merge these rows by entryId/revision.
+        // its revision. Re-send mutable cards from the phone's cached window
+        // so an answered question cannot return to its older pending state.
+        // Ordinary stream revisions stay on the normal sequence delta path.
         const cachedStart = database.getPage(sessionId, knownHistoryOffset!, 1)[0];
         const revisedEntries = cachedStart
-          ? database.getRevisedBetween(
+          ? database.getRevisedInteractionsBetween(
               sessionId,
               cachedStart.sessionSeq!,
               knownSessionSeq!,

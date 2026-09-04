@@ -318,21 +318,32 @@ test("resume history replays revised entries from the cached window", () => {
       answered: false,
       timestamp: new Date().toISOString(),
     });
+    const text = appendHistory(sessionId, {
+      role: "assistant",
+      content: "partial",
+      streamId: "assistant-stream-1",
+      timestamp: new Date(Date.now() + 1).toISOString(),
+    });
+    appendHistory(sessionId, {
+      ...text,
+      content: "complete",
+      revision: 2,
+    });
     const tail = appendHistory(sessionId, {
       role: "assistant",
       content: "waiting",
-      timestamp: new Date(Date.now() + 1).toISOString(),
+      timestamp: new Date(Date.now() + 2).toISOString(),
     });
 
     markQuestionAnswered(sessionId, "question-1", { "Which area?": "Streaming" });
     const resumed = getResumeHistoryPage(sessionId, {
       knownSessionSeq: tail.sessionSeq,
       knownHistoryOffset: 0,
-      knownHistoryEntryCount: 2,
+      knownHistoryEntryCount: 3,
     });
 
     assert.equal(resumed.historyKind, "delta");
-    assert.equal(resumed.offset, 2);
+    assert.equal(resumed.offset, 3);
     assert.equal(resumed.entries.length, 1);
     assert.equal(resumed.entries[0].entryId, question.entryId);
     assert.equal(resumed.entries[0].revision, 2);
