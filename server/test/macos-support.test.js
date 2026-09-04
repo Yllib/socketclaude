@@ -22,3 +22,20 @@ test("server shell entrypoints pass bash syntax validation", () => {
   });
   assert.equal(result.status, 0, result.stderr || result.stdout);
 });
+
+test("restart resolves credentials from the active service environment file", () => {
+  const fs = require("node:fs");
+  const restart = fs.readFileSync(
+    require("node:path").join(repoRoot, "server/scripts/restart-server.sh"),
+    "utf8",
+  );
+  const serviceControl = fs.readFileSync(
+    require("node:path").join(repoRoot, "server/scripts/service-control.sh"),
+    "utf8",
+  );
+
+  assert.match(restart, /SERVICE_CONTROL" environment-file/);
+  assert.match(restart, /Restart aborted: AUTH_TOKEN was not found/);
+  assert.match(serviceControl, /environment-file\)/);
+  assert.match(serviceControl, /--property=EnvironmentFiles/);
+});

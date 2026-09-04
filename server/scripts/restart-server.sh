@@ -69,6 +69,7 @@ SERVER_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 SERVICE_CONTROL="$SERVER_DIR/scripts/service-control.sh"
 SERVICE_NAME="$("$SERVICE_CONTROL" name)"
 SERVICE_DIR="$("$SERVICE_CONTROL" directory 2>/dev/null || true)"
+SERVICE_ENV_PATH="$("$SERVICE_CONTROL" environment-file 2>/dev/null || true)"
 NODE_MIN_VERSION="${SOCKETAGENT_NODE_MIN_VERSION:-22}"
 NODE_RUNTIME_VERSION="${SOCKETAGENT_NODE_VERSION:-22.22.1}"
 USER_NODE_DIR="${SOCKETAGENT_NODE_DIR:-$HOME/.local/share/socketagent/node}"
@@ -98,7 +99,9 @@ RECOVERY_ID=""
 # be invoked from a development checkout while the installed service runs from
 # another checkout, so the file beside this script is only a fallback.
 ENV_PATH="$SERVER_DIR/.env"
-if [[ -n "$SERVICE_DIR" && -f "$SERVICE_DIR/.env" ]]; then
+if [[ -n "$SERVICE_ENV_PATH" && -f "$SERVICE_ENV_PATH" ]]; then
+  ENV_PATH="$SERVICE_ENV_PATH"
+elif [[ -n "$SERVICE_DIR" && -f "$SERVICE_DIR/.env" ]]; then
   ENV_PATH="$SERVICE_DIR/.env"
 fi
 if [[ -f "$ENV_PATH" ]]; then
@@ -109,6 +112,10 @@ fi
 export SOCKETAGENT_ENV_PATH="$ENV_PATH"
 PORT="${PORT:-8085}"
 AUTH_TOKEN="${AUTH_TOKEN:-}"
+if [[ -z "$AUTH_TOKEN" ]]; then
+  echo "Restart aborted: AUTH_TOKEN was not found in the active service environment file: $ENV_PATH" >&2
+  exit 1
+fi
 
 # Ensure history directory exists
 mkdir -p "$HISTORY_DIR"

@@ -134,6 +134,21 @@ service_directory() {
   esac
 }
 
+service_environment_file() {
+  case "$OS_NAME" in
+    Darwin)
+      printf '%s/.env\n' "$(service_directory)"
+      ;;
+    Linux)
+      systemctl --user show "$(linux_service_name)" \
+        --property=EnvironmentFiles --value \
+        | sed -E 's/[[:space:]]+\(ignore_errors=(yes|no)\)$//' \
+        | head -n 1
+      ;;
+    *) echo "Unsupported service platform: $OS_NAME" >&2; exit 1 ;;
+  esac
+}
+
 logs_service() {
   case "$OS_NAME" in
     Darwin)
@@ -173,12 +188,15 @@ case "${1:-}" in
   directory)
     service_directory
     ;;
+  environment-file)
+    service_environment_file
+    ;;
   logs)
     shift
     logs_service "$@"
     ;;
   *)
-    echo "Usage: $0 name|target|directory|is-active|start|stop|restart|status|logs" >&2
+    echo "Usage: $0 name|target|directory|environment-file|is-active|start|stop|restart|status|logs" >&2
     exit 2
     ;;
 esac
