@@ -2975,6 +2975,7 @@ export class CodexSession {
     const mcpUrl = this.buildCodexMcpUrl(this.appServerMcpRegistration.token);
     const config: Record<string, unknown> = {
       model_reasoning_effort: this.codexReasoningEffort(),
+      suppress_unstable_features_warning: true,
       features: {
         default_mode_request_user_input: true,
       },

@@ -16,6 +16,7 @@ const {
   getHistoryPageToLastPrompt,
   getResumeHistoryPage,
   hasPersistedUserMessage,
+  markQuestionAnswered,
   positionSessionMessage,
 } = require("../dist/session-store");
 
@@ -297,6 +298,46 @@ test("resume history returns the complete recent prompt window in one page", () 
       completeCache.entries.map((entry) => entry.content),
       Array.from({ length: 10 }, (_, index) => `message-${index + 110}`),
     );
+  } finally {
+    deleteSessionArtifacts(sessionId);
+  }
+});
+
+test("resume history replays revised entries from the cached window", () => {
+  const sessionId = `test-transcript-resume-revision-${randomUUID()}`;
+  try {
+    const question = appendHistory(sessionId, {
+      role: "question",
+      content: "",
+      questionId: "question-1",
+      questions: [{
+        question: "Which area?",
+        header: "Area",
+        options: [{ label: "Streaming", description: "Test streaming." }],
+      }],
+      answered: false,
+      timestamp: new Date().toISOString(),
+    });
+    const tail = appendHistory(sessionId, {
+      role: "assistant",
+      content: "waiting",
+      timestamp: new Date(Date.now() + 1).toISOString(),
+    });
+
+    markQuestionAnswered(sessionId, "question-1", { "Which area?": "Streaming" });
+    const resumed = getResumeHistoryPage(sessionId, {
+      knownSessionSeq: tail.sessionSeq,
+      knownHistoryOffset: 0,
+      knownHistoryEntryCount: 2,
+    });
+
+    assert.equal(resumed.historyKind, "delta");
+    assert.equal(resumed.offset, 2);
+    assert.equal(resumed.entries.length, 1);
+    assert.equal(resumed.entries[0].entryId, question.entryId);
+    assert.equal(resumed.entries[0].revision, 2);
+    assert.equal(resumed.entries[0].answered, true);
+    assert.deepEqual(resumed.entries[0].answers, { "Which area?": "Streaming" });
   } finally {
     deleteSessionArtifacts(sessionId);
   }

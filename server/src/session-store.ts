@@ -2344,23 +2344,44 @@ export function getResumeHistoryPage(
     if (cacheIsContiguous) {
       const deltaCount = total - knownIndex! - 1;
       if (deltaCount <= maxDeltaEntries) {
-        const deltaEntries = database.getAfter(sessionId, knownSessionSeq!, maxDeltaEntries);
-        const hydratedDelta = hydrateHistoryEntries(deltaEntries);
-        if (Buffer.byteLength(JSON.stringify(hydratedDelta), "utf8") <= maxDeltaBytes) {
-          warnIfSlow("history_resume_delta", startedAt, {
-            sessionId,
-            total,
-            entries: hydratedDelta.length,
-            offset: knownIndex + 1,
-          });
-          return {
-            entries: hydratedDelta,
-            total,
-            offset: knownIndex + 1,
-            deferredContextAvailable: false,
-            totalUserPrompts,
-            historyKind: "delta",
-          };
+        // A durable interaction update keeps its original sequence and raises
+        // its revision. Re-send revised rows from the phone's cached window so
+        // an answered question cannot return to its older pending state after
+        // a reconnect. Clients already merge these rows by entryId/revision.
+        const cachedStart = database.getPage(sessionId, knownHistoryOffset!, 1)[0];
+        const revisedEntries = cachedStart
+          ? database.getRevisedBetween(
+              sessionId,
+              cachedStart.sessionSeq!,
+              knownSessionSeq!,
+              maxDeltaEntries + 1,
+            )
+          : [];
+        const deltaEntries = database.getAfter(
+          sessionId,
+          knownSessionSeq!,
+          maxDeltaEntries + 1,
+        );
+        const resumeEntries = [...revisedEntries, ...deltaEntries];
+        if (resumeEntries.length <= maxDeltaEntries) {
+          const hydratedDelta = hydrateHistoryEntries(resumeEntries);
+          if (Buffer.byteLength(JSON.stringify(hydratedDelta), "utf8") <= maxDeltaBytes) {
+            warnIfSlow("history_resume_delta", startedAt, {
+              sessionId,
+              total,
+              entries: hydratedDelta.length,
+              revisedEntries: revisedEntries.length,
+              offset: knownIndex + 1,
+            });
+            return {
+              entries: hydratedDelta,
+              total,
+              offset: knownIndex + 1,
+              deferredContextAvailable: false,
+              totalUserPrompts,
+              historyKind: "delta",
+            };
+          }
         }
       }
     }

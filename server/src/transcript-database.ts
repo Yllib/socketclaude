@@ -484,6 +484,28 @@ export class TranscriptDatabase {
     `).all(sessionId, sessionSeq, limit) as unknown as StoredTranscriptRow[]).map(parseEntry);
   }
 
+  getRevisedBetween(
+    sessionId: string,
+    startSessionSeq: number,
+    endSessionSeq: number,
+    limit: number,
+  ): HistoryEntry[] {
+    return (this.db.prepare(`
+      SELECT * FROM transcript_entries
+      WHERE session_id = ?
+        AND session_seq >= ?
+        AND session_seq <= ?
+        AND revision > 1
+      ORDER BY session_seq
+      LIMIT ?
+    `).all(
+      sessionId,
+      startSessionSeq,
+      endSessionSeq,
+      limit,
+    ) as unknown as StoredTranscriptRow[]).map(parseEntry);
+  }
+
   getByRole(sessionId: string, role: string): HistoryEntry[] {
     return (this.db.prepare(`
       SELECT * FROM transcript_entries

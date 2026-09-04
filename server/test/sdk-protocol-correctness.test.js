@@ -203,6 +203,7 @@ test("restores Codex thread settings and keeps interactive tools enabled", () =>
     assert.deepEqual(session.appServerConfig().tools, {
       update_plan: { enabled: true },
     });
+    assert.equal(session.appServerConfig().suppress_unstable_features_warning, true);
     assert.deepEqual(session.appServerConfig().features, {
       default_mode_request_user_input: true,
     });
