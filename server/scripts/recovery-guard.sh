@@ -29,7 +29,10 @@ detect_service_name() {
 }
 
 read_port() {
-  local env_file="$SERVER_DIR/.env"
+  if [[ "${PORT:-}" =~ ^[0-9]+$ ]]; then echo "$PORT"; return; fi
+  local env_file
+  env_file="$("$SERVICE_CONTROL" environment-file 2>/dev/null || true)"
+  env_file="${env_file:-$SERVER_DIR/.env}"
   local port
   port="$(grep -E '^PORT=' "$env_file" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"' || true)"
   echo "${port:-8085}"

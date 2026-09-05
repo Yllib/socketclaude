@@ -63,6 +63,7 @@ import { getClaudeAvailability } from "./claude-session";
 import { maybeSendAgentAttentionPush } from "./push-notifications";
 import { LatestSnapshotDispatcher } from "./latest-snapshot-dispatcher";
 import { createInteractiveRequestId } from "./interactive-request-id";
+import { waitForInteractiveAnswer } from "./interactive-answer";
 import { buildCodexRateLimitEvents } from "./rate-limit-events";
 import { recordRateLimitEvent } from "./rate-limit-cache";
 import {
@@ -333,6 +334,7 @@ export function codexAgentMessagePhase(value: unknown): "commentary" | "final_an
 }
 
 interface PendingQuestion {
+  cancel?: () => void;
   questionId: string;
   resolve: (answers: Record<string, string>) => void;
   questionData?: ServerMessage;
@@ -576,6 +578,7 @@ export class CodexSession {
   private codexSubagents = new Map<string, CodexSubagentState>();
   private lastSubagentSnapshotFingerprint: string | null = null;
   private _isCompacting = false;
+  private _manualCompactionPending = false;
   private _compactStartedAt: string | null = null;
   private _compactBoundaryEmitted = false;
   private _compactBoundaryTrigger: "auto" | "manual" = "auto";
@@ -632,6 +635,7 @@ export class CodexSession {
   private surfacedMcpAuth = new Set<string>();
 
   public onActivity?: () => void;
+  public onBeforeRun?: (resumeSessionId?: string) => void;
   public onClose?: () => void;
   public onSessionIdChanged?: (previousSessionId: string, nextSessionId: string) => void;
   public onMonitorOutput?: (text: string) => void;
@@ -697,6 +701,7 @@ export class CodexSession {
     return this._isRunning
       || this.pendingAppServerTurnCompletion !== null
       || this._isCompacting
+      || this._manualCompactionPending
       || this.appServerTurnSettler !== null
       || this._pendingUserPrompt !== null
       || this._queuedPrompts.length > 0
@@ -743,7 +748,7 @@ export class CodexSession {
     this.appServerActiveToolCalls.clear();
   }
 
-  private scheduleAppServerTurnCompletion(): void {
+  private scheduleAppServerTurnCompletion(status = "completed"): void {
     this.cancelPendingAppServerTurnCompletion();
     this.pendingAppServerTurnCompletion = setTimeout(() => {
       this.pendingAppServerTurnCompletion = null;
@@ -762,6 +767,8 @@ export class CodexSession {
           content: this._lastAssistantText,
           sessionId: sid,
           usage,
+          resultSubtype: status === "interrupted" ? "interrupted" : "success",
+          stopReason: status === "interrupted" ? "interrupted" : undefined,
         } as ServerMessage);
         updateSessionActivity(sid, this._lastAssistantText, usage);
       }
@@ -830,6 +837,10 @@ export class CodexSession {
    */
   async setPermissionMode(mode: string, options: { recordHistory?: boolean } = {}): Promise<void> {
     const previousMode = this._permissionMode;
+    if (mode !== previousMode && (this._isRunning || this._isCompacting)) {
+      this.send({ type: "permission_mode_changed", permissionMode: previousMode, sessionId: this.sessionId || "" } as any);
+      throw new Error("Stop the current Codex run before changing its permissions. The current permission mode has not changed.");
+    }
     this._permissionMode = mode;
     this._approvalsReviewer = "user";
     switch (mode) {
@@ -1327,6 +1338,7 @@ export class CodexSession {
     const pending = this.pendingQuestions.get(questionId);
     if (!pending) return;
     this.pendingQuestions.delete(questionId);
+    if (pending.cancel) { pending.cancel(); return; }
     pending.resolve({});
     const sid = this.sessionId || this._resumeSessionId || "";
     if (sid) markQuestionAnswered(sid, questionId, {});
@@ -1366,13 +1378,28 @@ export class CodexSession {
 
   async compactAppServerThread(threadId = this.threadId || this.sessionId || this._resumeSessionId): Promise<void> {
     if (!threadId) throw new Error("No Codex thread id to compact");
+    if (this.isBusy) throw new Error("Wait for the current Codex operation to finish before compacting");
     await this.ensureAppServer();
+    this._manualCompactionPending = true;
     this._isCompacting = true;
     this._compactStartedAt = new Date().toISOString();
     this._compactBoundaryEmitted = false;
     this._compactBoundaryTrigger = "manual";
     this.send({ type: "compacting", active: true, sessionId: threadId } as any);
-    await this.appServer!.compactThread(threadId);
+    try {
+      await this.appServer!.resumeThread({ ...this.buildAppServerThreadParams(), threadId });
+      await this.appServer!.compactThreadAndWait(threadId);
+    } catch (error) {
+      await this.stopAppServerClient(true);
+      throw error;
+    } finally {
+      this._manualCompactionPending = false;
+      this._isCompacting = false;
+      this._compactStartedAt = null;
+      this.send({ type: "compacting", active: false, sessionId: threadId } as any);
+      await this.releaseAppServerThreadWriter();
+      this.scheduleAppServerIdleStop();
+    }
   }
 
   async rollbackAppServerThread(numTurns: number, threadId = this.threadId || this.sessionId || this._resumeSessionId): Promise<void> {
@@ -2224,6 +2251,7 @@ export class CodexSession {
   }
 
   async runQuery(prompt: string, resumeSessionId?: string): Promise<void> {
+    this.onBeforeRun?.(resumeSessionId);
     if (playReviewModeEnabled()) {
       return this.runPlayReviewQuery(prompt, resumeSessionId);
     }
@@ -2492,6 +2520,7 @@ export class CodexSession {
       const completion = new Promise<void>((resolve, reject) => {
         this.appServerTurnSettler = { resolve, reject };
       });
+      void completion.catch(() => {});
 
       const collaborationMode = this.codexCollaborationMode();
       const turn = await this.appServer!.startTurn({
@@ -2714,6 +2743,7 @@ export class CodexSession {
 
   private surfaceTerminalAppServerFailure(message: string, recycling = false): void {
     if (this.appServerTerminalFailureHandled) return;
+    this.cancelPendingAppServerQuestions();
     this.appServerTerminalFailureHandled = true;
     const sid = this.sessionId;
     if (sid) {
@@ -2924,6 +2954,7 @@ export class CodexSession {
   }
 
   async dispose(): Promise<void> {
+    this.cancelPendingAppServerQuestions();
     this.streamSnapshots.dispose(true);
     this.cancelPendingAppServerTurnCompletion();
     await this.stopAppServerClient(true);
@@ -3229,6 +3260,7 @@ export class CodexSession {
   async abort(): Promise<void> {
     this.streamSnapshots.flushAll();
     this._abortRequested = true;
+    this.cancelPendingAppServerQuestions();
     this.cancelPendingAppServerTurnCompletion();
     this.clearQueuedPrompts("Codex turn interrupted");
     this.clearPendingAppServerSteers("Codex turn interrupted");
@@ -3404,8 +3436,8 @@ export class CodexSession {
         case "item/commandExecution/requestApproval": {
           const command = String(params.command || "");
           const allowed = await this.canApproveAppServerTool("Bash", {
-            command,
-          });
+            ...params, command,
+          }, request.id);
           respond({ result: { decision: allowed ? "accept" : "decline" } });
           return;
         }
@@ -3415,14 +3447,14 @@ export class CodexSession {
             ? params.command.join(" ")
             : String(params.command || "");
           const allowed = await this.canApproveAppServerTool("Bash", {
-            command,
-          });
+            ...params, command,
+          }, request.id);
           respond({ result: { decision: allowed ? "approved" : "denied" } });
           return;
         }
 
         case "item/fileChange/requestApproval": {
-          const allowed = await this.canApproveAppServerFileChange(params.itemId);
+          const allowed = await this.canApproveAppServerFileChange(params.itemId, params, request.id);
           respond({ result: { decision: allowed ? "accept" : "decline" } });
           return;
         }
@@ -3433,13 +3465,13 @@ export class CodexSession {
         }
 
         case "applyPatchApproval": {
-          const allowed = await this.canApproveLegacyApplyPatch(params.fileChanges);
+          const allowed = await this.canApproveLegacyApplyPatch(params.fileChanges, request.id);
           respond({ result: { decision: allowed ? "approved" : "denied" } });
           return;
         }
 
         case "item/permissions/requestApproval": {
-          const permissionsAllowed = await this.canApprovePermissionRequest(params.permissions);
+          const permissionsAllowed = await this.canApprovePermissionRequest(params.permissions, request.id, params);
           respond({
             result: {
               permissions: permissionsAllowed
@@ -3461,7 +3493,7 @@ export class CodexSession {
           console.warn(`[codex app-server] unsupported server request: ${method}`);
           respond({
             error: {
-              code: "unsupported_server_request",
+              code: -32601,
               message: `SocketAgent does not handle Codex app-server request '${method}' yet`,
             },
           });
@@ -3470,7 +3502,7 @@ export class CodexSession {
       console.error(`[codex app-server] approval request failed: ${err?.message || String(err)}`);
       respond({
         error: {
-          code: "socketagent_approval_error",
+          code: -32603,
           message: err?.message || String(err),
         },
       });
@@ -3724,61 +3756,88 @@ export class CodexSession {
     respond({ result: { answers: responseAnswers } });
   }
 
-  private async canApproveAppServerTool(
-    toolName: string,
-    input: Record<string, any>,
-  ): Promise<boolean> {
-    const sessionCtx = this.getSessionContext();
+  private async checkAppServerToolPolicy(toolName: string, input: Record<string, any>): Promise<boolean> {
     for (const plugin of this._plugins) {
-      if (!plugin.canUseToolInterceptor) continue;
-      const result = await plugin.canUseToolInterceptor(toolName, input, sessionCtx);
-      if (!result) continue;
-      return result.behavior !== "deny";
+      const result = await plugin.canUseToolInterceptor?.(toolName, input, this.getSessionContext());
+      if (result?.behavior === "deny") return false;
     }
     return true;
   }
 
-  private async canApproveAppServerFileChange(itemId: unknown): Promise<boolean> {
-    if (!itemId) return true;
-    const paths = this.appServerFileChangePaths.get(String(itemId)) || [];
-    if (paths.length === 0) return true;
+  private async requestAppServerApproval(description: string, requestId?: string | number): Promise<boolean> {
+    if (this._abortRequested) return false;
+    if (this._permissionMode === "bypassPermissions" || this._permissionMode === "superYolo") return true;
+    const questionId = createInteractiveRequestId("codex_approval");
+    const sessionId = this.sessionId || this._resumeSessionId || "";
+    const question = description;
+    const message: any = { type: "question", questionId, sessionId,
+      questions: [{ question, header: "Tool approval", options: [{ label: "Approve" }, { label: "Decline" }], multiSelect: false }] };
+    if (requestId !== undefined) this.appServerQuestionByRequestId.set(String(requestId), questionId);
+    if (sessionId) appendHistory(sessionId, { role: "question", content: "", questionId, questions: message.questions, timestamp: now() });
+    const waiting = waitForInteractiveAnswer(this.pendingQuestions, questionId, message, undefined, () => {
+      this.clearAppServerQuestionMapping(questionId);
+      if (sessionId) markQuestionAnswered(sessionId, questionId, {});
+      this.send({ type: "question_answered", questionId, sessionId, answers: {} } as any);
+    });
+    this.send(message);
+    const answers = await waiting;
+    this.clearAppServerQuestionMapping(questionId);
+    return answers?.[question] === "Approve";
+  }
+
+  private async canApproveAppServerTool(toolName: string, input: Record<string, any>, requestId?: string | number): Promise<boolean> {
+    if (!await this.checkAppServerToolPolicy(toolName, input)) return false;
+    const label = input.networkApprovalContext ? "Allow network access?" : "Allow " + toolName + "?";
+    return this.requestAppServerApproval(label + "\n" + JSON.stringify(redactSecretsDeep(input), null, 2), requestId);
+  }
+
+  private async canApproveAppServerFileChange(itemId: unknown, params: any = {}, requestId?: string | number): Promise<boolean> {
+    const paths = this.appServerFileChangePaths.get(String(itemId || "")) || [];
+    if (!paths.length) return false;
     for (const filePath of paths) {
-      const allowed = await this.canApproveAppServerTool("Edit", {
-        file_path: filePath,
-      });
-      if (!allowed) return false;
+      if (!await this.checkAppServerToolPolicy("Edit", { file_path: filePath })) return false;
     }
-    return true;
+    return this.requestAppServerApproval("Allow file changes?\n" + paths.join("\n") + "\n" + (params.reason || ""), requestId);
   }
 
-  private async canApprovePermissionRequest(permissions: any): Promise<boolean> {
-    const fileSystem = permissions?.fileSystem || null;
-    const writePaths = [
-      ...(Array.isArray(fileSystem?.write) ? fileSystem.write : []),
-      ...(Array.isArray(fileSystem?.entries)
-        ? fileSystem.entries
-            .filter((entry: any) => entry?.access === "write" || entry?.writable === true)
-            .map((entry: any) => entry?.path || entry?.root || entry?.glob)
-        : []),
-    ].filter(Boolean);
-    for (const filePath of writePaths) {
-      const allowed = await this.canApproveAppServerTool("Edit", {
-        file_path: String(filePath),
-      });
-      if (!allowed) return false;
+  private async canApprovePermissionRequest(permissions: any, requestId?: string | number, params: any = {}): Promise<boolean> {
+    const fileSystem = permissions?.fileSystem || {};
+    const writePaths: unknown[] = [
+      ...(Array.isArray(fileSystem.write) ? fileSystem.write : []),
+      ...(Array.isArray(fileSystem.entries) ? fileSystem.entries.filter((entry: any) => entry?.access === "write").map((entry: any) => entry.path) : []),
+    ];
+    for (const entry of writePaths) {
+      const raw = typeof entry === "string" ? entry : (entry as any)?.type === "path" ? (entry as any).path : null;
+      // Broad special/glob grants cannot be checked as individual protected
+      // files. Require concrete paths rather than silently accepting them.
+      if (typeof raw !== "string" || !raw.trim()) return false;
+      const filePath = path.resolve(params.cwd || this.cwd, raw);
+      if (!await this.checkAppServerToolPolicy("Edit", { file_path: filePath })) return false;
     }
-    return true;
+    return this.requestAppServerApproval("Allow additional permissions?\n" + (params.reason || "") + "\n" + JSON.stringify(permissions, null, 2), requestId);
   }
 
-  private async canApproveLegacyApplyPatch(fileChanges: unknown): Promise<boolean> {
-    if (!fileChanges || typeof fileChanges !== "object") return true;
-    for (const filePath of Object.keys(fileChanges as Record<string, unknown>)) {
-      const allowed = await this.canApproveAppServerTool("Edit", {
-        file_path: filePath,
-      });
-      if (!allowed) return false;
+  private async canApproveLegacyApplyPatch(fileChanges: unknown, requestId?: string | number): Promise<boolean> {
+    if (!fileChanges || typeof fileChanges !== "object") return false;
+    const paths = Object.keys(fileChanges);
+    for (const filePath of paths) {
+      if (!await this.checkAppServerToolPolicy("Edit", { file_path: filePath })) return false;
     }
-    return true;
+    return this.requestAppServerApproval("Allow file changes?\n" + paths.join("\n"), requestId);
+  }
+
+  private cancelPendingAppServerQuestions(): void {
+    for (const [questionId, pending] of [...this.pendingQuestions]) {
+      if (pending.cancel) pending.cancel();
+      else {
+        this.pendingQuestions.delete(questionId);
+        pending.resolve({});
+        const sessionId = this.sessionId || this._resumeSessionId || "";
+        if (sessionId) markQuestionAnswered(sessionId, questionId, {});
+        this.send({ type: "question_answered", questionId, sessionId, answers: {} } as any);
+      }
+      this.clearAppServerQuestionMapping(questionId);
+    }
   }
 
   private handleAppServerNotification(method: string, params: unknown): void {
@@ -3832,6 +3891,11 @@ export class CodexSession {
         if (p?.threadId && p.threadId !== this.threadId) {
           const agent = this.registerCodexSubagent(String(p.threadId));
           if (agent) this.updateCodexSubagentStatus(agent.agentId, "active");
+          return;
+        }
+        if (this._manualCompactionPending) {
+          this.activeAppServerTurnId = p?.turn?.id || null;
+          this.onActivity?.();
           return;
         }
         // A new root turn inside the completion grace window is Codex goal
@@ -4484,12 +4548,25 @@ export class CodexSession {
 
       case "turn/completed": {
         if (p?.threadId && p.threadId !== this.threadId) {
-          this.updateCodexSubagentStatus(String(p.threadId), "completed");
+          this.updateCodexSubagentStatus(String(p.threadId), p?.turn?.status || "completed", p?.turn?.error?.message);
           return;
         }
+        if (this.activeAppServerTurnId && p?.turn?.id && p.turn.id !== this.activeAppServerTurnId) return;
+        if (this._manualCompactionPending) { this.activeAppServerTurnId = null; return; }
         this.requeuePendingAppServerSteers("turn completed before steered userMessage was emitted");
         this.activeAppServerTurnId = null;
-        this.scheduleAppServerTurnCompletion();
+        // serverRequest/resolved owns per-request cleanup. A root turn ending
+        // must not cancel an approval still owned by a background subagent.
+        if (p?.turn?.status === "failed") {
+          this.cancelPendingAppServerTurnCompletion();
+          this.settleActiveAppServerToolCalls(p.turn.error?.message || "Codex turn failed");
+          this._isRunning = false;
+          this._runStartedAt = null;
+          this.surfaceTerminalAppServerFailure(p.turn.error?.message || "Codex turn failed");
+          this.onActivity?.();
+        } else if (!this.appServerTerminalFailureHandled) {
+          this.scheduleAppServerTurnCompletion(p?.turn?.status);
+        }
         return;
       }
 
@@ -5731,7 +5808,8 @@ export async function unarchiveCodexAppServerThread(threadId: string, cwd: strin
 
 export async function compactCodexAppServerThread(threadId: string, cwd: string): Promise<void> {
   await withStandaloneAppServerClient(cwd, async (client) => {
-    await client.compactThread(threadId);
+    await client.resumeThread({ threadId, cwd });
+    await client.compactThreadAndWait(threadId);
   });
 }
 

@@ -157,13 +157,13 @@ export interface CodexAppServerNotification<T = unknown> {
 }
 
 interface WireResponse {
-  id: number;
+  id: string | number;
   result?: unknown;
   error?: unknown;
 }
 
 interface WireServerRequest {
-  id: number;
+  id: string | number;
   method: string;
   params?: unknown;
 }
@@ -193,7 +193,7 @@ export class CodexAppServerRequestTimeoutError extends Error {
 export class CodexAppServerClient extends EventEmitter {
   private proc: ChildProcessWithoutNullStreams | null = null;
   private nextId = 1;
-  private pending = new Map<number, PendingRequest<unknown>>();
+  private pending = new Map<string | number, PendingRequest<unknown>>();
   private stdoutTail = "";
   private stderrTail = "";
   private closed = false;
@@ -299,6 +299,49 @@ export class CodexAppServerClient extends EventEmitter {
 
   async compactThread(threadId: string): Promise<unknown> {
     return this.request("thread/compact/start", { threadId });
+  }
+
+  async compactThreadAndWait(threadId: string, timeoutMs = 180_000): Promise<void> {
+    let cleanup = () => {};
+    const completed = new Promise<void>((resolve, reject) => {
+      let turnId: string | undefined;
+      let itemCompleted = false;
+      const finish = (error?: Error) => { cleanup(); error ? reject(error) : resolve(); };
+      const onNotification = ({ method, params }: CodexAppServerNotification<any>) => {
+        if (params?.threadId !== threadId) return;
+        if (method === "turn/started") {
+          turnId = params.turn?.id;
+        } else if (method === "item/completed" && params.item?.type === "contextCompaction") {
+          itemCompleted = true;
+          if (!turnId) finish();
+        } else if (method === "thread/compacted") {
+          finish();
+        } else if (method === "turn/completed" && (!turnId || params.turn?.id === turnId)) {
+          if (["failed", "interrupted"].includes(params.turn?.status)) finish(new Error(params.turn?.error?.message || "Codex compaction interrupted"));
+          else if (itemCompleted) finish();
+        } else if (method === "error" && params.willRetry !== true) {
+          finish(new Error(params.error?.message || params.message || "Codex compaction failed"));
+        }
+      };
+      const onExit = () => finish(new Error("Codex exited before compaction completed"));
+      const onError = (error: Error) => finish(error);
+      const timer = setTimeout(() => finish(new CodexAppServerRequestTimeoutError("thread/compact/start completion", timeoutMs)), timeoutMs);
+      cleanup = () => {
+        clearTimeout(timer);
+        this.off("notification", onNotification);
+        this.off("exit", onExit);
+        this.off("error", onError);
+      };
+      this.on("notification", onNotification);
+      this.on("exit", onExit);
+      this.on("error", onError);
+    });
+    // A process failure may precede the request response.
+    void completed.catch(() => {});
+    try {
+      await this.compactThread(threadId);
+      await completed;
+    } finally { cleanup(); }
   }
 
   async getGoal(threadId: string): Promise<unknown> {
@@ -554,7 +597,7 @@ export class CodexAppServerClient extends EventEmitter {
     if (!handled) {
       respond({
         error: {
-          code: "unsupported_server_request",
+          code: -32601,
           message: `SocketAgent does not handle Codex app-server request '${msg.method}' yet`,
         },
       });
@@ -577,19 +620,20 @@ export class CodexAppServerClient extends EventEmitter {
   private isResponse(value: unknown): value is WireResponse {
     return !!value
       && typeof value === "object"
-      && typeof (value as { id?: unknown }).id === "number";
+      && (typeof (value as { id?: unknown }).id === "number" || typeof (value as { id?: unknown }).id === "string");
   }
 
   private isServerRequest(value: unknown): value is WireServerRequest {
     return !!value
       && typeof value === "object"
-      && typeof (value as { id?: unknown }).id === "number"
+      && (typeof (value as { id?: unknown }).id === "number" || typeof (value as { id?: unknown }).id === "string")
       && typeof (value as { method?: unknown }).method === "string";
   }
 
   private isNotification(value: unknown): value is CodexAppServerNotification {
     return !!value
       && typeof value === "object"
+      && !("id" in value)
       && typeof (value as { method?: unknown }).method === "string";
   }
 

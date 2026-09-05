@@ -352,11 +352,14 @@ export function reconcileInterruptedScheduledTask(
 /** Repair every orphaned running task after a server process starts. */
 export function reconcileInterruptedScheduledTasks(
   now: Date = new Date(),
+  resumableSessionIds: Set<string> = new Set(),
 ): ScheduledTask[] {
   const tasks = readTasks();
   const recovered: ScheduledTask[] = [];
   let changed = false;
   const reconciled = tasks.map((task) => {
+    const running = [...(task.runs || [])].reverse().find(run => run.status === "running");
+    if (task.status === "running" && resumableSessionIds.has(running?.sessionId || task.sessionId || "")) return task;
     const replacement = reconcileInterruptedScheduledTask(task, now);
     if (!replacement) return task;
     changed = true;
@@ -365,6 +368,32 @@ export function reconcileInterruptedScheduledTasks(
   });
   if (changed) writeTasks(reconciled);
   return recovered;
+}
+
+/** The restarted server owns completion of the original scheduled run. */
+export function finishRecoveredScheduledTask(
+  sessionId: string, outcome: "completed" | "failed", summary: string, now = new Date(),
+): ScheduledTask | undefined {
+  const task = readTasks().find(task => task.status === "running"
+    && task.runs?.some(run => run.sessionId === sessionId && run.status === "running"));
+  if (!task) return undefined;
+  const run = [...task.runs!].reverse().find(run => run.sessionId === sessionId && run.status === "running")!;
+  run.status = outcome;
+  run.completedAt = now.toISOString();
+  run.resultSummary = summary;
+  if (outcome === "failed") run.error = summary;
+  task.resultSummary = summary;
+  task.error = outcome === "failed" ? summary : undefined;
+  task.lastRunAt = run.completedAt;
+  task.runCount = (task.runCount || 0) + 1;
+  if (run.trigger === "manual") task.status = run.resumeTaskStatus || "completed";
+  else if (task.recurrence && task.recurrence.type !== "once") {
+    const next = getNextRunTime(task, now.getTime());
+    task.status = next ? "pending" : outcome;
+    if (next) task.scheduledTime = next;
+  } else task.status = outcome;
+  saveScheduledTask(task);
+  return task;
 }
 
 /** Get all session IDs that belong to scheduled tasks */

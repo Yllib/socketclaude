@@ -1586,6 +1586,7 @@ export interface SessionInfo {
 }
 
 export interface ErrorServerMessage {
+  sessionId?: string;
   type: "error";
   message: string;
 }

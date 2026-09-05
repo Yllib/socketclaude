@@ -8,6 +8,7 @@
 const path = require("path");
 const fs = require("fs");
 const http = require("http");
+const { randomUUID } = require("crypto");
 
 // Prefer the active service's config selected by restart-server.sh. The helper
 // can live in a different checkout from the installed service.
@@ -35,14 +36,18 @@ if (!token) {
   process.exit(1);
 }
 
-const body = JSON.stringify({ sessionId, prompt });
+// Supply the same third argument when retrying an uncertain HTTP response.
+const requestId = process.argv[4] || randomUUID();
+console.log(`Continuation request ID: ${requestId}`);
+const body = JSON.stringify({ sessionId, prompt, requestId });
 
 const req = http.request({
-  hostname: "localhost",
+  hostname: "127.0.0.1",
   port: parseInt(port),
-  path: `/continue?token=${token}`,
+  path: "/continue",
   method: "POST",
   headers: {
+    "Authorization": `Bearer ${token}`,
     "Content-Type": "application/json",
     "Content-Length": Buffer.byteLength(body),
   },
@@ -51,13 +56,16 @@ const req = http.request({
   res.on("data", (chunk) => { data += chunk; });
   res.on("end", () => {
     if (res.statusCode === 200) {
-      console.log("Session continued successfully");
+      console.log("Continuation accepted. Check session history for its outcome.");
     } else {
       console.error(`Failed (${res.statusCode}): ${data}`);
       process.exit(1);
     }
   });
 });
+
+const deadline = setTimeout(() => req.destroy(new Error("Continuation request timed out; retry with the same request ID")), 30_000);
+req.on("close", () => clearTimeout(deadline));
 
 req.on("error", (err) => {
   console.error("HTTP error:", err.message);

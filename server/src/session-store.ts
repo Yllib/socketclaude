@@ -2829,7 +2829,7 @@ function compactSdkEventsFile(file: string): void {
   }
 }
 
-function flushSdkEventQueue(sessionId?: string): void {
+export function flushSdkEventQueue(sessionId?: string): void {
   ensureSdkEventsDir();
   const sessionIds = sessionId ? [sessionId] : [...pendingSdkEventLines.keys()];
   for (const sid of sessionIds) {

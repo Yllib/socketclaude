@@ -726,7 +726,7 @@ test("uses the stable Claude API message id across partial stream event UUIDs", 
     type: "stream_event",
     uuid: "event-frame-2",
     parent_tool_use_id: null,
-    event: { type: "content_block_delta", index: 0 },
+    event: { type: "content_block_delta", index: 0, delta: { type: "text_delta" } },
   });
   const secondDelta = session._streamKey({
     type: "stream_event",
@@ -734,17 +734,17 @@ test("uses the stable Claude API message id across partial stream event UUIDs", 
     parent_tool_use_id: null,
     event: { type: "content_block_delta", index: 0 },
   });
-  const completed = session._streamKey({
+  const completed = session._streamIdentity.completedKeys({
     type: "assistant",
     uuid: "assistant-transcript-uuid",
     parent_tool_use_id: null,
-    message: { id: "api-message-1" },
-  });
+    message: { id: "api-message-1", content: [{ type: "text", text: "hello" }] },
+  })[0];
 
   assert.equal(started, "main:api-message-1");
-  assert.equal(firstDelta, started);
-  assert.equal(secondDelta, started);
-  assert.equal(completed, started);
+  assert.equal(firstDelta, `${started}:block:0`);
+  assert.equal(secondDelta, firstDelta);
+  assert.equal(completed, firstDelta);
 });
 
 test("keeps interleaved Claude subagent message streams in separate lanes", () => {
@@ -768,7 +768,7 @@ test("keeps interleaved Claude subagent message streams in separate lanes", () =
       parent_tool_use_id: null,
       event: { type: "content_block_delta", index: 0 },
     }),
-    "main:main-api-message",
+    "main:main-api-message:block:0",
   );
   assert.equal(
     session._streamKey({
@@ -777,7 +777,7 @@ test("keeps interleaved Claude subagent message streams in separate lanes", () =
       parent_tool_use_id: "agent-tool-1",
       event: { type: "content_block_delta", index: 0 },
     }),
-    "agent-tool-1:child-api-message",
+    "agent-tool-1:child-api-message:block:0",
   );
 });
 

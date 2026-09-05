@@ -1,5 +1,9 @@
 import { query, createSdkMcpServer, tool, forkSession as sdkForkSession, type Settings } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
+import { ClaudeStreamIdentity } from "./claude-stream-identity";
+import { claudeTotalUsage } from "./claude-usage";
+import { waitForInteractiveAnswer } from "./interactive-answer";
+import { prepareCodexMcpElicitation, resolveCodexMcpElicitation } from "./codex-elicitation";
 import * as crypto from "crypto";
 import { execFile, execFileSync, spawn, spawnSync } from "child_process";
 import * as pty from "node-pty";
@@ -823,6 +827,7 @@ export function refreshClaudeExecutableInfo(): ClaudeExecutableInfo {
 }
 
 interface PendingQuestion {
+  cancel?: () => void;
   questionId: string;
   resolve: (answers: Record<string, string>) => void;
   questionData?: ServerMessage; // stored so we can re-send on reconnect
@@ -1016,7 +1021,10 @@ export class ClaudeSession {
   private _thinkingProgress: { startedAtMs: number; estimatedTokens: number; uuid?: string } | null = null;
   private _turnCorrelation: ClaudeTurnCorrelation = {};
   private _terminalSlashCommands = new Set<string>();
-  private _activeSdkMessageIds = new Map<string, string>();
+  private _streamIdentity = new ClaudeStreamIdentity();
+  private _querySettingsDirty = false;
+  private _queryConsumer: Promise<void> | null = null;
+  private _restartingForSettings = false;
   private _lastPreview: string = "";
   private _lastSessionInit: ServerMessage | null = null;
   private _lastSupportedModels: ServerMessage | null = null;
@@ -1030,6 +1038,7 @@ export class ClaudeSession {
     this.sendImmediately(message);
   });
   public onActivity?: () => void;
+  public onBeforeRun?: (resumeSessionId?: string) => void;
   public onClose?: () => void;
   public onSessionIdChanged?: (previousSessionId: string, nextSessionId: string) => void;
   public onMonitorOutput?: (text: string) => void;
@@ -1074,6 +1083,7 @@ export class ClaudeSession {
   }
 
   setEffort(effort: 'low' | 'medium' | 'high' | 'xhigh' | 'max'): void {
+    if (this._effort !== effort) this._deferQuerySettings();
     this._effort = effort;
     this.persistAgentSettings({ effort });
     console.log(`Effort set to ${effort} for session ${this.sessionId || '(pending)'}`);
@@ -1084,6 +1094,7 @@ export class ClaudeSession {
   }
 
   setThinking(thinking: typeof ClaudeSession.prototype._thinking): void {
+    if (JSON.stringify(this._thinking) !== JSON.stringify(thinking)) this._deferQuerySettings();
     this._thinking = thinking;
     this.persistAgentSettings({ thinking });
     console.log(`Thinking set to ${JSON.stringify(thinking)} for session ${this.sessionId || '(pending)'}`);
@@ -1094,12 +1105,14 @@ export class ClaudeSession {
   }
 
   setDisallowedTools(tools: string[]): void {
+    if (JSON.stringify(this._disallowedTools) !== JSON.stringify(tools)) this._deferQuerySettings();
     this._disallowedTools = [...tools];
     this.persistAgentSettings({ disallowedTools: this._disallowedTools });
     console.log(`Disallowed tools set to [${tools.join(', ')}] for session ${this.sessionId || '(pending)'}`);
   }
 
   setAppendSystemPrompt(text: string, options: { inherited?: boolean; clearOverride?: boolean } = {}): void {
+    if (this._appendSystemPrompt !== text) this._deferQuerySettings();
     this._appendSystemPrompt = text;
     if (options.clearOverride) {
       this._systemPromptOverride = undefined;
@@ -1564,7 +1577,7 @@ export class ClaudeSession {
   }
 
   get isBusy(): boolean {
-    return this._isRunning || this._isCompacting || this._hasClaudeBackgroundWork();
+    return this._isRunning || this._isCompacting || this._restartingForSettings || this._hasClaudeBackgroundWork();
   }
 
   get isCompacting(): boolean {
@@ -1719,6 +1732,7 @@ export class ClaudeSession {
     remapSessionMemory(previousSessionId, nextSessionId);
     this.sessionId = nextSessionId;
     this._resumeSessionId = nextSessionId;
+    this._streamIdentity.clear();
     this._streamingText.clear();
     this._streamingThinking.clear();
     this._thinkingProgress = null;
@@ -2424,28 +2438,11 @@ export class ClaudeSession {
   }
 
   private _streamKey(message: any): string {
-    const lane = this._streamLane(message);
-    const event = message?.type === "stream_event" ? message?.event : undefined;
-    const apiMessageId = String(
-      event?.type === "message_start"
-        ? event?.message?.id || ""
-        : message?.message?.id || "",
-    );
-
-    if (apiMessageId) this._activeSdkMessageIds.set(lane, apiMessageId);
-
-    // The Agent SDK assigns a fresh outer UUID to every stream_event frame.
-    // The API message id from message_start remains stable for all deltas and
-    // for the completed assistant snapshot, so it is the card identity.
-    const stableId = apiMessageId
-      || this._activeSdkMessageIds.get(lane)
-      || String(message?.uuid || "")
-      || "current";
-    return `${lane}:${stableId}`;
+    return this._streamIdentity.streamKey(message);
   }
 
-  private _finishSdkMessageStream(message: any): void {
-    this._activeSdkMessageIds.delete(this._streamLane(message));
+  private _finishSdkMessageStream(_message: any): void {
+    // Completed block snapshots may follow message_stop. Retain their mappings.
   }
 
   private _appendLiveStream(
@@ -2470,6 +2467,120 @@ export class ClaudeSession {
     const key = this._streamKey(message);
     this._streamingText.delete(key);
     this._streamingThinking.delete(key);
+  }
+
+  private _publishCompletedClaudeBlocks(message: any): string[] {
+    const keys = this._streamIdentity.completedKeys(message);
+    const blocks = Array.isArray(message.message?.content) ? [...message.message.content] : [];
+    const textParts: string[] = [];
+    const isRoot = !message.parent_tool_use_id;
+    if (isRoot && this._thinkingProgress && !blocks.some((block: any) => block.type === "thinking")) {
+      blocks.push({ type: "thinking", thinking: "" });
+      keys.push(`main:${message.message?.id || message.uuid}:thinking-progress`);
+    }
+    for (const [index, block] of blocks.entries()) {
+      if (block.type !== "text" && block.type !== "thinking") continue;
+      const thinking = block.type === "thinking";
+      const streamId = keys[index];
+      const stream = (thinking ? this._streamingThinking : this._streamingText).get(streamId);
+      const content = String(thinking ? block.thinking || block.text || stream?.content || "" : block.text || "");
+      const progress = thinking && isRoot ? this._thinkingProgress : null;
+      const timestamp = new Date(stream?.startedAtMs || progress?.startedAtMs || Date.now()).toISOString();
+      const thinkingMetadata = thinking ? {
+        thinkingDurationMs: Math.max(1, Date.now() - Date.parse(timestamp)),
+        ...(progress?.estimatedTokens ? { thinkingTokens: progress.estimatedTokens } : {}),
+      } : {};
+      const common = {
+        streamId, uuid: message.uuid, parentToolUseId: message.parent_tool_use_id || null,
+        ...(isRoot ? this._turnCorrelation : {}), ...thinkingMetadata, timestamp,
+      };
+      this.send({
+        type: thinking ? "thinking" : "text", content, sessionId: this.sessionId || "",
+        snapshot: true, finalSnapshot: true, ...common,
+      } as any);
+      if (this.sessionId && !this._authErrorSent) {
+        appendHistory(this.sessionId, { role: "assistant", content, ...(thinking ? { thinking: true } : {}), ...common });
+      }
+      this._streamingText.delete(streamId);
+      this._streamingThinking.delete(streamId);
+      if (thinking && isRoot) this._thinkingProgress = null;
+      if (!thinking) textParts.push(content);
+    }
+    return textParts;
+  }
+
+  private _waitForQuestion(questionId: string, message: ServerMessage, signal?: AbortSignal) {
+    return waitForInteractiveAnswer(this.pendingQuestions, questionId, message, signal, () => {
+      const sessionId = String((message as any).sessionId || this.sessionId || "");
+      if (sessionId) markQuestionAnswered(sessionId, questionId, {});
+      this.send({ type: "question_answered", questionId, sessionId, answers: {} } as any);
+    });
+  }
+
+  private _cancelPendingQuestions(): void {
+    for (const pending of [...this.pendingQuestions.values()]) {
+      if (pending.cancel) pending.cancel();
+      else {
+        this.pendingQuestions.delete(pending.questionId);
+        pending.resolve({});
+        if (this.sessionId) markQuestionAnswered(this.sessionId, pending.questionId, {});
+        this.send({ type: "question_answered", questionId: pending.questionId, sessionId: this.sessionId || "", answers: {} } as any);
+      }
+    }
+  }
+
+  private async _requestClaudeToolApproval(toolName: string, input: Record<string, unknown>, signal?: AbortSignal, reason?: string) {
+    if (signal?.aborted) return { behavior: "deny" as const, message: "Request cancelled" };
+    // Reaching canUseTool means the SDK requires a decision, including explicit
+    // ask rules in bypass mode. Never silently override those requests.
+    const questionId = createInteractiveRequestId("approval");
+    const question = `Allow ${toolName}?\n${reason || ""}\n${JSON.stringify(redactSecretsDeep(input), null, 2)}`;
+    const message: any = {
+      type: "question", questionId, sessionId: this.sessionId || "",
+      questions: [{ question, header: "Tool approval", options: [{ label: "Approve" }, { label: "Decline" }], multiSelect: false }],
+    };
+    if (this.sessionId) appendHistory(this.sessionId, {
+      role: "question", content: "", questionId, questions: message.questions, timestamp: new Date().toISOString(),
+    });
+    const waiting = this._waitForQuestion(questionId, message, signal);
+    this.send(message);
+    const answers = await waiting;
+    return answers?.[question] === "Approve"
+      ? { behavior: "allow" as const, updatedInput: input }
+      : { behavior: "deny" as const, message: answers ? "User declined the tool request" : "Request cancelled" };
+  }
+
+  private async _handleClaudeElicitation(request: any, signal?: AbortSignal): Promise<any> {
+    if (signal?.aborted) return { action: "cancel" };
+    const prepared = prepareCodexMcpElicitation(request);
+    const questionId = createInteractiveRequestId("elicit");
+    const sessionId = this.sessionId || "";
+    const message: any = prepared.mode === "url" ? {
+      type: "elicitation_url", questionId, sessionId, mcpServerName: prepared.serverName,
+      message: prepared.message, url: prepared.url, elicitationId: prepared.elicitationId,
+    } : {
+      type: "question", questionId, sessionId, questions: prepared.questions, mcpServerName: prepared.serverName,
+    };
+    if (sessionId) appendHistory(sessionId, {
+      role: prepared.mode === "url" ? "elicitation_url" : "question",
+      content: prepared.message, questionId, questions: prepared.questions,
+      mcpServerName: prepared.serverName, url: prepared.url, timestamp: new Date().toISOString(),
+    });
+    const waiting = this._waitForQuestion(questionId, message, signal);
+    this.send(message);
+    const answers = await waiting;
+    if (!answers) return { action: "cancel" };
+    if (prepared.mode === "url") {
+      const answer = String(Object.values(answers)[0] || "");
+      return { action: /cancel|decline/i.test(answer) || !answer ? "decline" : "accept" };
+    }
+    try {
+      const response = resolveCodexMcpElicitation(prepared, answers);
+      return { action: response.action, ...(response.action === "accept" ? { content: response.content } : {}) };
+    } catch (error) {
+      this.send({ type: "error", message: `Form response was invalid: ${String(error)}`, sessionId });
+      return { action: "decline" };
+    }
   }
 
   /** Currently-executing tool call info (null if no tool is running) */
@@ -2712,6 +2823,7 @@ export class ClaudeSession {
     this._pendingBoundaryContext = [];
     this.streamSnapshots.flushAll();
     this._leaveWarmIdle();
+    this._cancelPendingQuestions();
     this.abortController?.abort();
     this.activeInputQueue?.close();
     this.activeInputQueue = null;
@@ -2751,8 +2863,11 @@ export class ClaudeSession {
   interrupt(): void {
     this._stopRequested = true;
     this._pendingBoundaryContext = [];
+    this._cancelPendingQuestions();
     if (this.activeQuery) {
-      this.activeQuery.interrupt();
+      void this.activeQuery.interrupt().catch(error => {
+        this.send({ type: "error", message: `Could not interrupt Claude: ${String(error)}`, sessionId: this.sessionId || "" });
+      });
     }
   }
 
@@ -3039,14 +3154,45 @@ export class ClaudeSession {
     return turnPromise;
   }
 
+  private _deferQuerySettings(): void {
+    if (!this.activeQuery || this._querySettingsDirty) return;
+    this._querySettingsDirty = true;
+    if (this.sessionId) {
+      const content = "Settings saved for the next prompt. The current Claude run keeps its existing settings. Background tasks must finish or be stopped before the new settings can apply.";
+      const uuid = crypto.randomUUID();
+      const streamId = `settings:${uuid}`;
+      this.send({ type: "text", content, streamId, snapshot: true, finalSnapshot: true, sessionId: this.sessionId } as any);
+      appendHistory(this.sessionId, { role: "assistant", content, streamId, uuid, timestamp: new Date().toISOString() });
+    }
+  }
+
+  private async _prepareQuerySettings(): Promise<void> {
+    if (!this._querySettingsDirty || !this.activeQuery) return;
+    if (this._isRunning || this._hasClaudeBackgroundWork()) {
+      throw new Error("Claude settings are pending. Finish or stop the current run and background tasks before sending a new prompt.");
+    }
+    const consumer = this._queryConsumer;
+    this._restartingForSettings = true;
+    try {
+      this.activeInputQueue?.close();
+      this.activeQuery.close();
+      if (consumer) await consumer;
+      this.activeQuery = null;
+      this.activeInputQueue = null;
+    } finally { this._restartingForSettings = false; }
+  }
+
   async runQuery(
     prompt: string,
     resumeSessionId?: string,
     messageId?: string,
   ): Promise<void> {
+    this.onBeforeRun?.(resumeSessionId);
     // The SDK stream also remains reusable while a completed root turn waits
     // for background work. A new phone prompt must join that process rather
     // than replacing activeQuery and orphaning its task lifecycle events.
+    if (this._querySettingsDirty) await this._prepareQuerySettings();
+    this.onBeforeRun?.(resumeSessionId);
     if (this.activeQuery && this.activeInputQueue && !this._isRunning) {
       return this._runWarmPrompt(prompt, resumeSessionId, messageId);
     }
@@ -3789,8 +3935,7 @@ export class ClaudeSession {
                   const result = {
                     hookSpecificOutput: {
                       hookEventName: "PreToolUse" as const,
-                      permissionDecision: "allow" as const,
-                      updatedInput: { command: wrapped },
+                      updatedInput: { ...toolInput, command: wrapped },
                     },
                   };
                   console.log(`[Hook] Bash returning updatedInput command length=${wrapped.length}`);
@@ -4017,7 +4162,8 @@ export class ClaudeSession {
             console.log(`canUseTool called: ${toolName}${agentID ? ` (agent: ${agentID})` : ''}${decisionReason ? ` reason: ${decisionReason}` : ''}`);
 
             // NOTE: Plugin interceptors run in PreToolUse hook (not here).
-            // In bypassPermissions mode, canUseTool is only called for interactive tools.
+            // Even bypass mode can reach this callback through explicit ask rules.
+            if (signal?.aborted) return { behavior: "deny" as const, message: "Request cancelled" };
 
             if (toolName === "AskUserQuestion") {
               const qId = createInteractiveRequestId("q");
@@ -4062,11 +4208,8 @@ export class ClaudeSession {
                 });
               }
 
-              const answers = await new Promise<Record<string, string>>(
-                (resolve) => {
-                  this.pendingQuestions.set(qId, { questionId: qId, resolve, questionData: questionMsg });
-                }
-              );
+              const answers = await this._waitForQuestion(qId, questionMsg, signal);
+              if (!answers) return { behavior: "deny" as const, message: "Request cancelled" };
 
               return {
                 behavior: "allow" as const,
@@ -4137,152 +4280,23 @@ export class ClaudeSession {
                 });
               }
 
-              const answers = await new Promise<Record<string, string>>(
-                (resolve) => {
-                  this.pendingQuestions.set(qId, { questionId: qId, resolve, questionData: questionMsg });
-                }
-              );
+              const answers = await this._waitForQuestion(qId, questionMsg, signal);
+              if (!answers) return { behavior: "deny" as const, message: "Request cancelled" };
 
               const firstAnswer = Object.values(answers)[0] || "";
               if (firstAnswer.toLowerCase().includes("approve")) {
-                // Notify app that we're exiting plan mode
-                this.send({
-                  type: "permission_mode_changed",
-                  permissionMode: "bypassPermissions",
-                  sessionId: this.sessionId || "",
-                } as any);
                 return { behavior: "allow" as const, updatedInput: input };
               } else {
                 return { behavior: "deny" as const, message: "User rejected the plan." };
               }
             }
 
-            return { behavior: "allow" as const, updatedInput: input };
+            return this._requestClaudeToolApproval(toolName, input, signal, decisionReason);
           },
-          onElicitation: async (request: any, { signal }: { signal: AbortSignal }) => {
-            const { serverName, message, mode, url, elicitationId, requestedSchema } = request;
-            console.log(`[Elicitation] server=${serverName} mode=${mode || 'form'} msg=${message?.slice(0, 100)}`);
-
-            if (mode === 'url' && url) {
-              // URL-mode: send a dedicated card so the app can open the URL
-              const qId = createInteractiveRequestId("elicit");
-              const elicitMsg: ServerMessage = {
-                type: "elicitation_url",
-                questionId: qId,
-                mcpServerName: serverName,
-                message: message || `${serverName} requires authentication`,
-                url,
-                elicitationId: elicitationId || undefined,
-                sessionId: this.sessionId || "",
-              } as any;
-              this.send(elicitMsg);
-
-              // Persist to history so it survives session resume
-              if (this.sessionId) {
-                appendHistory(this.sessionId, {
-                  role: "elicitation_url",
-                  content: message || `${serverName} requires authentication`,
-                  questionId: qId,
-                  mcpServerName: serverName,
-                  url,
-                  timestamp: new Date().toISOString(),
-                });
-              }
-
-              // Wait for user to complete the URL flow or cancel
-              const answers = await new Promise<Record<string, string>>((resolve) => {
-                this.pendingQuestions.set(qId, { questionId: qId, resolve, questionData: elicitMsg });
-              });
-              const action = Object.values(answers)[0] || "";
-              if (action.toLowerCase().includes("cancel") || action.toLowerCase().includes("decline")) {
-                return { action: "decline" as const };
-              }
-              return { action: "accept" as const };
-            }
-
-            // Form-mode: convert requestedSchema to QuestionItems and use question card
-            const qId = createInteractiveRequestId("elicit");
-            const questions: QuestionItem[] = [];
-
-            if (requestedSchema && typeof requestedSchema === 'object') {
-              const props = (requestedSchema as any).properties || {};
-              const required = (requestedSchema as any).required || [];
-              for (const [key, schema] of Object.entries(props) as [string, any][]) {
-                const desc = schema.description || key;
-                const isRequired = required.includes(key);
-                const options: { label: string; description?: string }[] = [];
-                // If the schema has enum values, create options for them
-                if (Array.isArray(schema.enum)) {
-                  for (const val of schema.enum) {
-                    options.push({ label: String(val) });
-                  }
-                }
-                questions.push({
-                  question: `${desc}${isRequired ? ' (required)' : ''}`,
-                  header: key,
-                  options,
-                  multiSelect: false,
-                });
-              }
-            }
-
-            // Fallback if no schema properties: single text input with the message
-            if (questions.length === 0) {
-              questions.push({
-                question: message || `${serverName} is requesting input`,
-                options: [],
-                multiSelect: false,
-              });
-            }
-
-            const questionMsg: ServerMessage = {
-              type: "question",
-              questionId: qId,
-              questions,
-              sessionId: this.sessionId || "",
-              mcpServerName: serverName,
-            } as any;
-            this.send(questionMsg);
-
-            if (this.sessionId) {
-              appendHistory(this.sessionId, {
-                role: "question",
-                content: "",
-                questionId: qId,
-                questions,
-                timestamp: new Date().toISOString(),
-              });
-            }
-
-            const answers = await new Promise<Record<string, string>>((resolve) => {
-              this.pendingQuestions.set(qId, { questionId: qId, resolve, questionData: questionMsg });
-            });
-
-            // Check if user cancelled
-            const firstAnswer = Object.values(answers)[0] || "";
-            if (firstAnswer.toLowerCase() === "cancel" || firstAnswer.toLowerCase() === "decline") {
-              return { action: "decline" as const };
-            }
-
-            // Map answers back to the schema structure
-            const content: Record<string, string | number | boolean | string[]> = {};
-            if (requestedSchema && (requestedSchema as any).properties) {
-              const props = (requestedSchema as any).properties;
-              for (const [key] of Object.entries(props)) {
-                if (answers[key] !== undefined) {
-                  content[key] = answers[key];
-                }
-              }
-            } else {
-              // Single-field fallback
-              const val = Object.values(answers)[0];
-              if (val) content["value"] = val;
-            }
-
-            return { action: "accept" as const, content };
-          },
+          onElicitation: (request, { signal }) => this._handleClaudeElicitation(request, signal),
         },
       });
+      this._querySettingsDirty = false;
       this._pendingTransferContext = null;
       if (transferContext) {
         const transferSessionId = this.sessionId || this.replacesSessionId || resumeTarget;
@@ -5290,107 +5304,13 @@ export class ClaudeSession {
           }
 
           const apiMessage = (message as any).message;
-          const completedThinkingParts = apiMessage?.content && Array.isArray(apiMessage.content)
-            ? apiMessage.content
-              .filter((b: any) => b.type === "thinking")
-              .map((b: any) => b.thinking || b.text || "")
-            : [];
-          const thinkingStreamId = this._streamKey(message);
-          const thinkingStream = this._streamingThinking.get(thinkingStreamId);
-          const isRootMessage = !(message as any).parent_tool_use_id;
-          const progress = isRootMessage ? this._thinkingProgress : null;
-          const thinkingContent = completedThinkingParts.join("")
-            || thinkingStream?.content
-            || "";
-          if (thinkingStream || progress || thinkingContent.trim()) {
-            const startCandidates = [
-              thinkingStream?.startedAtMs,
-              progress?.startedAtMs,
-            ].filter((value): value is number => typeof value === "number");
-            const startedAtMs = startCandidates.length > 0
-              ? Math.min(...startCandidates)
-              : Date.now();
-            const thinkingDurationMs = Math.max(1, Date.now() - startedAtMs);
-            const thinkingTokens = Math.max(0, progress?.estimatedTokens || 0);
-            const thinkingTimestamp = new Date(startedAtMs).toISOString();
-            this.send({
-              type: "thinking",
-              content: thinkingContent,
-              sessionId: this.sessionId || "",
-              streamId: thinkingStreamId,
-              snapshot: true,
-              finalSnapshot: true,
-              thinkingDurationMs,
-              ...(thinkingTokens > 0 ? { thinkingTokens } : {}),
-              timestamp: thinkingTimestamp,
-              parentToolUseId: (message as any).parent_tool_use_id || null,
-              uuid: (message as any).uuid || progress?.uuid || undefined,
-              ...(isRootMessage ? this._turnCorrelation : {}),
-            } as any);
-            if (this.sessionId) {
-              appendHistory(this.sessionId, {
-                role: "assistant",
-                content: thinkingContent,
-                thinking: true,
-                streamId: thinkingStreamId,
-                thinkingDurationMs,
-                ...(thinkingTokens > 0 ? { thinkingTokens } : {}),
-                parentToolUseId: (message as any).parent_tool_use_id || null,
-                uuid: (message as any).uuid || progress?.uuid || undefined,
-                ...(isRootMessage ? this._turnCorrelation : {}),
-                timestamp: thinkingTimestamp,
-              });
-            }
+          const completedTextParts = this._publishCompletedClaudeBlocks(message);
+          if (completedTextParts.length && !(message as any).parent_tool_use_id) {
+            sawMainAssistantText = true;
+            this._lastPreview = completedTextParts.join("").slice(0, 200);
+            this.onActivity?.();
           }
-          if (isRootMessage) this._thinkingProgress = null;
-          const completedTextParts = apiMessage?.content && Array.isArray(apiMessage.content)
-            ? apiMessage.content
-              .filter((b: any) => b.type === "text")
-              .map((b: any) => b.text)
-            : [];
-          if (completedTextParts.length > 0) {
-            if (!(message as any).parent_tool_use_id) {
-              sawMainAssistantText = true;
-            }
-            this.send({
-              type: "text",
-              content: completedTextParts.join(""),
-              sessionId: this.sessionId || "",
-              streamId: this._streamKey(message),
-              snapshot: true,
-              finalSnapshot: true,
-              parentToolUseId: (message as any).parent_tool_use_id || null,
-              uuid: (message as any).uuid || undefined,
-              ...(!(message as any).parent_tool_use_id ? this._turnCorrelation : {}),
-            } as any);
-          }
-          // Only close the stream that produced this assistant message. Other
-          // subagents can still be streaming concurrently.
-          this._clearLiveStreamsForMessage(message);
-          // Log the full assistant text once the message is complete
-          // Skip persisting the raw error text when auth login is being handled
-          console.log(`[SDK] Assistant message: content_blocks=${apiMessage?.content?.length || 0} types=${apiMessage?.content?.map((b: any) => b.type).join(',') || 'none'}`);
           if (apiMessage?.content && Array.isArray(apiMessage.content)) {
-            // Extract full text from assistant message
-            const textParts = completedTextParts;
-            if (textParts.length > 0) {
-              if (!(message as any).parent_tool_use_id) {
-                this._lastPreview = textParts.join("").slice(0, 200);
-              }
-              this.onActivity?.();
-              if (this.sessionId && !this._authErrorSent) {
-                appendHistory(this.sessionId, {
-                  role: "assistant",
-                  content: textParts.join(""),
-                  streamId: this._streamKey(message),
-                  parentToolUseId: (message as any).parent_tool_use_id || null,
-                  uuid: (message as any).uuid || undefined,
-                  ...(!(message as any).parent_tool_use_id ? this._turnCorrelation : {}),
-                  timestamp: now(),
-                });
-              }
-            }
-
             for (const block of apiMessage.content) {
               if (block.type === "tool_use") {
                 if ((message as any).parent_tool_use_id) {
@@ -5874,18 +5794,7 @@ export class ClaudeSession {
           };
 
           // Total usage across ALL turns (from SDK result.usage)
-          const totalThinkingTokens = result.modelUsage
-            ? Object.values(result.modelUsage as Record<string, { thinkingTokens?: number }>)
-                .reduce((sum, usage) => sum + Number(usage.thinkingTokens || 0), 0)
-            : 0;
-          const totalUsage = result.usage ? {
-            inputTokens: result.usage.inputTokens || 0,
-            outputTokens: result.usage.outputTokens || 0,
-            cacheReadTokens: result.usage.cacheReadInputTokens || 0,
-            cacheCreateTokens: result.usage.cacheCreationInputTokens || 0,
-            costUsd: result.usage.costUSD || 0,
-            ...(totalThinkingTokens > 0 ? { thinkingTokens: totalThinkingTokens } : {}),
-          } : undefined;
+          const totalUsage = claudeTotalUsage(result);
 
           // "next" context is normally delivered by PostToolBatch. A
           // text-only turn has no such boundary, so continue the same live
@@ -5930,10 +5839,10 @@ export class ClaudeSession {
             totalUsage,
             numTurns: result.num_turns,
             stopReason: result.stop_reason || undefined,
-            resultSubtype: result.subtype || undefined,
+            resultSubtype: result.is_error && result.subtype === "success" ? "error_during_execution" : result.subtype || undefined,
             terminalReason: result.terminal_reason || undefined,
             fastModeState: result.fast_mode_state || undefined,
-            errors: result.errors?.length ? result.errors : undefined,
+            errors: result.errors?.length ? result.errors : result.is_error ? [result.result || "Claude turn failed"] : undefined,
             permissionDenials: result.permission_denials?.length ? result.permission_denials : undefined,
             ...this._turnCorrelation,
           });
@@ -6003,6 +5912,7 @@ export class ClaudeSession {
         });
       }
     } finally {
+      this._cancelPendingQuestions();
       this._pendingBoundaryContext = [];
       if (this._activeSubagents.size > 0 || this._sdkBackgroundTasks.size > 0) {
         this._resetSdkTaskTracking(
@@ -6025,10 +5935,10 @@ export class ClaudeSession {
       this.activeQuery = null;
       this._rejectPendingTurns(new Error("Claude SDK stream closed"));
       this.onActivity?.();
-      this.onClose?.();
+      if (!this._restartingForSettings) this.onClose?.();
     }
       };
-      void consumeQuery();
+      this._queryConsumer = consumeQuery();
       return initialTurnPromise;
     } catch (err: unknown) {
       const errMsg = formatClaudeQueryError(err, "Unknown error starting query", this.cwd);

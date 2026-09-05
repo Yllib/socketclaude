@@ -22,6 +22,9 @@ import * as fs from "fs";
 import * as http from "http";
 import * as os from "os";
 import * as path from "path";
+import { RestartRecoveryStore, RestartRecoveryWorker, boundedRecoverySetup, RESTART_CONTINUATION_PROMPT } from "./restart-recovery";
+import { finishRecoveredScheduledTask } from "./scheduled-task-store";
+import { flushSessionStore, flushSdkEventQueue } from "./session-store";
 import { execFile, execFileSync, spawn } from "child_process";
 import { WebSocketServer, WebSocket } from "ws";
 import { ClaudeSession, refreshClaudeExecutableInfo } from "./claude-session";
@@ -654,6 +657,39 @@ function loadServerKeyPair(): KeyPair {
 
 // Global session registry — sessions survive client disconnects
 const activeSessions: Map<string, Session> = new Map();
+const restartRecovery = new RestartRecoveryStore(socketAgentDataPath("recovery", "runs.json"));
+const recoveryOwners = new WeakMap<Session, { sessionId: string; id: string }>();
+const abandonedRecoveryInstances = new WeakSet<Session>();
+const continuationStarting = new Set<string>();
+let restartPreparing = false;
+let shuttingDown = false;
+let serverReady = false;
+let restartPreparationTimer: ReturnType<typeof setTimeout> | undefined;
+
+function trackRecoverableRun(session: Session, fallbackSessionId?: string): void {
+  if (shuttingDown || abandonedRecoveryInstances.has(session) || recoveryOwners.has(session)) return;
+  const sessionId = sessionInstanceId(session) || fallbackSessionId;
+  if (!sessionId || !getSession(sessionId)) return;
+  const taskId = (session as any)._scheduledTaskId;
+  if (taskId) {
+    const task = getScheduledTask(taskId);
+    const run = task?.runs?.at(-1);
+    if (task && run?.status === "running" && run.sessionId !== sessionId) {
+      task.sessionId = sessionId;
+      run.sessionId = sessionId;
+      saveScheduledTask(task);
+    }
+  }
+  recoveryOwners.set(session, { sessionId, id: restartRecovery.start(sessionId) });
+}
+
+function completeRecoverableRun(session: Session): void {
+  if (shuttingDown || abandonedRecoveryInstances.has(session) || sessionIsBusy(session)) return;
+  const owner = recoveryOwners.get(session);
+  if (!owner) return;
+  restartRecovery.complete(owner.sessionId, owner.id);
+  recoveryOwners.delete(session);
+}
 const acceptedPromptSubmissions = new Map<
   string,
   { acceptedAt: number; sessionId: string }
@@ -786,6 +822,7 @@ function sessionInstanceId(session: Session): string {
 function syncLiveSessionInstance(session: Session): void {
   const sessionId = sessionInstanceId(session);
   if (!sessionId) return;
+  if (sessionIsBusy(session)) trackRecoverableRun(session, sessionId);
   // Retain idle/warm backend processes too. Stop is destructive for the exact
   // session and must close every process that could accept another turn, not
   // only the runner currently exposed through activeSessions. Plain dormant
@@ -925,6 +962,8 @@ function beginLogicalRun(
   fallbackSessionId?: string,
   options: { repairIdleCurrent?: boolean } = {},
 ): void {
+  if (restartPreparing || shuttingDown) throw new Error("Server is preparing to restart. Retry after it reconnects.");
+  trackRecoverableRun(session, fallbackSessionId);
   const sessionId = session.getSessionId() || fallbackSessionId;
   if (sessionId && getSession(sessionId)) {
     const startedAt = new Date().toISOString();
@@ -1014,6 +1053,8 @@ function settleLogicalRun(
   outcome: SessionRunOutcome,
   fallbackSessionId?: string,
 ): void {
+  if (shuttingDown) return;
+  completeRecoverableRun(session);
   const sessionId = persistPendingLogicalRun(session, fallbackSessionId);
   if (!sessionId) return;
   setSessionRunSupervisorSettled(sessionId, true, outcome);
@@ -1575,13 +1616,23 @@ function notifySessionActivity(): void {
 }
 
 function attachSessionLifecycleCallbacks(session: Session): void {
+  session.onBeforeRun = resumeSessionId => {
+    if (restartPreparing || shuttingDown) throw new Error("Server is preparing to restart. Retry after reconnecting.");
+    trackRecoverableRun(session, resumeSessionId);
+  };
   syncLiveSessionInstance(session);
   session.onActivity = () => {
     syncLiveSessionInstance(session);
+    if (!sessionIsBusy(session)) completeRecoverableRun(session);
     notifySessionActivity();
   };
   session.onAgentSessionRequest = (args) => manageAgentSession(session, args);
   (session as any).onSessionIdChanged = (previousSessionId: string, nextSessionId: string) => {
+    const owner = recoveryOwners.get(session);
+    if (owner) {
+      restartRecovery.rekey(owner.sessionId, nextSessionId, owner.id);
+      owner.sessionId = nextSessionId;
+    }
     liveSessionInstances.rekey(session, previousSessionId, nextSessionId);
     if (activeSessions.get(previousSessionId) === session) {
       activeSessions.delete(previousSessionId);
@@ -1597,6 +1648,7 @@ function attachSessionLifecycleCallbacks(session: Session): void {
     notifySessionActivity();
   };
   (session as any).onClose = () => {
+    if (!sessionIsBusy(session)) completeRecoverableRun(session);
     liveSessionInstances.remove(session);
     let removed = false;
     if (!sessionShouldRemainPooled(session) && !sessionIsBusy(session)) {
@@ -2409,6 +2461,7 @@ async function launchDelegatedAgentTurn(
   const runPromise = child.runQuery(prompt, resumeId);
   void runPromise
     .then(() => {
+      if (shuttingDown) return;
       if (turnAbortTracker.finish(child, turnAbortState)) return;
       const sid = child.getSessionId() || childSessionId;
       finishDelegatedAgentTurn(
@@ -2419,6 +2472,7 @@ async function launchDelegatedAgentTurn(
       );
     })
     .catch((err: any) => {
+      if (shuttingDown) return;
       if (turnAbortTracker.finish(child, turnAbortState)) return;
       launchFailure = err instanceof Error ? err : new Error(String(err));
       finishDelegatedAgentTurn(
@@ -2744,7 +2798,8 @@ function scheduleInterruptedDelegatedAgentDeadline(
     if (!latest || !run || (run.status !== "running" && run.status !== "starting")) return;
     const childSessionId = latest.childSessionId;
     const activeChild = childSessionId ? activeSessions.get(childSessionId) : undefined;
-    if (activeChild && sessionIsBusy(activeChild)) {
+    const recovery = childSessionId ? restartRecovery.get(childSessionId) : undefined;
+    if ((activeChild && sessionIsBusy(activeChild)) || (recovery && recovery.state !== "failed")) {
       scheduleInterruptedDelegatedAgentDeadline(delegationId, runId, 15_000);
       return;
     }
@@ -3512,6 +3567,19 @@ function createConnectionHandler(
   }
 
   async function handleMessage(msg: ClientMessage): Promise<void> {
+    const targetSessionId = String((msg as any).sessionId || activeSessionId || "");
+    if ((restartPreparing || shuttingDown || continuationStarting.has(targetSessionId))
+        && ["prompt", "new_session", "answer", "compact_context"].includes(msg.type)) {
+      sendJson({ type: "error", message: "Session recovery or server restart is in progress. Please retry shortly." });
+      return;
+    }
+    const reserve = msg.type === "prompt" && !!targetSessionId;
+    if (reserve) continuationStarting.add(targetSessionId);
+    try { await handleMessageImpl(msg); }
+    finally { if (reserve) continuationStarting.delete(targetSessionId); }
+  }
+
+  async function handleMessageImpl(msg: ClientMessage): Promise<void> {
     // Wire-format handshake — relay path absorbs this earlier in relay-client,
     // so the only callers reaching here are direct-WS clients. Reply so the
     // app knows binary uploads are supported.
@@ -8411,7 +8479,195 @@ function createConnectionHandler(
   };
 }
 
+function appendRecoveryNotice(sessionId: string, content: string): void {
+  if (!getSession(sessionId)) return;
+  try {
+    appendHistory(sessionId, { role: "assistant", content: "[Server recovery] " + content, timestamp: new Date().toISOString() });
+  } catch (error) { console.error("[Recovery] Could not write status:", error); }
+}
+
+function settleRecoveredSchedule(sessionId: string, outcome: "completed" | "failed", summary: string): void {
+  const task = finishRecoveredScheduledTask(sessionId, outcome, summary);
+  if (!task) return;
+  broadcastScheduledTaskList();
+  if (scheduledTaskUsesAutomaticNotifications(task)) {
+    broadcastScheduledTaskNotification(`${scheduledTaskDisplayName(task)} ${outcome}`, summary, sessionId, outcome, { scheduledTaskId: task.id });
+  }
+}
+
+async function continueSession(sessionId: string, prompt: string, recoveryId?: string): Promise<void> {
+  if (restartPreparing || shuttingDown || !serverReady) throw new Error("Server is not ready for continuation");
+  if (sessionAutomationLocks.isLocked(sessionId)) throw new Error("Session was stopped by the user");
+  if (continuationStarting.has(sessionId) || hasBusyLiveSession(sessionId)) throw new Error("Session is already running or starting");
+  const sessionInfo = getSession(sessionId);
+  if (!sessionInfo) throw new Error("Session not found");
+  continuationStarting.add(sessionId);
+  try {
+    // Use the real WebSocket if a client is already connected for this session
+    // (typical after restart: app reconnects before the continue script runs).
+    // Otherwise fall back to a dummy so the query still runs headless.
+    const existingClient = sessionClients.get(sessionId);
+    const ws = existingClient?.ws?.readyState === WebSocket.OPEN
+      ? existingClient.ws
+      : { readyState: WebSocket.CLOSED, send: () => {} } as any;
+    const session = createSession(sessionInfo.backend, ws, sessionInfo.cwd, plugins, getStoredCodexDriver(sessionInfo));
+    try {
+      const scheduled = listScheduledTasks().find(task => task.status === "running"
+        && task.runs?.some(run => run.sessionId === sessionId && run.status === "running"));
+      if (scheduled) {
+        (session as any)._scheduledTaskId = scheduled.id;
+        (session as any)._scheduledTaskName = scheduledTaskDisplayName(scheduled);
+        (session as any)._suppressOngoingNotification = !scheduledTaskUsesAutomaticNotifications(scheduled);
+      }
+      await boundedRecoverySetup(restorePersistedPermissionMode(session, sessionInfo));
+
+      (session as any)._resumeSessionId = sessionId;
+      await boundedRecoverySetup(restorePersistedAgentSettings(session, sessionInfo));
+      if (restartPreparing || shuttingDown || sessionAutomationLocks.isLocked(sessionId)) {
+        throw new Error("Continuation cancelled before launch");
+      }
+      if (recoveryId) recoveryOwners.set(session, { sessionId, id: recoveryId });
+      attachSessionLifecycleCallbacks(session);
+
+      // Register immediately so the app can find it when it reconnects
+      activeSessions.set(sessionId, session);
+      beginLogicalRun(session, sessionId);
+
+      // Update the connection handler's active session so future messages
+      // (prompts, answers, abort) from the app go to this running session
+      if (existingClient) {
+        existingClient.setActiveSession(session);
+        console.log(`[Continue] Using existing WebSocket for session ${sessionId}`);
+      }
+      console.log(`[Continue] Starting query for session ${sessionId}`);
+
+      // A server restart must not detach a delegated child from the run that
+      // owns its eventual supervisor callback. The old process's Promise is
+      // gone, so this continuation becomes the durable completion owner.
+      let delegatedContinuation = runningDelegatedAgentTurnForChild(sessionId);
+      if (!delegatedContinuation) {
+        const detached = getDelegatedAgent(sessionId);
+        const reattached = detached
+          ? reattachUntrackedDelegatedRestartContinuation(detached, true)
+          : undefined;
+        if (reattached?.run.status === "running") {
+          delegatedContinuation = reattached;
+        }
+      }
+      if (recoveryId) appendRecoveryNotice(sessionId, "Attempting to resume interrupted work.");
+      const continueRunPromise = session.runQuery(prompt, sessionId);
+      const turnAbortState = turnAbortTracker.begin(session);
+      continueRunPromise.then(() => {
+        if (shuttingDown) return;
+        settleRecoveredSchedule(sessionId, "completed", session.lastPreview || "Recovered task completed");
+        if (delegatedContinuation) {
+          finishDelegatedAgentTurn(
+            delegatedContinuation.record.delegationId,
+            delegatedContinuation.run.runId,
+            sessionId,
+            "completed",
+          );
+        }
+        const sid = session.getSessionId() || sessionId;
+        if (activeSessions.get(sid) === session && !sessionShouldRemainPooled(session)) {
+          activeSessions.delete(sid);
+        }
+        if (!turnAbortTracker.finish(session, turnAbortState)) {
+          settleLogicalRun(session, "completed", sessionId);
+        }
+        broadcastSessionList();
+      }).catch((err) => {
+        if (shuttingDown) return;
+        settleRecoveredSchedule(sessionId, "failed", String(err.message || err));
+        if (recoveryId) appendRecoveryNotice(sessionId, "Recovery run failed. Open the session to review the error and retry.");
+        console.error(`[Continue] Query error: ${err.message}`);
+        if (delegatedContinuation) {
+          finishDelegatedAgentTurn(
+            delegatedContinuation.record.delegationId,
+            delegatedContinuation.run.runId,
+            sessionId,
+            "failed",
+            err,
+          );
+        }
+        if (activeSessions.get(sessionId) === session && !sessionShouldRemainPooled(session)) activeSessions.delete(sessionId);
+        if (!turnAbortTracker.finish(session, turnAbortState)) {
+          settleLogicalRun(session, "failed", sessionId);
+        }
+      }).catch(error => console.error("[Recovery] Completion reporting failed:", error));
+      try { sendSessionStartedPush(session); } catch (error) { console.error("[Recovery] Notification failed:", error); }
+    } catch (error) {
+      abandonedRecoveryInstances.add(session);
+      recoveryOwners.delete(session);
+      if (activeSessions.get(sessionId) === session) activeSessions.delete(sessionId);
+      try { await boundedRecoverySetup(session instanceof CodexSession ? session.dispose() : session.abort(), 5_000); } catch {}
+      throw error;
+    }
+  } finally { continuationStarting.delete(sessionId); }
+}
+
+const restartRecoveryWorker = new RestartRecoveryWorker(restartRecovery, {
+  ready: () => serverReady && !restartPreparing && !shuttingDown,
+  exists: sessionId => !!getSession(sessionId),
+  stopped: sessionId => sessionAutomationLocks.isLocked(sessionId),
+  busy: sessionId => continuationStarting.has(sessionId) || hasBusyLiveSession(sessionId),
+  launch: run => continueSession(run.sessionId, RESTART_CONTINUATION_PROMPT, run.id),
+  skipped: sessionId => settleRecoveredSchedule(sessionId, "failed", "Recovery cancelled because the session was stopped or removed"),
+  notice: (sessionId, message) => {
+    appendRecoveryNotice(sessionId, message);
+    if (restartRecovery.get(sessionId)?.state === "failed") settleRecoveredSchedule(sessionId, "failed", message);
+  },
+});
+
+function recoverInterruptedSessions(): void {
+  restartRecoveryWorker.tick();
+}
+
 const httpServer = http.createServer((req, res) => {
+  if (req.url?.startsWith("/internal/restart/")) {
+    const remote = req.socket.remoteAddress || "";
+    if (!["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(remote)
+        || getBearerToken(req) !== AUTH_TOKEN) {
+      res.writeHead(401); res.end("Unauthorized"); return;
+    }
+    try {
+    const route = req.url.split("?")[0];
+    if (req.method === "POST" && route === "/internal/restart/prepare") {
+      if (!serverReady || shuttingDown) { res.writeHead(503); res.end("Not ready"); return; }
+      if (restartPreparing) { res.writeHead(409); res.end("Restart already prepared"); return; }
+      restartPreparing = true;
+      if (restartPreparationTimer) clearTimeout(restartPreparationTimer);
+      // If the service-manager command fails, do not leave a healthy server drained forever.
+      restartPreparationTimer = setTimeout(() => { restartPreparing = false; }, 60_000);
+      for (const [sid, session] of activeSessions) {
+        if (sessionIsBusy(session)) {
+          trackRecoverableRun(session, sid);
+          appendRecoveryNotice(sessionInstanceId(session) || sid, "Server restart prepared. Interrupted work will resume after startup.");
+        }
+      }
+      flushSessionStore();
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true, pid: process.pid, sessions: restartRecovery.list() }));
+      return;
+    }
+    if (req.method === "POST" && route === "/internal/restart/cancel") {
+      if (restartPreparationTimer) clearTimeout(restartPreparationTimer);
+      restartPreparing = false;
+      res.writeHead(200); res.end("{}"); return;
+    }
+    if (req.method === "GET" && route === "/internal/restart/status") {
+      res.writeHead(serverReady && !shuttingDown ? 200 : 503, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ready: serverReady && !shuttingDown, pid: process.pid, preparing: restartPreparing, sessions: restartRecovery.list() }));
+      return;
+    }
+    res.writeHead(404); res.end("Not found"); return;
+    } catch (error) {
+      restartPreparing = false;
+      console.error("[Recovery] Restart preparation failed:", error);
+      res.writeHead(500); res.end("Could not persist restart preparation; server was not restarted");
+      return;
+    }
+  }
   if (isCodexAppMcpRequest(req)) {
     void handleCodexAppMcpRequest(req, res).catch((err) => {
       console.error(`[Codex MCP] Unhandled request error: ${err.message}`, err.stack);
@@ -8490,23 +8746,32 @@ const httpServer = http.createServer((req, res) => {
     return;
   }
 
-  // POST /continue — trigger a prompt on a session without a WebSocket (used by restart script)
+  // Legacy/manual continuation client. Normal restart recovery runs in-process.
   if (req.method === "POST" && req.url?.startsWith("/continue")) {
     const url = new URL(req.url, `http://localhost:${PORT}`);
-    const token = url.searchParams.get("token");
+    const token = getBearerToken(req) || url.searchParams.get("token");
     if (token !== AUTH_TOKEN) {
       res.writeHead(401);
       res.end("Unauthorized");
       return;
     }
     let body = "";
-    req.on("data", (chunk: Buffer) => { body += chunk.toString(); });
+    req.on("data", (chunk: Buffer) => {
+      body += chunk.toString();
+      if (body.length > 64 * 1024) req.destroy();
+    });
     req.on("end", async () => {
       try {
-        const { sessionId, prompt } = JSON.parse(body);
-        if (!sessionId || !prompt) {
+        const { sessionId, prompt, requestId } = JSON.parse(body);
+        if (typeof sessionId !== "string" || typeof prompt !== "string" || !sessionId || !prompt
+            || typeof requestId !== "string" || !requestId || requestId.length > 128) {
           res.writeHead(400);
-          res.end("Missing sessionId or prompt");
+          res.end("Missing sessionId, prompt, or stable requestId");
+          return;
+        }
+        if (restartRecovery.wasCompleted(requestId) || restartRecovery.get(sessionId)?.id === requestId) {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: true, duplicate: true }));
           return;
         }
         if (sessionAutomationLocks.isLocked(sessionId)) {
@@ -8524,81 +8789,15 @@ const httpServer = http.createServer((req, res) => {
           res.end("Session not found");
           return;
         }
-        // Use the real WebSocket if a client is already connected for this session
-        // (typical after restart: app reconnects before the continue script runs).
-        // Otherwise fall back to a dummy so the query still runs headless.
-        const existingClient = sessionClients.get(sessionId);
-        const ws = existingClient?.ws?.readyState === WebSocket.OPEN
-          ? existingClient.ws
-          : { readyState: WebSocket.CLOSED, send: () => {} } as any;
-        const session = createSession(sessionInfo.backend, ws, sessionInfo.cwd, plugins, getStoredCodexDriver(sessionInfo));
-        await restorePersistedPermissionMode(session, sessionInfo);
-
-        (session as any)._resumeSessionId = sessionId;
-        await restorePersistedAgentSettings(session, sessionInfo);
-        attachSessionLifecycleCallbacks(session);
-
-        // Register immediately so the app can find it when it reconnects
-        activeSessions.set(sessionId, session);
-        beginLogicalRun(session, sessionId);
-
-        // Update the connection handler's active session so future messages
-        // (prompts, answers, abort) from the app go to this running session
-        if (existingClient) {
-          existingClient.setActiveSession(session);
-          console.log(`[Continue] Using existing WebSocket for session ${sessionId}`);
+        if (!serverReady || restartPreparing || shuttingDown || continuationStarting.has(sessionId) || hasBusyLiveSession(sessionId)) {
+          res.writeHead(409); res.end("Server or session is busy"); return;
         }
-        console.log(`[Continue] Starting query for session ${sessionId}`);
-
-        // A server restart must not detach a delegated child from the run that
-        // owns its eventual supervisor callback. The old process's Promise is
-        // gone, so this continuation becomes the durable completion owner.
-        let delegatedContinuation = runningDelegatedAgentTurnForChild(sessionId);
-        if (!delegatedContinuation) {
-          const detached = getDelegatedAgent(sessionId);
-          const reattached = detached
-            ? reattachUntrackedDelegatedRestartContinuation(detached, true)
-            : undefined;
-          if (reattached?.run.status === "running") {
-            delegatedContinuation = reattached;
-          }
+        restartRecovery.start(sessionId, requestId);
+        try { await continueSession(sessionId, prompt, requestId); }
+        catch (error: any) {
+          restartRecovery.retry(sessionId, requestId, String(error?.message || error));
+          throw error;
         }
-        const continueRunPromise = session.runQuery(prompt, sessionId);
-        const turnAbortState = turnAbortTracker.begin(session);
-        sendSessionStartedPush(session);
-        continueRunPromise.then(() => {
-          if (delegatedContinuation) {
-            finishDelegatedAgentTurn(
-              delegatedContinuation.record.delegationId,
-              delegatedContinuation.run.runId,
-              sessionId,
-              "completed",
-            );
-          }
-          const sid = session.getSessionId() || sessionId;
-          if (activeSessions.get(sid) === session && !sessionShouldRemainPooled(session)) {
-            activeSessions.delete(sid);
-          }
-          if (!turnAbortTracker.finish(session, turnAbortState)) {
-            settleLogicalRun(session, "completed", sessionId);
-          }
-          broadcastSessionList();
-        }).catch((err) => {
-          console.error(`[Continue] Query error: ${err.message}`);
-          if (delegatedContinuation) {
-            finishDelegatedAgentTurn(
-              delegatedContinuation.record.delegationId,
-              delegatedContinuation.run.runId,
-              sessionId,
-              "failed",
-              err,
-            );
-          }
-          if (!sessionShouldRemainPooled(session)) activeSessions.delete(sessionId);
-          if (!turnAbortTracker.finish(session, turnAbortState)) {
-            settleLogicalRun(session, "failed", sessionId);
-          }
-        });
 
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: true }));
@@ -9119,6 +9318,10 @@ async function initializeListeningServer(): Promise<void> {
     console.log(`[AppMonitor] Restored ${restoredMonitors} durable monitor(s)`);
   }
   restorePendingWorkReviewResultDeliveries();
+  serverReady = true;
+  recoverInterruptedSessions();
+  const recoveryTimer = setInterval(recoverInterruptedSessions, 2_000);
+  recoveryTimer.unref();
 }
 
 // Clean up any tool calls left pending from a previous server crash
@@ -9371,6 +9574,7 @@ function finishManualScheduledTask(task: ScheduledTask, originalStatus: Schedule
 }
 
 async function executeScheduledTask(task: ScheduledTask, trigger: "scheduled" | "manual" = "scheduled"): Promise<void> {
+  if (restartPreparing || shuttingDown) throw new Error("Server is preparing to restart");
   if (task.status === "running") return;
 
   const manualRun = trigger === "manual";
@@ -9498,6 +9702,7 @@ async function executeScheduledTask(task: ScheduledTask, trigger: "scheduled" | 
 
     session.runQuery(scheduledTaskPrompt(task)).then(() => {
       clearInterval(registerInterval);
+      if (shuttingDown) return;
       const realSessionId = session.getSessionId();
       const sid = realSessionId || tempId;
       task.sessionId = realSessionId || undefined;
@@ -9567,6 +9772,7 @@ async function executeScheduledTask(task: ScheduledTask, trigger: "scheduled" | 
       console.log(`[Scheduler] Task ${task.id} run #${runNumber} completed, session ${sid}`);
     }).catch((err) => {
       clearInterval(registerInterval);
+      if (shuttingDown) return;
       const sid = session.getSessionId() || tempId;
       task.sessionId = sid !== tempId ? sid : undefined;
       currentRun.sessionId = sid !== tempId ? sid : "";
@@ -9659,6 +9865,7 @@ async function executeScheduledTask(task: ScheduledTask, trigger: "scheduled" | 
 }
 
 async function checkScheduledTasks(): Promise<void> {
+  if (!serverReady || restartPreparing || shuttingDown) return;
   const dueTasks = getDueTasks();
   for (const task of dueTasks) {
     executeScheduledTask(task).catch((err: any) => {
@@ -9667,7 +9874,9 @@ async function checkScheduledTasks(): Promise<void> {
   }
 }
 
-const recoveredScheduledTasks = reconcileInterruptedScheduledTasks();
+const recoveredScheduledTasks = reconcileInterruptedScheduledTasks(new Date(),
+  new Set(restartRecovery.list().filter(run => run.state !== "failed"
+    && !sessionAutomationLocks.isLocked(run.sessionId)).map(run => run.sessionId)));
 for (const task of recoveredScheduledTasks) {
   console.warn(
     `[Scheduler] Recovered interrupted task ${task.id}; ` +
@@ -11138,7 +11347,25 @@ if (autoUpdateEnabled()) {
 // Graceful shutdown — clean up plugins, relay, and watchers
 for (const sig of ["SIGTERM", "SIGINT"] as const) {
   process.on(sig, async () => {
+    if (shuttingDown) return;
+    restartPreparing = true;
+    for (const [sid, session] of activeSessions) {
+      if (sessionIsBusy(session)) trackRecoverableRun(session, sid);
+    }
+    flushSessionStore();
+    shuttingDown = true;
+    serverReady = false;
+    // Bound cleanup. The durable journal belongs to startup even if a backend
+    // never acknowledges interruption or the OS kills us during shutdown.
+    const shutdownDeadline = setTimeout(() => process.exit(1), 15_000);
+    shutdownDeadline.unref();
     console.log(`Received ${sig}, cleaning up...`);
+    httpServer.close();
+    await Promise.allSettled([...new Set(activeSessions.values())].map(async session => {
+      try { await session.abort(); } finally { if (session instanceof CodexSession) await session.dispose(); }
+    }));
+    flushSdkEventQueue();
+    flushSessionStore();
     if (relayClient) relayClient.close();
     for (const plugin of plugins) {
       if (plugin.cleanup) {

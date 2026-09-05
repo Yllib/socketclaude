@@ -1,4 +1,6 @@
 import { QuestionItem } from "./protocol";
+import { AjvJsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/ajv-provider.js";
+const elicitationValidator = new AjvJsonSchemaValidator();
 
 export type CodexMcpElicitationAction = "accept" | "decline" | "cancel";
 
@@ -25,6 +27,7 @@ export interface PreparedCodexMcpElicitation {
   questions: QuestionItem[];
   bindings: ElicitationAnswerBinding[];
   fallbackApproval: boolean;
+  requestedSchema: Record<string, any>;
 }
 
 function asObject(value: unknown): Record<string, any> {
@@ -159,6 +162,7 @@ export function prepareCodexMcpElicitation(rawParams: unknown): PreparedCodexMcp
     questions,
     bindings,
     fallbackApproval,
+    requestedSchema,
   };
 }
 
@@ -180,7 +184,9 @@ function coerceAnswer(binding: ElicitationAnswerBinding, answer: string): unknow
     return binding.optionValues.get(values[0]);
   }
   if (binding.schema.type === "boolean") {
-    return /^(?:true|yes|approve|approved|confirm|confirmed)$/i.test(answer.trim());
+    if (/^(?:true|yes)$/i.test(answer.trim())) return true;
+    if (/^(?:false|no)$/i.test(answer.trim())) return false;
+    return answer;
   }
   if (binding.schema.type === "number" || binding.schema.type === "integer") {
     const parsed = Number(answer.trim());
@@ -208,6 +214,10 @@ export function resolveCodexMcpElicitation(
     const answer = answers[binding.question];
     if (answer === undefined || answer.trim() === "") continue;
     content[binding.property] = coerceAnswer(binding, answer);
+  }
+  if (Object.keys(prepared.requestedSchema).length) {
+    const validation = elicitationValidator.getValidator(prepared.requestedSchema)(content);
+    if (!validation.valid) throw new Error(validation.errorMessage);
   }
   return { action: "accept", content, _meta: null };
 }
